@@ -151,3 +151,34 @@ def lower_layernormscale(x, eps):
     )
     pw.realize()
     return pw
+
+lowering.register_op_dtype_propagation_rules(
+    "cat", lowering.ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT, None
+)
+
+@lowering.register_lowering(torch.ops.spyre.cat)
+def lower_cat(input, output, dim, offset):
+    fn = lowering.ops_wrapper(torch.ops.spyre.cat.__name__)
+    print("lower_cat")
+    print("input={}".format(input))
+    print("output={}".format(output))
+    print("fn={}".format(fn))
+
+    def inner_fn(index):
+        loaded_inputs = [
+            input.make_loader()(index),
+            output.make_loader()(index),
+        ]
+        return fn(*loaded_inputs, dim, offset)
+
+    pw = SpyrePointwise.create(
+        device=input.get_device(),
+        dtype=input.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=input.get_size(),
+        origin_node=input.get_origin_node(),
+        traceback=input.get_traceback(),
+        op_info={"output_offset": {"dim": dim, "offset": offset}}
+    )
+    pw.realize()
+    return pw

@@ -18,6 +18,12 @@ import torch
 from torch._inductor.decomposition import register_decomposition
 
 
+# List of decompositions to be re-defined in this file
+decomps_to_exclude = [
+    torch.ops.aten.cat.default
+]
+torch._decomp.remove_decompositions(torch._inductor.decomposition.decompositions, decomps_to_exclude)
+
 @register_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
@@ -34,6 +40,29 @@ def layernorm_decomp(
     mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
     norm_mean = torch.ops.spyre.layernormscale(mean, eps)
     return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+
+
+@register_decomposition([torch.ops.aten.cat.default])
+def decompose_cat(
+    tensors: list[torch.Tensor],
+    dim: int = 0,
+) -> torch.Tensor:
+    orig_decomp = torch._inductor.decomposition.cat(tensors, dim)
+    if orig_decomp == NotImplemented:
+        expanded_size = 0
+        for t in tensors:
+            expanded_size += t.size(dim)
+        output_size = list(tensors[0].size())
+        output_size[dim] = expanded_size
+        output = tensors[0].new_empty(output_size)
+        output.spyre_dci = output.get_dci()
+        offset = 0
+        for input in tensors:
+            output = torch.ops.spyre.cat(input=input, output=output, dim=dim, offset=offset)
+            offset += input.size(dim)
+        return output
+    else:
+        return orig_decomp
 
 
 """

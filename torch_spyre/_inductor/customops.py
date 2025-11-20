@@ -152,3 +152,23 @@ def _(
     res = x.new_empty(x.size())
     res.spyre_dci = x.get_dci()
     return res
+
+
+@torch.library.custom_op("spyre::cat", mutates_args=(), device_types="spyre")
+def cat(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dim: int,
+    offset: int
+) -> torch.Tensor:
+    pass
+
+
+@cat.register_fake
+def _(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dim: int,
+    offset: int
+) -> torch.Tensor:
+    return output
