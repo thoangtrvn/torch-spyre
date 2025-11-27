@@ -396,6 +396,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     f"Tensor{i}-idx{i}"
                                     for i in range(len(inputs), len(tensors))
                                 ],
+                                "opConsts": generate_opconsts(**kwargs)
                             }
                         ],
                     }
