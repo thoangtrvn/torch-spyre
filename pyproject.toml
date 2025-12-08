@@ -49,7 +49,6 @@ build = [ # no-isolation build
 ]
 test = [
     "pytest~=9.0.0",
-#    "torch_sendnn", # must be installed manually
     "transformers~=4.57.1"
 ]
 lint = [
