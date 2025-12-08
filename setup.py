@@ -109,9 +109,15 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     INCLUDE_DIRS += [
         DEEPTOOLS_DIR / "include",
     ]
+    # TODO: Figure out why the deeptools build is doing the wrong thing
+    # g3log headers should be one folder up
+    INCLUDE_DIRS += [
+        DEEPTOOLS_DIR / "include" / "g3log",
+    ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+    LIBRARY_DIRS += [DEEPTOOLS_DIR / "lib"]
 
-LIBRARIES = ["sendnn", "flex", "dee_internal"]
+LIBRARIES = ["sendnn", "flex", "dee_internal", "util"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
