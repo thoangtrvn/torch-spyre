@@ -172,5 +172,4 @@ SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
   return static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())
       ->spyre_layout;
 }
-
 };  // namespace spyre
