@@ -44,10 +44,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     tensors = inputs + outputs
 
     data_format = get_sen_data_format(inputs[0]["dtype"])
+    stick_size = BYTES_PER_STICK // inputs[0]["dtype"].itemsize
 
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
     cores = int(os.getenv("SENCORES", "1"))
-    cores = min(cores, dimensions[-1] // 64)
+    cores = min(cores, dimensions[-1] // stick_size)
     if cores == 0:
         raise Unsupported("WARNING: small tensors not yet supported")
     # include corelet division with core division example 
@@ -110,14 +111,14 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     "mb_": dimensions[0] if d2 else 0,
                                     "x_": dimensions[1] if d3 else 0,
                                     "out_": dimensions[-1] // cores,
-                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > 64)) else {},
+                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > stick_size)) else {},
                                 },
                                 "el_": {
                                     "name_": "core",
                                     "mb_": dimensions[0] if d2 else 0,
                                     "x_": dimensions[1] if d3 else 0,
                                     "out_": dimensions[-1] // cores,
-                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > 64) ) else {},
+                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > stick_size) ) else {},
                                 },
                             }
                         },
