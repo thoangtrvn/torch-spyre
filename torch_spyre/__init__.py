@@ -84,6 +84,9 @@ class _SpyreImpl:
         else:
             return getattr(self._C, "is_available", lambda: True)()
 
+    def is_initialized(self):
+        return self._initialized and not self._is_in_bad_fork()
+
     def device_count(self) -> int:
         # TODO(tmhoangt) - invoke the right API to return
         return 1
@@ -114,6 +117,7 @@ def make_spyre_module() -> types.ModuleType:
     mod.manual_seed = impl.manual_seed
     mod.manual_seed_all = impl.manual_seed_all
     mod.is_available = impl.is_available
+    mod.is_initialized = impl.is_initialized
     mod.device_count = impl.device_count
     mod.current_device = impl.current_device
     mod.set_device = impl.set_device
@@ -151,6 +155,8 @@ def _autoload():
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
+
+    import torch_spyre.ops  # noqa: F401
 
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging

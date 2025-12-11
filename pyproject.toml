@@ -28,7 +28,7 @@ dependencies = [
     "torch~=2.7.1",
     "psutil~=7.1.0"
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.optional-dependencies]
@@ -54,7 +54,7 @@ test = [
 ]
 lint = [
     "mypy~=1.13.0",
-    "pre-commit~=4.0.1",
+    "pre-commit~=4.5.0",
     "types-PyYAML~=6.0.12.20250915",
     "uv~=0.9.10",
 ]

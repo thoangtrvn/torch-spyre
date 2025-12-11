@@ -1,0 +1,47 @@
+name: Recompile requirements for Dependabot
+
+on:
+  pull_request:
+    paths:
+      - pyproject.toml
+
+jobs:
+  recompile:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf  # v2.2.1
+        id: app-token
+        with:
+          app-id: ${{ vars.SPYRE_BOT_APP_ID }}
+          private-key: ${{ secrets.SPYRE_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548  # v6.1.0
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@06e4edb239928eb926db9fa84abd11632bf44baa  # v7.1.3
+      - name: Recompile requirements
+        run: ./tools/update-requirements.sh
+
+      - name: Check for changes
+        id: git-check
+        run: |
+          if ! git diff --quiet uv.lock; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push if changed
+        if: steps.git-check.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add requirements/*.txt uv.lock
+          git commit -m "[dependabot skip] chore: recompile requirements after dependency update"
+          git push

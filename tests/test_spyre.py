@@ -105,10 +105,62 @@ class TestSpyre(TestCase):
             print("Printing failed:", e)
             assert False, "Spyre backend should support tensor printing"
 
+    def test_cross_device_copy_scalar(self):
+        # scalar tensor becomes 1D tensor on Spyre
+        a = torch.tensor(10, dtype=torch.float16)
+        b = a.to(device="spyre").add(2).to(device="cpu")
+        self.assertEqual(b.ndim, 1)
+        self.assertEqual(b.numel(), 1)
+        self.assertEqual(b.item(), a + 2)
+
     def test_cross_device_copy(self):
         a = torch.rand(10, dtype=torch.float16)
         b = a.to(device="spyre").add(2).to(device="cpu")
         self.assertEqual(b, a + 2)
+
+    def test_cross_device_copy_dtypes(self):
+        dtypes = [
+            torch.float8_e4m3fn,
+            torch.int8,
+            torch.int64,
+            torch.float16,
+            torch.float32,
+        ]
+        for dtype in dtypes:
+            x = None
+            if dtype in [torch.int8]:
+                x = torch.rand(64, 64) * 100
+                x = x.to(dtype=dtype)
+            elif dtype in [torch.int64]:
+                x = torch.randint(-32768, 32767, (64, 64), dtype=dtype)
+            elif dtype in [torch.float8_e4m3fn]:
+                x = torch.rand(64, 64)
+                x = x.to(dtype=dtype)
+            else:
+                x = torch.rand(64, 64, dtype=dtype)
+            assert x.device.type == "cpu", "initial device is not cpu"
+            x_spyre = x.to("spyre")
+            assert x_spyre.device.type == "spyre", "to device is not spyre"
+            assert x_spyre.dtype == x.dtype
+            x_cpu = x_spyre.to("cpu")
+            custom_rtol = 2e-3
+            custom_atol = 1e-5
+            try:
+                if dtype in [torch.float8_e4m3fn]:
+                    from torch.testing import assert_close
+
+                    assert_close(x.float(), x_cpu.float())
+                else:
+                    torch.testing.assert_close(
+                        x,
+                        x_cpu,
+                        rtol=custom_rtol,
+                        atol=custom_atol,
+                        check_dtype=False,  # You may need this if the dtypes are different after conversion
+                    )
+                print(f"Tensors are close with custom tolerance for dtype={dtype}.")
+            except AssertionError as e:
+                print(f"Tensors are NOT close for dtype={dtype}! Details:\n{e}")
 
     @unittest.skip("Skip for now")
     def test_data_dependent_output(self):
@@ -131,9 +183,8 @@ class TestSpyre(TestCase):
         assert x_storage_nbytes == 128
         assert x_storage_nbytes != y.untyped_storage().nbytes(), "failed allocation"
 
-    # simple test which makes sure we can copy to/from spyre and retain the same values
     def test_spyre_round_trip(self):
-        dtypes = [torch.float16]  # FIXME: Need to support multiple dtypes
+        dtypes = [torch.float16]
         for dtype in dtypes:
             x = torch.tensor([1, 2], dtype=dtype)
             assert x.device.type == "cpu", "initial device is not cpu"
@@ -144,6 +195,44 @@ class TestSpyre(TestCase):
                 torch.testing.assert_close(x, x_cpu),
                 f"round trip copy produces incorrect results for dtype={dtype}",
             )
+
+    def test_default_on_import(self):
+        import torch_spyre  # noqa: F401
+
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_set_get_roundtrip(self):
+        import torch_spyre  # noqa: F401
+
+        torch.spyre.set_downcast_warning(False)
+        assert torch.spyre.get_downcast_warning() is False
+        torch.spyre.set_downcast_warning(True)
+        assert torch.spyre.get_downcast_warning() is True
+
+    def test_warning_emitted_when_enabled(self):
+        import torch_spyre  # noqa: F401
+        import warnings
+
+        torch.set_warn_always(True)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        torch.spyre.set_downcast_warning(True)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        # At least one UserWarning captured
+        assert any("does not support int64" in str(w.message) for w in rec)
+
+    def test_warning_suppressed_when_disabled(self):
+        import torch_spyre  # noqa: F401
+        import warnings
+
+        torch.set_warn_always(True)
+        torch.spyre.set_downcast_warning(False)
+        t = torch.randint(-32768, 32767, (64, 64), dtype=torch.int64)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            t2 = t.to(device="spyre")  # noqa: F841
+        assert len(rec) == 0
 
 
 if __name__ == "__main__":

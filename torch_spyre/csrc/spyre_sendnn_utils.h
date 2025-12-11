@@ -33,7 +33,7 @@
 #include <sendnn/graph/senparms.hpp>
 #include <sendnn/runtime/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
-#include <sendnn/tensor/tensor_info.hpp>
+#include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <tuple>
@@ -120,6 +120,6 @@ sendnn::Tensor createOutputTensor(sendnn::GraphLoader& gl, void* data_ptr,
 
 sendnn::TensorInfo getTensorInfo(const at::Tensor& input);
 
-sendnn::TensorInfo getScalarTensorInfo();
+sendnn::TensorInfo getScalarTensorInfo(const at::Tensor& input);
 
 }  // namespace spyre

@@ -12,37 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-MATMUL_REDUCTION_OP = "matmul"
-BATCH_MATMUL_OP = "batchmatmul"
-TRANSPOSE_OP = "transpose"
-DEVICE_NAME = "spyre"
-BYTES_PER_STICK = 128
+import torch
 
-SEGMENT_OFFSETS = [
-    0x0,
-    0x400000000,
-    0x800000000,
-    0xC00000000,
-    0x1000000000,
-    0x1400000000,
-    0x1800000000,
-]
 
-SPYRE_FP32_OPS = [
-    "add",
-    "sub",
-    "mul",
-    "ge",
-    "le",
-    "eq",
-    "where",
-    "realdiv",
-    "relu",
-    "reciprocal",
-    "layernormscale",
-    "abs",
-    "exp",
-    "sigmoid",
-    "exx2",
-    "layernormnorm",
-]
+@torch.library.register_kernel("aten::mm", ["spyre"])
+def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+    compiled_mm = torch.compile(torch.mm, dynamic=False)
+    return compiled_mm(self, mat2)
+
+
+@torch.library.register_kernel("aten::mm.out", ["spyre"])
+def spyre__mm_out(
+    self: torch.Tensor, mat2: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    compiled_mm = torch.compile(torch.mm, dynamic=False)
+    return compiled_mm(self, mat2, out=out)

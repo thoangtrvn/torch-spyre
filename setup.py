@@ -96,6 +96,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
     RUNTIME_DIR = Path(os.environ["RUNTIME_INSTALL_DIR"])
     SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
+    DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
     INCLUDE_DIRS += [
         RUNTIME_DIR / "include",
     ]
@@ -105,9 +106,12 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     INCLUDE_DIRS += [
         SENLIB_DIR / "include",
     ]
+    INCLUDE_DIRS += [
+        DEEPTOOLS_DIR / "include",
+    ]
     LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
 
-LIBRARIES = ["sendnn", "flex"]
+LIBRARIES = ["sendnn", "flex", "dee_internal"]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
@@ -137,6 +141,20 @@ class clean(Command):
 
 
 def run_codegen():
+    import sys
+    import importlib
+
+    is_meta = any(
+        cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
+    )
+
+    if not importlib.util.find_spec("sendnn"):
+        if not is_meta:
+            raise ImportError("sendnn is required for building. Install it first.")
+
+        print("Skipping codegen (sendnn not available, metadata extraction only)")
+        return None
+
     gen_script = CODEGEN_DIR / "gen.py"
 
     if not gen_script.exists():
@@ -156,7 +174,9 @@ def run_codegen():
 if __name__ == "__main__":
     OUTPUT_CODEGEN_DIR = run_codegen()
 
-    sources = list(CSRC_DIR.glob("*.cpp")) + list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
+    sources = list(CSRC_DIR.glob("*.cpp"))
+    if OUTPUT_CODEGEN_DIR:
+        sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
     sources = [str(p.relative_to(ROOT_DIR).as_posix()) for p in sorted(sources)]
     sources = sorted([str(s) for s in sources])
 
@@ -172,6 +192,7 @@ if __name__ == "__main__":
                 ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                 ("MODULE_NAME", f'"{PACKAGE_NAME}._C"'),
                 ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+                ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
                 ("EAGER_MODE_ENV", '"EAGER_MODE"'),
                 ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
             ],

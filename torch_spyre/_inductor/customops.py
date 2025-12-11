@@ -15,7 +15,6 @@
 from typing import Optional
 import torch
 
-from .stickify import SpyreDCI, spyre_reduction_result_shape, StickFormat
 from . import Unsupported
 
 
@@ -30,27 +29,21 @@ def compact(input: torch.Tensor) -> torch.Tensor:
 def _(input):
     if len(input.size()) != 1:
         raise Unsupported("compact only implemented for 1-D tensors")
-    output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
-    return output
+    return input.new_empty(input.size())
 
 
 @torch.library.custom_op("spyre::swap", mutates_args=(), device_types="spyre")
 def swap(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
-    output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], format=StickFormat.SPARSE)
-    return output
+    return input.new_empty_strided(input.size(), [64])
 
 
 @swap.register_fake
 def _(input):
     if len(input.size()) != 1:
         raise Unsupported("swap only implemented for 1-D tensors")
-    output = input.new_empty_strided(input.size(), [64])
-    output.spyre_dci = SpyreDCI([0], format=StickFormat.SPARSE)
-    return output
+    return input.new_empty_strided(input.size(), [64])
 
 
 @torch.library.custom_op("spyre::slice", mutates_args=(), device_types="spyre")
@@ -58,7 +51,6 @@ def slice(input: torch.Tensor) -> torch.Tensor:
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
     output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
     return output
 
 
@@ -66,9 +58,19 @@ def slice(input: torch.Tensor) -> torch.Tensor:
 def _(input):
     if len(input.size()) != 1:
         raise Unsupported("slice only implemented for 1-D tensors")
-    output = input.new_empty(input.size())
-    output.spyre_dci = SpyreDCI([0], format=StickFormat.DENSE)
-    return output
+    return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::softplus", mutates_args=(), device_types="spyre")
+def softplus(
+    input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
+) -> torch.Tensor:
+    pass
+
+
+@softplus.register_fake
+def _(input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0):
+    return input.new_empty(input.size())
 
 
 @torch.library.custom_op("spyre::layer_norm", mutates_args=())
@@ -94,9 +96,7 @@ def _(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
 ):
-    res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
-    return res
+    return x.new_empty(x.size())
 
 
 @torch.library.custom_op("spyre::exx2", mutates_args=(), device_types="spyre")
@@ -106,11 +106,7 @@ def exx2(x: torch.Tensor, exx2Scale: float, useZeroMean: bool) -> torch.Tensor: 
 
 @exx2.register_fake
 def _(x: torch.Tensor, exx2Scale: float, useZeroMean: bool):
-    res_size, res_dci = spyre_reduction_result_shape(x, [x.ndim - 1], False)
-    res_dci = SpyreDCI(res_dci.dim_order, format=StickFormat.SPARSE_MULTI)
-    res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
-    return res
+    return x.new_empty(x.size()[:-1])
 
 
 @torch.library.custom_op("spyre::layernormscale", mutates_args=(), device_types="spyre")
@@ -120,14 +116,7 @@ def layernormscale(x: torch.Tensor, eps: float) -> torch.Tensor:  # type: ignore
 
 @layernormscale.register_fake
 def _(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x_dci = x.get_dci()
-    if x_dci.format != StickFormat.SPARSE_MULTI:
-        raise Unsupported(f"layernormscale: Unexpected format {x_dci.format}")
-    res_dci = SpyreDCI(x_dci.dim_order, format=StickFormat.SPARSE)
-    res_size = list(x.size())
-    res = x.new_empty(res_size)
-    res.spyre_dci = res_dci
-    return res
+    return x.new_empty(x.size())
 
 
 @torch.library.custom_op("spyre::layernormnorm", mutates_args=(), device_types="spyre")
@@ -149,6 +138,17 @@ def _(
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    res = x.new_empty(x.size())
-    res.spyre_dci = x.get_dci()
-    return res
+    return x.new_empty(x.size())
+
+
+@torch.library.custom_op("spyre::gelu", mutates_args=(), device_types="spyre")
+def gelu(
+    input: torch.Tensor,
+    approximate: str = "none",
+) -> torch.Tensor:
+    pass
+
+
+@gelu.register_fake
+def _(input: torch.Tensor, approximate: str = "none"):
+    return input.new_empty(input.size())
