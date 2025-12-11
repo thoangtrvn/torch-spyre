@@ -16,7 +16,7 @@ import math
 import os
 from torch_spyre._C import encode_constant, get_sen_data_format
 from torch_spyre._inductor.constants import BYTES_PER_STICK
-
+from torch_spyre._inductor import Unsupported
 
 def generate_constant_info(data_format, **kwargs):
     if "op_info" not in kwargs or "constants" not in kwargs["op_info"]:
@@ -65,6 +65,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
+    if cores > 1 and d3:
+        raise Unsupported("WARNING: Work division across cores on 3D tensors not yet supported.")
 
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
