@@ -40,15 +40,15 @@ class TestOps(TestCase):
     def test_mul_ok(self):
         out_cpu = SimpleIterate(device="cpu")
         out_sen = SimpleIterate(device="spyre").to("cpu")
-    
+
         atol = 0.01
         rtol = 0.01
         same = torch.allclose(out_cpu, out_sen, atol=atol, rtol=rtol)
-        
+
         max_diff = 0 if same else (out_cpu - out_sen).abs().max().item()
-    
+
         assert same, f"Outputs are different: max diff={max_diff}"
-        
+
 
 if __name__ == "__main__":
     run_tests()
