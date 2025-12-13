@@ -1,29 +1,40 @@
-# test operations used in models with torch.compile
+# Testing Models with torch.compile
 
 ## Overview
-This repository provides a test framework for validating models with `torch.compile`.  
-You can run all tests, selectively skip tests, or report detailed information about skipped and failed cases.
+
+This docucment explains how to run a subset of test cases for validating models with `torch.compile`.
+You can:
+
+* Run all tests
+* Selectively skip tests
+* Report detailed information about skipped and failed cases.
 
 ## How to run tests
 
 ### Run tests by default
 
-executes all pytest-style files except ones deselected using pytest's markers by `addops` in `pytest.ini`
+By default, all pytest-style files are executed, except those deselected using pytest's markers defined in `pytest.ini`
+via `addopts`.
 
 ```
 pytest tests/_inductor/models
 ```
 
-### deselect behavior
+### Deselect behavior
 
-default: `not paddedtensor and not largedimtensor and not fpoperation and not constant`
+Markers are defined in `pytest.ini`
 
-you can specify as you expected.
+Default deselection:
 
-Examples
+```
+not paddedtensor and not largedimtensor and not fpoperation and not constant
+```
+
+You can override this behavior by specifying your own marker expression.
+
+**Examples**:
 
 ```
 pytest -m "not padded tensor and not largedimtensor" tests/_inductor/models
 pytest -m "fpoperation" tests/_inductor/models
-
-Markers are defined in `pytest.ini`
+```
