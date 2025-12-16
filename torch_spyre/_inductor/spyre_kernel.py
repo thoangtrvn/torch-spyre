@@ -396,6 +396,7 @@ class SpyreKernel(SIMDKernel[SpyreKernelCSEVariable]):
             scales.append(scale)
             ks = KernelSummary(in_di, scales, args, self.op_info)
             if in_di != out_di:
+                self.spyre_op = TRANSPOSE_OP
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
