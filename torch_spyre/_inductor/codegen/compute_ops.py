@@ -14,6 +14,7 @@
 
 import math
 import os
+import torch
 from torch_spyre._C import encode_constant, get_sen_data_format
 from torch_spyre._inductor.constants import BYTES_PER_STICK
 from torch_spyre._inductor import Unsupported
@@ -66,8 +67,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
+    #TODO: known limitations with torch-spyre and work division across cores
     if cores > 1 and d3:
         raise Unsupported("WARNING: Work division across cores on 3D tensors not yet supported.")
+    if cores > 1 and inputs[0]["dtype"] == torch.float32:
+        raise Unsupported("WARNING: Work division with fp32 tensors not yet supported.")
 
     if reduction and tensors[-1]["scale"][-1] == 1:
         op += "nonstick"
