@@ -19,6 +19,7 @@ from torch_spyre._C import encode_constant, get_sen_data_format
 from torch_spyre._inductor.constants import BYTES_PER_STICK
 from torch_spyre._inductor import Unsupported
 
+
 def generate_constant_info(data_format, **kwargs):
     if "op_info" not in kwargs or "constants" not in kwargs["op_info"]:
         return "{}"
@@ -52,7 +53,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     cores = min(cores, dimensions[-1] // stick_size)
     if cores == 0:
         raise Unsupported("WARNING: small tensors not yet supported")
-    # include corelet division with core division example 
+    # include corelet division with core division example
     # TO DO: when fully supported the SENCORELETS default should be 2
     corelets = int(os.getenv("SENCORELETS", "1"))
     if cores > 1:
@@ -67,9 +68,11 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
 
     d2 = len(dimensions) >= 2
     d3 = len(dimensions) >= 3
-    #TODO: known limitations with torch-spyre and work division across cores
+    # TODO: known limitations with torch-spyre and work division across cores
     if cores > 1 and d3:
-        raise Unsupported("WARNING: Work division across cores on 3D tensors not yet supported.")
+        raise Unsupported(
+            "WARNING: Work division across cores on 3D tensors not yet supported."
+        )
     if cores > 1 and inputs[0]["dtype"] == torch.float32:
         raise Unsupported("WARNING: Work division with fp32 tensors not yet supported.")
 
@@ -108,21 +111,41 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             "x_": dimensions[1] if d3 else 0,
                             "out_": dimensions[-1],
                         },
-                        "dataStageParam_": { #TODO: extend coreletSplit to support splitting on "mb" cases
+                        "dataStageParam_": {  # TODO: extend coreletSplit to support splitting on "mb" cases
                             "0": {
                                 "ss_": {
                                     "name_": "core",
                                     "mb_": dimensions[0] if d2 else 0,
                                     "x_": dimensions[1] if d3 else 0,
                                     "out_": dimensions[-1] // cores,
-                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > stick_size)) else {},
+                                    "coreletSplit_": {
+                                        "out": [
+                                            dimensions[-1] // 2,
+                                            dimensions[-1] // 2,
+                                        ]
+                                    }
+                                    if (
+                                        corelets == 2
+                                        and (dimensions[-1] // cores > stick_size)
+                                    )
+                                    else {},
                                 },
                                 "el_": {
                                     "name_": "core",
                                     "mb_": dimensions[0] if d2 else 0,
                                     "x_": dimensions[1] if d3 else 0,
                                     "out_": dimensions[-1] // cores,
-                                    "coreletSplit_": {"out": [dimensions[-1] // 2, dimensions[-1] // 2]} if (corelets==2 and (dimensions[-1] // cores > stick_size) ) else {},
+                                    "coreletSplit_": {
+                                        "out": [
+                                            dimensions[-1] // 2,
+                                            dimensions[-1] // 2,
+                                        ]
+                                    }
+                                    if (
+                                        corelets == 2
+                                        and (dimensions[-1] // cores > stick_size)
+                                    )
+                                    else {},
                                 },
                             }
                         },
