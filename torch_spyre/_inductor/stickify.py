@@ -95,7 +95,10 @@ def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
-    op = pw.get_origin_node().target
+    if pw.get_origin_node() == None and pw.origins != None:
+        op = list(pw.origins)[0].target
+    else:
+        op = pw.get_origin_node().target
     if len(args) == 1:
         x = args[0]
         match op:
@@ -161,6 +164,8 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             raise Unsupported(
                 f"size mismatch:  layernormnorm({x.layout.size})=>{output.size}) "
             )
+    elif op == aten.index_put.default:
+        x = args[1]
         stl = SpyreTensorLayout(
             output.size,
             output.dtype,

@@ -101,22 +101,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                             "x_": dimensions[1] if d3 else 0,
                             "out_": dimensions[-1],
                         },
-                        "dataStageParam_": {
-                            "0": {
-                                "ss_": {
-                                    "name_": "core",
-                                    "mb_": dimensions[0] if d2 else 0,
-                                    "x_": dimensions[1] if d3 else 0,
-                                    "out_": dimensions[-1] // cores,
-                                },
-                                "el_": {
-                                    "name_": "core",
-                                    "mb_": dimensions[0] if d2 else 0,
-                                    "x_": dimensions[1] if d3 else 0,
-                                    "out_": dimensions[-1] // cores,
-                                },
-                            }
-                        },
+                        "dataStageParam_": dataStageParam,
                         "primaryDsInfo_": {
                             "OUTPUT": {
                                 "layoutDimOrder_": (["mb"] if d2 else [])
@@ -396,7 +381,7 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                                     f"Tensor{i}-idx{i}"
                                     for i in range(len(inputs), len(tensors))
                                 ],
-                                "opConsts": generate_opconsts(**kwargs)
+                                "opConsts": generate_opconsts(**kwargs),
                             }
                         ],
                     }
