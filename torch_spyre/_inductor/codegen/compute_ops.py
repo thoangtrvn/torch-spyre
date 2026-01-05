@@ -15,6 +15,9 @@
 import math
 import os
 import torch
+import warnings
+import logging
+
 from torch_spyre._C import encode_constant, get_sen_data_format
 from torch_spyre._inductor.constants import BYTES_PER_STICK
 from torch_spyre._inductor import Unsupported
@@ -48,12 +51,10 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     data_format = get_sen_data_format(inputs[0]["dtype"])
     stick_size = BYTES_PER_STICK // inputs[0]["dtype"].itemsize
 
+    logger = logging.getLogger(__name__)
+
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
     cores = int(os.getenv("SENCORES", "1"))
-    cores = min(cores, dimensions[-1] // stick_size)
-    if cores == 0:
-        raise Unsupported("WARNING: small tensors not yet supported")
-    # include corelet division with core division example
     # TO DO: when fully supported the SENCORELETS default should be 2
     corelets = int(os.getenv("SENCORELETS", "1"))
     if cores > 1:
@@ -61,9 +62,9 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
             for t in tensors:
                 for s in t["scale"]:
                     if s != 1:
-                        raise Unsupported("broadcast/reduction with core division")
+                        raise Unsupported("broadcast/reduction with core division, defaulting to one core for op {op}")
         except Unsupported:
-            print(f"WARNING: defaulting to one core for op {op}")
+            logger.debug(f"Defaulting to one core for op {op}")
             cores = 1
 
     d2 = len(dimensions) >= 2
