@@ -218,3 +218,9 @@ def spyre__sin(input, **kwargs):
 @register_fallback(["aten::cos", "aten::cos.out"])
 def spyre__cos(input, **kwargs):
     return torch.cos(input, **kwargs)
+
+# @register_fallback(["aten::mm", "aten::mm.out"])
+# def spyre__mm(input1, input2, **kwargs) -> torch.Tensor:
+    # return torch.mm(input1, input2, **kwargs)
+    # compiled_mm = torch.compile(torch.mm, dynamic=False)
+    # return compiled_mm(self, mat2)
