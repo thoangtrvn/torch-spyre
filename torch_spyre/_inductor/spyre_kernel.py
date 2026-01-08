@@ -281,6 +281,15 @@ class SpyreKernelOpsHandler(DefaultHandler):
     ) -> tuple[RValue, ...]:
         raise NotImplementedError
 
+    def indirect_indexing(
+        self,
+        var: str,
+        size: Union[sympy.Expr, int],
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        return torch._inductor.utils.sympy_index_symbol(str(var))
+
 
 def create_tensor_arg(
     is_input: bool, arg_index: int, layout: FixedTiledLayout
@@ -312,6 +321,7 @@ def create_kernel_spec(
 
 class SpyreKernel(SIMDKernel[CSEVariable]):
     overrides = SpyreOpFuncs  # type: ignore[assignment]
+    loaded_tensors: dict[str, TensorAccess] = {}  # {SymbolName: TensorAccess}
 
     def __init__(
         self,
@@ -336,7 +346,23 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        return TensorAccess(name, index, layout)
+        ta = TensorAccess(name, index, layout)
+        self.loaded_tensors[str(ta)] = ta
+        return ta
+
+    def get_index_tensor(self, index: Any) -> TensorAccess | None:
+        if isinstance(index, sympy.Symbol):
+            for s in index.free_symbols:
+                if s.name in self.loaded_tensors:
+                    return self.loaded_tensors[s.name]
+            return None
+        elif isinstance(index, sympy.Expr):
+            for arg in index.args:
+                if (ta := self.get_index_tensor(arg)) is not None:
+                    return ta
+        else:
+            raise Unsupported(f"index value of unexpected type {type(index)}")
+        return None
 
     def store(
         self,
@@ -400,6 +426,25 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(
                 create_kernel_spec(value.op, False, di, args, scales, op_info)
             )
+        elif (index_tensor := self.get_index_tensor(dst.index)) is not None:
+            input_stride = list(self.get_strides(value.index).values())[0]
+            output_stride = list(self.get_strides(value.index).values())[0]
+            in_di = self.analyze_index_expr(value.index)
+            out_di = self.analyze_index_expr(value.index)
+            args = [
+                create_tensor_arg(True, actuals.index(value.name), value.layout),
+                create_tensor_arg(
+                    True, actuals.index(index_tensor.name), index_tensor.layout
+                ),
+                create_tensor_arg(False, actuals.index(value.name), value.layout),
+            ]
+            scales = [
+                self.analyze_tensor_access(in_di, value.index),
+                self.analyze_tensor_access(in_di, index_tensor.index),
+                self.analyze_tensor_access(out_di, value.index),
+            ]
+            ks = KernelSummary("indexcopy", False, in_di, scales, args, op_info)
+            self.kernel_summaries.append(ks)
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             input_stride = list(self.get_strides(value.index).values())[0]
