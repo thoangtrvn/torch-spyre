@@ -45,4 +45,8 @@ at::Tensor empty_with_layout(
     std::optional<c10::Layout> layout_opt,
     std::optional<c10::Device> device_opt, std::optional<bool> pin_memory_opt,
     std::optional<c10::MemoryFormat> memory_format_opt);
+at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    int64_t offset_increment);
 }  // namespace spyre
