@@ -748,7 +748,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("as_strided", TORCH_FN(spyre_as_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
-  m.impl("reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
+  m.impl("_reinterpret_tensor", TORCH_FN(spyre_reinterpret_tensor));
 }
 
 }  // namespace spyre
