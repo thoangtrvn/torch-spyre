@@ -95,7 +95,7 @@ def stride_order_vars(index: sympy.Expr) -> Sequence[sympy.Symbol]:
 def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:
     pw: Pointwise = n.node.data
     output: FixedLayout = n.node.get_layout()
-    if pw.get_origin_node() == None and pw.origins != None:
+    if pw.get_origin_node() is None and pw.origins is not None:
         op = list(pw.origins)[0].target
     else:
         op = pw.get_origin_node().target
@@ -203,9 +203,9 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         stl = SpyreTensorLayout(
             output.size, output.dtype, list(range(len(output.size))), output_format
         )
-        return FixedTiledLayout(
-            output.device, output.dtype, output.size, output.stride, stl
-        )
+    return FixedTiledLayout(
+        output.device, output.dtype, output.size, output.stride, stl
+    )
 
 
 def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLayout:

@@ -314,6 +314,7 @@ def create_kernel_spec(
             torch.bool,
             torch.float16,
             torch.float32,
+            torch.int64,
         ]:
             raise Unsupported(f"operations on {arg.dtype} dtype")
     return KernelSpec(op, is_reduction, [d.numel for d in dims], args, scales, op_info)
@@ -443,8 +444,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(in_di, index_tensor.index),
                 self.analyze_tensor_access(out_di, value.index),
             ]
-            ks = KernelSummary("indexcopy", False, in_di, scales, args, op_info)
-            self.kernel_summaries.append(ks)
+            self.kernel_specs.append(
+                create_kernel_spec("indexcopy", False, in_di, args, scales, op_info)
+            )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             input_stride = list(self.get_strides(value.index).values())[0]
