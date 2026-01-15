@@ -25,7 +25,16 @@ from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from . import KernelSpec, ConstantArg, UnimplementedOp
 from .kernel_runner import (
     SpyreSDSCKernelRunner,
+    SpyreTritonKernelRunner,
     SpyreUnimplementedRunner,
+)
+
+from torch._inductor.codecache import PyCodeCache
+from torch._inductor.runtime.triton_compat import (
+    ASTSource,
+    cc_warp_size,
+    GPUTarget,
+    triton,
 )
 
 _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
@@ -95,3 +104,34 @@ class SpyreAsyncCompile:
 
     def wait(self, scope: dict[str, Any]) -> None:
         pass
+
+    def triton(self, kernel_name: str, source_code: str, device_str: str):
+        cat = getattr(PyCodeCache.load(source_code), kernel_name)
+        cfg = cat.configs[0]
+        compile_meta = cat.triton_meta
+        compile_meta["device_type"] = cat.device_props.type
+        compile_meta["cc"] = cat.device_props.cc
+        compile_meta["constants"].update(cfg.kwargs)
+        compile_args = (
+            ASTSource(
+                cat.fn,
+                compile_meta["signature"],
+                compile_meta["constants"],
+                compile_meta["configs"][0],
+            ),
+        )
+        target = GPUTarget(
+            compile_meta["device_type"],
+            compile_meta["cc"],
+            cc_warp_size(compile_meta["cc"]),
+        )
+        options = {
+            "spyre_options": compile_meta["spyre_options"],
+        }
+        compile_kwargs = {
+            "target": target,
+            "options": options,
+        }
+        tkc = triton.compile(*compile_args, **compile_kwargs)
+
+        return SpyreTritonKernelRunner(kernel_name, tkc)

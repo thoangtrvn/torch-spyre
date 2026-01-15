@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+import os
+
+from typing import Any, Optional
 
 from torch._inductor.utils import IndentedBuffer
+from torch._inductor.scheduler import Scheduler
 from torch._inductor.codegen.simd import SIMDScheduling
+from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
+from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.utils import (
     get_kernel_metadata,
     get_fused_kernel_name,
@@ -23,11 +28,16 @@ from torch._inductor.utils import (
 from torch._inductor.virtualized import V
 
 from .spyre_kernel import SpyreKernel
+from .spyre_triton_kernel import SpyreTritonKernel
 
 
 class SuperDSCScheduling(SIMDScheduling):
     kernel_type: type[Any] = SpyreKernel
     dsc_type: str = "sdsc"
+
+    def __init__(self, scheduler: Optional[Scheduler]):
+        super().__init__(scheduler)
+        self.triton_scheduling = TritonScheduling(scheduler)
 
     def get_argument_metadata(self, wrapper, kernel) -> str:
         actuals = kernel.args.python_argdefs()[1]
@@ -40,6 +50,8 @@ class SuperDSCScheduling(SIMDScheduling):
         return buf.getvalue().rstrip()
 
     def define_kernel(self, src_code, node_schedule, kernel):
+        if isinstance(kernel, SpyreTritonKernel):
+            return self.triton_scheduling.define_kernel(src_code, node_schedule, kernel)
         """Codegen kernel definition to go in output wrapper code"""
         wrapper = V.graph.wrapper_code
         if src_code in wrapper.src_to_kernel:
@@ -61,3 +73,22 @@ class SuperDSCScheduling(SIMDScheduling):
             wrapper.define_kernel(kernel_name, buf.getvalue(), metadata_comment)
 
         return kernel_name
+
+    def create_kernel_choices(  # type: ignore[override]
+        self,
+        kernel_features: SIMDKernelFeatures,
+        kernel_args: list[Any],
+        kernel_kwargs: dict[str, Any],
+    ) -> list[SpyreKernel | SpyreTritonKernel]:
+        if os.getenv("TORCH_SPYRE_TRITON") == "1":
+            self.triton_scheduling.kernel_type = SpyreTritonKernel
+            return self.triton_scheduling.create_kernel_choices(
+                kernel_features, kernel_args, kernel_kwargs
+            )
+        self.kernel_type = SpyreKernel
+        return [
+            self.kernel_type(
+                *kernel_args,
+                **kernel_kwargs,
+            )
+        ]

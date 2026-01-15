@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import os
+import json
+import torch
+from typing import Any
 from torch_spyre._C import launch_kernel
 
 
@@ -38,3 +41,20 @@ class SpyreSDSCKernelRunner:
         print(f"RUN: {self.kernel_name} {g2}")
         actuals = [args[i] for i in self.arg_mapping]
         return launch_kernel(g2, actuals)
+
+
+class SpyreTritonKernelRunner:
+    def __init__(self, name: str, kernel: Any):
+        self.kernel_name = name
+        self.kernel = kernel
+        compiler_artifacts = json.loads(self.kernel.asm["dtir"])
+        self.code_dir = compiler_artifacts["code_dir"]
+        print(f"SpyreTritonKernelRunner.init: {self.kernel_name} {self.code_dir}")
+
+    def run(self, *args, **kw_args):
+        g2 = os.path.join(self.code_dir, "g2.graph.cbor")
+        print(f"RUN: {self.kernel_name} {g2}")
+        return launch_kernel(
+            g2,
+            [tensor for tensor in args if torch.is_tensor(tensor)],
+        )
