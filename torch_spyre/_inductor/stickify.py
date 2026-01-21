@@ -142,14 +142,16 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 )
             case _:
                 # Generic pointwise unary: output layout is same as input
+                output_host_dim_order = range(0, len(output.size))
                 if not x.layout.size == output.size:
-                    raise Unsupported(
-                        f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
-                    )
+                    if 1 not in output.size:
+                        raise Unsupported(
+                            f"size mismatch:  {op}({x.layout.size})=>{output.size}) "
+                        )
                 stl = SpyreTensorLayout(
                     output.size,
                     output.dtype,
-                    x.layout.device_layout.host_dim_order(),
+                    output_host_dim_order,
                     x.layout.device_layout.format,
                 )
                 return FixedTiledLayout(
