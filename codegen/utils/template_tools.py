@@ -17,6 +17,221 @@ from jinja2 import Environment, FileSystemLoader
 from utils.arg_mapper import map_arguments
 from utils.shape_extractor import infer_output_shape_stride
 
+import re
+
+def get_args_with_default_vals(schema_string):
+    """
+    Extract keyword-only argument names (those after '*')
+    from a PyTorch operator schema string.
+
+    In PyTorch schemas, arguments after '*' are keyword-only and typically have
+    default values. This function identifies and returns the names of those arguments.
+
+    Args:
+        schema_string (str): PyTorch operator schema string in the format:
+                "op_name(arg1, arg2, *, kwarg1=default1, kwarg2=default2) -> return_type"
+
+    Returns:
+        list[str]: List of keyword-only argument names (without defaults or types)
+
+    Examples:
+        schema = "aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor"
+        ['alpha']
+
+        schema = "aten::clamp(Tensor self, *, Scalar? min=None, Scalar? max=None) -> Tensor"
+        ['min', 'max']
+
+        schema = "aten::mm(Tensor self, Tensor mat2) -> Tensor"
+        []
+
+        schema = "aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *,
+                            Scalar beta=1, Scalar alpha=1) -> Tensor"
+        ['beta', 'alpha']
+
+    """
+    # Extract everything inside parentheses
+    inside = re.search(r'\((.*)\)', schema_string).group(1)
+    # Split by comma and clean spacing
+    parts = [p.strip() for p in inside.split(',')]
+    # Find the index of "*"
+    if "*" in parts:
+        parts = parts[parts.index("*") + 1:]
+    else:
+        parts = []
+    args_with_def_vals = []
+    for p in parts:
+        name = p.split()[-1]          # last token: alpha=1
+        name = name.split("=")[0]     # remove default: alpha
+        args_with_def_vals.append(name)
+    return args_with_def_vals
+
+
+def format_python_signature(arguments):
+    """
+    Convert argument list to Python function signature string.
+    
+    Example:
+        [{'name': 'self', 'type': 'Tensor'}, {'name': 'mat2', 'type': 'Tensor'}]
+        -> "self: torch.Tensor, mat2: torch.Tensor"
+    """
+    sig_parts = []
+    for arg in arguments:
+        type_str = convert_cpp_type_to_python(arg['type'])
+        # Handle default values if present
+        if 'default' in arg and arg['default'] is not None and arg['default'] != '':
+            default_val = format_default_value(arg['default'])
+            sig_parts.append(f"{arg['name']}: {type_str} = {default_val}")
+        elif "out" in arg['name']:
+            sig_parts.append(f"{arg['name']}: {type_str} = None")
+        else:
+            sig_parts.append(f"{arg['name']}: {type_str}")
+    return ", ".join(sig_parts)
+
+
+def format_default_value(default_val):
+    """
+    Format default value for Python.
+    
+    Examples:
+        c10::nullopt -> None
+        true -> True
+        false -> False
+        1.0 -> 1.0
+    """
+    if default_val in ['c10::nullopt', 'nullptr', '::std::nullopt']:
+        return 'None'
+    elif default_val == 'true':
+        return 'True'
+    elif default_val == 'false':
+        return 'False'
+    else:
+        return str(default_val)
+
+
+def format_python_return_type(returns):
+    """
+    Convert return type to Python type annotation.
+
+    Example:
+        [{'type': 'Tensor'}] -> "torch.Tensor"
+        [{'type': 'Tensor'}, {'type': 'Tensor'}] -> "tuple[torch.Tensor, torch.Tensor]"
+    """
+    if not returns:
+        return "None"
+
+    if len(returns) == 1:
+        return convert_cpp_type_to_python(returns[0]['type'])
+
+    # Multiple returns - use tuple
+    types = [convert_cpp_type_to_python(r['type']) for r in returns]
+    return f"tuple[{', '.join(types)}]"
+
+
+def convert_cpp_type_to_python(cpp_type):
+    """Convert C++ type to Python type annotation."""
+    # Remove const, &, * modifiers
+    clean_type = cpp_type.replace('at::', '').replace('const', '').replace('&', '').replace('*', '').strip()
+    type_mapping = {
+        'ITensorListRef': 'list[Tensor]',
+        'TensorList': 'list[Tensor]',
+        'Tensor': 'torch.Tensor',
+        'int64_t': 'int',
+        'double': 'float',
+        'bool': 'bool',
+        'Scalar': 'Union[int, float, bool, complex]',
+        'IntArrayRef': 'list[int]',
+        'c10::string_view': 'str',
+        'Dimname': 'str',
+    }
+
+    for cpp, py in type_mapping.items():
+        if cpp in clean_type:
+            clean_type = clean_type.replace(cpp, py)
+
+    # Handle optionals
+    if 'optional' in cpp_type.lower() or 'Optional' in cpp_type:
+        clean_type = f"None"
+
+    return clean_type
+
+
+def get_argument_names(arguments, schema_string):
+    """
+    Get comma-separated list of argument names.
+
+    Args:
+        arguments: List of argument dicts
+        exclude_out: If True, exclude the 'out' parameter
+
+    Returns:
+        str: "self, mat2" or "self, mat2, alpha=alpha"
+    """
+    names = []
+    args_with_def_vals = get_args_with_default_vals(schema_string)
+    for arg in arguments:
+        if arg['name'] == 'out':
+            continue
+        if arg['name'] in args_with_def_vals:
+            names.append(f"{arg['name']}={arg['name']}")
+        else:
+            names.append(arg['name'])
+    return ", ".join(names)
+
+
+def get_out_argument_name(arguments):
+    """Find and return the 'out' parameter name if it exists."""
+    for arg in arguments:
+        if arg['name'] == 'out':
+            return arg['name']
+    return None
+
+
+def extract_base_op_name(op_name):
+    """
+    Extract base operation name without suffixes.
+
+    Example:
+        "mm_out" -> "mm"
+        "add_" -> "add"
+        "relu" -> "relu"
+    """
+    # Remove common suffixes
+    base_name = op_name
+
+    strip_list = ["_names", "_out", "_Tensor", "_default", "_mode", "_dims", "_dimname", "_dim", "_Dimname", "_int"]
+    for st in strip_list:
+        if st in base_name:
+            base_name = base_name.replace(st, "")
+    if base_name.endswith('_'):
+        base_name = base_name[:-1]
+
+    return base_name
+
+
+def enhance_replacement_data(rep_data):
+    """
+    Add Python-specific fields to replacement data.
+    This should be called in generate_replacements() for each operation.
+    """
+    arguments = rep_data.get('arguments', [])
+    returns = rep_data.get('returns', [])
+    schema_string = rep_data.get('schema_string', [])
+    
+    # Generate Python signature
+    rep_data['signature_in'] = format_python_signature(arguments)
+    rep_data['signature_out'] = format_python_return_type(returns)
+    
+    # Generate argument name lists
+    rep_data['arg_names'] = get_argument_names(arguments, schema_string)
+    rep_data['out_arg_name'] = get_out_argument_name(arguments)
+    
+    # Extract base operation name
+    if 'template_data' in rep_data:
+        op_name = rep_data['template_data'].get('op_name', '')
+        rep_data['template_data']['base_op_name'] = extract_base_op_name(op_name)
+    
+    return rep_data
+
 
 def generate_signature_dict(replacement_dict):
     signatures = {}
@@ -157,8 +372,8 @@ def generate_replacements(
                     f"Warning: {declaration['operator_name']}.{declaration['overload_name']} - Argument mapping failed, skipping..."
                 )
                 continue
-
         # For view ops, skip dtype overload
+
         if (
             declaration["template_name"] in ["view", "view_copy"]
             and declaration["overload_name"] == "dtype"
@@ -204,7 +419,11 @@ def generate_replacements(
                             declaration["returns"][i]["stride"] = output_shape_stride[
                                 "stride"
                             ]
-
+        #print("Before ")
+        #print(declaration)
+        declaration = enhance_replacement_data(declaration)
+        #print("After ")
+        #print(declaration)
         replacements.append(declaration)
 
     print(f"{num_supported_decs} of {num_total_decs} declarations are supported.")
