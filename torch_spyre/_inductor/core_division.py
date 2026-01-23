@@ -17,14 +17,20 @@ import os
 import torch
 from torch._inductor.ir import (
     ComputedBuffer,
+    FallbackKernel,
     FixedLayout,
+    MultiOutput,
     Pointwise,
     Reduction,
 )
-from torch._inductor.scheduler import BaseSchedulerNode, SchedulerNode
+from torch._inductor.scheduler import (
+    BaseSchedulerNode,
+    ExternKernelSchedulerNode,
+    SchedulerNode,
+)
 
 from . import Unsupported
-from .constants import MATMUL_REDUCTION_OP
+from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
 
@@ -56,7 +62,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     if max_cores == 1:
         return
 
-    if len(output.size) > 2:
+    if len(n.node.get_outputs()) > 2:
         # Core division currently only implemented for 1 or 2 tensors
         return
 
@@ -66,7 +72,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             return
 
     device_size = output.device_layout.device_size
-    split_idx = -2 if len(device_size) == 2 else -3
+    split_idx = -3 if len(device_size) == 4 else 0  # split along stick dim
     num_cores = core_split(device_size[split_idx], max_cores)
     if num_cores > 1:
         for cd in n.spyre_core_division:
@@ -88,6 +94,15 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             for cd in n.spyre_core_division:
                 cd[-3] = num_cores
 
+    if red.reduction_type == BATCH_MATMUL_OP:
+        # [mb, out//64, x, 64]
+        device_size = output.device_layout.device_size
+        # try split along mb first
+        mb_nsplit = core_split(device_size[0], max_cores)
+        if mb_nsplit > 1:
+            for cd in n.spyre_core_division:
+                cd[0] = mb_nsplit
+
 
 def core_division_planning(
     nodes: list[BaseSchedulerNode],
@@ -97,7 +112,8 @@ def core_division_planning(
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
 
-    for n in nodes:
+    it = iter(nodes)
+    for n in it:
         if isinstance(n, SchedulerNode) and isinstance(n.node, ComputedBuffer):
             if isinstance(n.node.data, Pointwise):
                 divide_pointwise_op(n, get_mem_deps(n), max_cores)
@@ -106,7 +122,19 @@ def core_division_planning(
             else:
                 # Core division not supported on other IRNode types
                 pass
+        elif isinstance(n, ExternKernelSchedulerNode):
+            if isinstance(n.node, FallbackKernel):
+                n = next(it, None)
+                if not (
+                    isinstance(n, ExternKernelSchedulerNode)
+                    and isinstance(n.node, MultiOutput)
+                ):
+                    raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
+                # Core division not supported on fallback kernels
+                pass
+            else:
+                print(f"Warning: unhandled node type {type(n.node)}")
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 

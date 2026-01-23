@@ -16,7 +16,7 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, StickFormat, DataFormats
+from torch_spyre._C import SpyreTensorLayout, StickFormat, DataFormats, to_with_layout
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -40,9 +40,9 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.num_stick_dims, 1)
 
         stl = SpyreTensorLayout([512, 8, 256], torch.float16)
-        self.assertEqual(stl.device_size, [512, 4, 8, 64])
-        self.assertEqual(stl.device_strides(), [2048, 512, 64, 1])
-        self.assertEqual(stl.dim_map, [0, 2, 1, 2])
+        self.assertEqual(stl.device_size, [8, 4, 512, 64])
+        self.assertEqual(stl.device_strides(), [131072, 32768, 64, 1])
+        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
@@ -55,9 +55,9 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.num_stick_dims, 1)
 
         stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
-        self.assertEqual(stl.device_size, [256, 8, 8, 64])
-        self.assertEqual(stl.device_strides(), [4096, 512, 64, 1])
-        self.assertEqual(stl.dim_map, [2, 0, 1, 0])
+        self.assertEqual(stl.device_size, [8, 8, 256, 64])
+        self.assertEqual(stl.device_strides(), [131072, 16384, 64, 1])
+        self.assertEqual(stl.dim_map, [1, 0, 2, 0])
         self.assertEqual(stl.format, StickFormat.Dense)
         self.assertEqual(stl.num_stick_dims, 1)
 
@@ -100,6 +100,37 @@ class TestSpyreTensorLayout(TestCase):
         z = SpyreTensorLayout([512, 256], torch.float16, [1, 0])
         self.assertEqual(x, y)
         self.assertNotEqual(y, z)
+
+    def test_to_spyre_layout(self):
+        x = torch.rand([512, 256], dtype=torch.float16)
+        x = torch.rand([512, 256], dtype=torch.float16)
+        x_stl = SpyreTensorLayout([512, 256], torch.float16)
+        x_dev = to_with_layout(x, x_stl)
+        self.assertEqual(x_dev, x_dev.cpu())
+
+        y = torch.rand([512, 512], dtype=torch.float16)
+        y_stl = SpyreTensorLayout(
+            [8, 512, 64], [0, 1, 0], 1, StickFormat.Dense, DataFormats.SEN169_FP16
+        )
+        y_dev = to_with_layout(y, y_stl)
+        self.assertEqual(y_dev, y_dev.cpu())
+
+        z = torch.rand([512, 8, 256], dtype=torch.float16)
+        z_stl = SpyreTensorLayout([512, 8, 256], torch.float16, [2, 1, 0])
+        z_dev = to_with_layout(z, z_stl)
+        self.assertEqual(z_dev, z_dev.cpu())
+
+    def test_dim_order_round_trip(self):
+        """Tests the pattern used by inductor to propagate dim order from inputs to outputs"""
+        x_2 = SpyreTensorLayout([3, 256], torch.float16)
+        y_2 = SpyreTensorLayout([3, 256], torch.float16, x_2.host_dim_order())
+        self.assertEqual(x_2, y_2)
+        x_3 = SpyreTensorLayout([3, 64, 256], torch.float16)
+        y_3 = SpyreTensorLayout([3, 64, 256], torch.float16, x_3.host_dim_order())
+        self.assertEqual(x_3, y_3)
+        x_4 = SpyreTensorLayout([7, 3, 64, 256], torch.float16)
+        y_4 = SpyreTensorLayout([7, 3, 64, 256], torch.float16, x_4.host_dim_order())
+        self.assertEqual(x_4, y_4)
 
 
 if __name__ == "__main__":

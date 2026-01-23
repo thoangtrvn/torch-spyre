@@ -47,10 +47,6 @@ aten = torch.ops.aten
 spyreop = torch.ops.spyre
 
 
-def stl_host_dim_order(self: SpyreTensorLayout) -> list[int]:
-    return self.dim_map[1:]
-
-
 def stl_stick_dim(self: SpyreTensorLayout) -> int:
     return self.dim_map[-1]
 
@@ -65,7 +61,6 @@ def stl_is_stick_reduction(self: SpyreTensorLayout, axis: list[int]) -> bool:
         return False
 
 
-setattr(SpyreTensorLayout, "host_dim_order", stl_host_dim_order)
 setattr(SpyreTensorLayout, "stick_dim", stl_stick_dim)
 setattr(SpyreTensorLayout, "is_stick_reduction", stl_is_stick_reduction)
 
@@ -91,10 +86,20 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     if len(args) == 1:
         x = args[0]
         match op:
-            case spyreop.layernormnorm.default:
-                raise Unsupported("TODO: layernormnorm")
             case spyreop.layernormscale.default:
-                raise Unsupported("TODO: layernormscale")
+                if not x.layout.size == output.size:
+                    raise Unsupported(
+                        f"size mismatch:  layernormscale({x.layout.size})=>{output.size}) "
+                    )
+                stl = SpyreTensorLayout(
+                    output.size,
+                    output.dtype,
+                    x.layout.device_layout.host_dim_order(),
+                    x.layout.device_layout.format,
+                )
+                return FixedTiledLayout(
+                    output.device, output.dtype, output.size, output.stride, stl
+                )
             case spyreop.slice.default:
                 if x.layout.device_layout.format != StickFormat.Sparse:
                     raise Unsupported("slice on non-sparse tensor")
@@ -137,6 +142,21 @@ def pointwise_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
                 return FixedTiledLayout(
                     output.device, output.dtype, output.size, output.stride, stl
                 )
+    elif op == spyreop.layernormnorm.default:
+        x = args[0]
+        if not x.layout.size == output.size:
+            raise Unsupported(
+                f"size mismatch:  layernormnorm({x.layout.size})=>{output.size}) "
+            )
+        stl = SpyreTensorLayout(
+            output.size,
+            output.dtype,
+            x.layout.device_layout.host_dim_order(),
+            x.layout.device_layout.format,
+        )
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
     else:
         output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
         input_dims = [stride_order_vars(arg.dep.index) for arg in args]
@@ -174,28 +194,46 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
     red: Reduction = n.node.data
     output: FixedLayout = n.node.get_layout()
     output_dims = stride_order_vars(list(n.read_writes.writes)[0].index)
-    if (
-        red.reduction_type == MATMUL_REDUCTION_OP
-        or red.reduction_type == BATCH_MATMUL_OP
-    ):
+    if red.reduction_type == MATMUL_REDUCTION_OP:
         x_stl = args[0].layout.device_layout
         y_stl = args[1].layout.device_layout
+        if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
+            raise Unsupported(f"matmul on non-dense tensors {x_stl} {y_stl}")
+        if x_stl.stick_dim() == 0 and y_stl.stick_dim() == 0:
+            out_host_dim_order = [1, 0]
+        elif x_stl.stick_dim() != 0 and y_stl.stick_dim() != 0:
+            out_host_dim_order = [0, 1]
+        else:
+            raise Unsupported(f"matmul stick dimensions mismatch {x_stl} {y_stl}")
+        stl = SpyreTensorLayout(output.size, output.dtype, out_host_dim_order)
+        return FixedTiledLayout(
+            output.device, output.dtype, output.size, output.stride, stl
+        )
+    elif red.reduction_type == BATCH_MATMUL_OP:
+        x_stl = args[0].layout.device_layout
+        y_stl = args[1].layout.device_layout
+        output_host_dim_order = x_stl.host_dim_order()
         if x_stl.format != StickFormat.Dense or y_stl.format != StickFormat.Dense:
             raise Unsupported(
                 f"{red.reduction_type} on non-dense tensors {x_stl} {y_stl}"
             )
+        if len(x_stl.device_size) != len(output.size) + 1:
+            output_host_dim_order = x_stl.host_dim_order()[:-1]
         if x_stl.host_dim_order() != y_stl.host_dim_order():
             raise Unsupported(
                 f"{red.reduction_type} stick dimensions mismatch {x_stl} {y_stl}"
             )
-        stl = SpyreTensorLayout(output.size, output.dtype, x_stl.host_dim_order())
+        stl = SpyreTensorLayout(output.size, output.dtype, output_host_dim_order)
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
     elif red.reduction_type == "exx2":
         x_stl = args[0].layout.device_layout
         stl = SpyreTensorLayout(
-            output.size, output.dtype, x_stl.host_dim_order(), StickFormat.SparseMulti
+            output.size,
+            output.dtype,
+            x_stl.host_dim_order(),
+            StickFormat.SparseMulti,
         )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl

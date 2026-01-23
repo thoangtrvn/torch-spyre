@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-MATMUL_REDUCTION_OP = "matmul"
 BATCH_MATMUL_OP = "batchmatmul"
-TRANSPOSE_OP = "transpose"
-DEVICE_NAME = "spyre"
 CLONE_OP = "clone"
+MATMUL_REDUCTION_OP = "matmul"
+TRANSPOSE_OP = "transpose"
+
+DEVICE_NAME = "spyre"
+
 
 SEGMENT_OFFSETS = [
     0x0,
@@ -32,9 +34,6 @@ SPYRE_FP32_OPS = [
     "add",
     "sub",
     "mul",
-    "ge",
-    "le",
-    "eq",
     "where",
     "realdiv",
     "relu",

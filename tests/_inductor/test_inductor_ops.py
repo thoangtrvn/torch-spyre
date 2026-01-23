@@ -190,6 +190,20 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ]
             ),
         },
+        (
+            "test_alias_operands_cpu",
+            "test_unary_op_cpu",
+        ): {
+            "ops_dict": {
+                "pow": lambda x: torch.pow(x, 2),
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),),
+                    ((67, 256),),
+                ]
+            ),
+        },
         # Compare with cpu for now to avoid hitting eager mode coverage issue
         ("test_max_keepdim0", "test_reduce_keepdim0_cpu"): {
             "ops_dict": {
@@ -252,6 +266,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": make_param_dict(
                 [
                     ((1088, 320),),
+                    ((320, 320),),
                 ]
             ),
         },
@@ -266,6 +281,11 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     1,
                     2,
                     cached_randn((512, 256, 128), abs=True),
+                ),
+                "dim_0_2_same_dim": (
+                    0,
+                    2,
+                    cached_randn((128, 128, 128), abs=True),
                 ),
             }
         },
@@ -289,27 +309,72 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+        ("test_cmp", "test_binary_op_cpu"): {
+            "ops_dict": {
+                "eq": torch.eq,
+                "ne": torch.ne,
+                "ge": torch.ge,
+                "le": torch.le,
+                "gt": torch.gt,
+                "lt": torch.lt,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "2d": (
+                    torch.ceil(cached_randn((64, 128), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((64, 128), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "3d": (
+                    torch.ceil(cached_randn((2, 32, 128), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((2, 32, 128), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+                "broadcast": (
+                    torch.ceil(cached_randn((256, 256), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
+                ),
+            },
+        },
         (
             "test_where",
             "test_where_cpu",
         ): {
+            "ops_dict": {
+                "eq": lambda x, y: x == y,
+                "ne": lambda x, y: x != y,
+                "ge": lambda x, y: x >= y,
+                "le": lambda x, y: x <= y,
+                "gt": lambda x, y: x > y,
+                "lt": lambda x, y: x < y,
+            },
             "param_sets": {
-                "eq": (
-                    lambda x, y: x == y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
+                "1d256": (
+                    torch.ceil(cached_randn((256,), abs=True, scale=10.0)).to(
+                        dtype=torch.float16
+                    ),
+                    torch.ceil(cached_randn((256,), abs=True, scale=9.9)).to(
+                        dtype=torch.float16
+                    ),
                 ),
-                "ge": (
-                    lambda x, y: x >= y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
-                ),
-                "ne": (
-                    lambda x, y: x != y,
-                    cached_randn((256,)),
-                    cached_randn((256,)),
-                ),
-            }
+            },
         },
         (
             "test_pointwise_binary_op_fp32",
@@ -426,6 +491,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 },
             },
         },
+        (
+            "test_full",
+            "test_full_cpu",
+        ): {
+            "param_sets": {
+                "value_1": (
+                    ([64, 128]),
+                    -65472.0,
+                ),
+                "value_2": (
+                    ([64, 128]),
+                    -65504.0,
+                ),
+                "tuple": (
+                    ((64, 64)),
+                    1024.0,
+                ),
+                "size": (
+                    torch.Size([64, 128]),
+                    1024.0,
+                ),
+            },
+        },
+        (
+            "test_dropout_functional",
+            "test_dropout_functional",
+        ): {
+            "param_sets": {
+                "value_3d": (
+                    cached_randn((64, 11, 2048)),
+                    {
+                        "p": 0.5,
+                        "training": False,
+                        "inplace": False,
+                    },
+                ),
+                "value_4d": (
+                    cached_randn((1, 64, 11, 2048)),
+                    {
+                        "p": 0.0,
+                        "training": False,
+                        "inplace": False,
+                    },
+                ),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -450,6 +561,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         else:
             compare(op, x)
 
+    def test_bool(self):
+        # torch._dynamo.config.dynamic_shapes = False
+        dtype = torch.bool
+        x = torch.randint(0, 2, (2, 64), dtype=dtype)
+        x_spyre = x.to("spyre")
+        y = torch.randint(0, 2, (2, 64), dtype=dtype)
+        y_spyre = y.to("spyre")
+        result = torch.compile(torch.eq, dynamic=False)(x_spyre, y_spyre).cpu()
+        torch.testing.assert_close(result, torch.eq(x, y))
+
+    def test_unary_op_cpu(self, op, x):
+        compare_with_cpu(op, x)
+
     def test_binary_op(self, op, a, b):
         if op == torch.div:
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
@@ -463,6 +587,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             compare_with_cpu(op, a, b)
         else:
             compare(op, a, b)
+
+    def test_binary_op_cpu(self, op, x, y):
+        compare_with_cpu(op, x, y)
 
     @unittest.skip("deeptools: error")
     def test_add_broadcast(self, x, y):
@@ -523,6 +650,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     def test_clone(self, x):
         compare_with_cpu(lambda a: torch.clone(a).contiguous(), x)
 
+    def test_dropout_functional(self, input, kwargs):
+        compare_with_cpu(lambda a: torch.nn.functional.dropout(a, **kwargs), input)
+
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
     def test_fallback_cpu(self, x):
         def fn(t):
@@ -545,6 +675,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_numel_cpu(self, x):
         compare_with_cpu(lambda x: torch.numel(x), x)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_full_cpu(self, *args):
+        def fn(device=None):
+            return torch.full(*args, dtype=torch.float16, device=device)
+
+        compare_with_cpu(fn, needs_device=True)
 
 
 if __name__ == "__main__":

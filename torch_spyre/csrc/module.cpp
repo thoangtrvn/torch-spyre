@@ -31,7 +31,7 @@
 #include <sendnn/graph/graph_builder.hpp>
 #include <sendnn/graph/graph_deserializer.hpp>
 #include <sendnn/graph/graph_utils.hpp>
-#include <sendnn/runtime/graph_loader.hpp>
+#include <sendnn/interface/graph_loader.hpp>
 #include <sendnn/runtime/runtime_interface.hpp>
 #include <sendnn/tensor/sentensor_info.hpp>
 #include <sendnn/util/status.hpp>
@@ -122,8 +122,9 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
                 new sendnn::Node(sendnn::opcodes::PrimaryInput, {tensor}));
             exec_graph.NewEdge(edge_count, node, 0,
                                exec_graph.input_ops_[edge_count]);
-            sub_graph.NewEdge(edge_count++, compute_node, 0,
+            sub_graph.NewEdge(edge_count, compute_node, 0,
                               sub_graph.input_ops_[edge_count]);
+            edge_count++;
           } else {
             auto tensor = sendnn::Tensor(getTensorInfo(arg));
             exec_graph.NewOutput(sendnn::opcodes::PrimaryOutput, {});
@@ -182,7 +183,14 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
   sen_outputs.push_back(tensor);
 
   // Execute device init
-  if (args.size() >= 3) {
+  if (args.size() == 6) {
+    // Filling in segment 5 adds another input to the device init supernode
+    status =
+        gl.Predict(sendnn::Outputs(), {sen_inputs[1], sen_outputs.front()}, 1);
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+    status = gl.Compute(sen_outputs, sen_inputs, 2);
+    if (!status.IsOk()) throw std::runtime_error(status.Message());
+  } else if (args.size() >= 3) {
     status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, 1);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
 
@@ -228,6 +236,14 @@ void convertArtifacts(std::string artifacts_path) {
 
   return;
 }
+
+int64_t get_elem_in_stick(c10::ScalarType torch_dtype) {
+  auto str_type = torchScalarToString[torch_dtype];
+  const auto [sen_dtype_cpu, sen_dtype_dev] =
+      stringToDTDataFormatPair(str_type);
+  return elems_per_stick(sen_dtype_dev);
+}
+
 }  // namespace spyre
 
 PYBIND11_MODULE(_C, m) {
@@ -238,6 +254,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+  m.def("to_with_layout", &spyre::to_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -280,6 +297,7 @@ PYBIND11_MODULE(_C, m) {
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
       .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
+      .def("host_dim_order", &spyre::SpyreTensorLayout::host_dim_order)
       .def(py::self == py::self)
       .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
            py::arg("host_size"), py::arg("dtype"))
@@ -298,4 +316,5 @@ PYBIND11_MODULE(_C, m) {
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,
         "Enable/disable downcast warnings for this process.");
+  m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
 }

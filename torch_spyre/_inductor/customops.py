@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from typing import Optional, Sequence
 import torch
+from torch_spyre.fallbacks import warn_fallback
 
 from . import Unsupported
 
@@ -85,7 +86,7 @@ def layer_norm(
         raise Unsupported(
             f"spyre.layernorm: unsupported reduction shape {normalized_shape}"
         )
-    return torch.native_layer_norm(x, normalized_shape, weight, bias, eps)[0]
+    return torch.native_layer_norm(x, normalized_shape, weight, bias, eps)[0].clone()
 
 
 @layer_norm.register_fake
@@ -170,3 +171,26 @@ def _(
     max: Optional[torch.types.Number] = None,
 ):
     return input.new_empty(input.size())
+
+
+@torch.library.custom_op("spyre::full", mutates_args=(), device_types="spyre")
+def spyre_full(
+    size: Sequence[int],
+    fill_value: torch.types.Number,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    # Fall back to CPU.
+    warn_fallback("torch.ops.spyre.full")
+    tmp = torch.full(size, fill_value, dtype=dtype, device="cpu")
+    return tmp.to(device)
+
+
+@spyre_full.register_fake
+def _(
+    size: Sequence[int],
+    fill_value: torch.types.Number,
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+):
+    return torch.empty(size, dtype=dtype, device="spyre")
