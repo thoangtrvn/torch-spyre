@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Union
 import torch
 import torch_spyre.fallbacks  # noqa: F401
 
@@ -28,5 +29,14 @@ def spyre__mm_out(
 ) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
     return compiled_mm(self, mat2, out=out)
+
+
+@torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])
+def spyre__fill_scalar(
+    self: torch.Tensor, other: Union[int, float, bool, complex]
+) -> torch.Tensor:
+    tmp = torch.ones(self.size(), dtype=self.dtype) * other
+    self.copy_(tmp)
+    return self
 
 # INSERT_CODEGEN_HERE
