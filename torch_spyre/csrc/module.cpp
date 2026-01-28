@@ -300,11 +300,12 @@ PYBIND11_MODULE(_C, m) {
       .def("elems_per_stick", &spyre::SpyreTensorLayout::elems_per_stick)
       .def("host_dim_order", &spyre::SpyreTensorLayout::host_dim_order)
       .def(py::self == py::self)
-      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
-           py::arg("host_size"), py::arg("dtype"))
+      .def(py::init<std::vector<int64_t>, c10::ScalarType, bool>(),
+           py::arg("host_size"), py::arg("dtype"),
+           py::arg("pad_all_dims") = false)
       .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
                     spyre::SpyreTensorLayout::StickFormat>(),
-           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
+           py::arg("padded_size"), py::arg("dtype"), py::arg("dim_order"),
            py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
       .def(py::init<std::vector<int64_t>, std::vector<int32_t>, int32_t,
                     spyre::SpyreTensorLayout::StickFormat, DataFormats>(),

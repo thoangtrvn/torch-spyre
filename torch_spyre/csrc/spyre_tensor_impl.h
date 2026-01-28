@@ -63,8 +63,9 @@ class SpyreTensorLayout {
    * host_size. Generic stick format is row major with a single dense stick
    * dimension.
    */
-  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype) {
-    init(host_size, dtype);
+  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
+                    bool pad_all_dims = false) {
+    init(host_size, dtype, pad_all_dims);
   }
 
   /**
@@ -91,14 +92,15 @@ class SpyreTensorLayout {
    * host_size. Generic stick format is row major with a single dense stick
    * dimension.
    */
-  void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
+  void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
+            bool pad_all_dims);
 
   /**
    * Initialize a SpyreTensorLayout for the argument host_size with the given
    * order of dimensions in decreasing stride order and stick format.
    */
-  void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
-            std::vector<int32_t> dim_order, StickFormat format = Dense);
+  void init(std::vector<int64_t> padded_size, c10::ScalarType dtype,
+            std::vector<int32_t> dim_order, StickFormat format);
 
   std::string toString() const;
 
