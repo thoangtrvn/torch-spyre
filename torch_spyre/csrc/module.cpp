@@ -37,11 +37,14 @@
 #include <sendnn/util/status.hpp>
 #include <string>
 #include <vector>
+#include <cstdlib>
+#include <cstdint>
 
 #include "logging.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
 #include "types_mapping.h"
+#include "spyre_program_loader.h"
 
 namespace spyre {
 
@@ -92,12 +95,32 @@ void freeRuntime() {
   GlobalRuntime::reset();
 }
 void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
+
+  auto runtime = GlobalRuntime::get();
+
   // Get global runtime from eager
   auto gl = sendnn::GraphLoader(GlobalRuntime::get());
 
   // Load compiled kernel
   auto g2 = sendnn::Graph();
   sendnn::Deserialize(&g2, g2_path);
+
+  auto programs = spyre::ExtractProgramsFromGraph(g2);
+  for (const auto& pi : programs) {
+    DEBUGINFO("printing PI");
+    DEBUGINFO(pi.device_dmva);
+    DEBUGINFO(pi.size_bytes);
+  }
+
+  auto dma_result = runtime->DirectProgramDmaTransfer(
+        const_cast<void*>(programs[0].data),
+        programs[0].device_dmva,
+        programs[0].size_bytes,
+        0
+  );
+  setenv("PROGRAM_DMVA_TEST", std::to_string(programs[0].device_dmva).c_str(), 1);
+  DEBUGINFO(dma_result.status);
+  DEBUGINFO(dma_result.bytes_transferred);
 
   for (auto &super_node : g2.compute_ops_) {
     if (super_node->Name() != "DeviceInit" &&
@@ -184,6 +207,7 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
 
   // Execute device init
   if (args.size() == 6) {
+    DEBUGINFO("Size is 6");
     // Filling in segment 5 adds another input to the device init supernode
     status =
         gl.Predict(sendnn::Outputs(), {sen_inputs[1], sen_outputs.front()}, 1);
@@ -191,14 +215,16 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     status = gl.Compute(sen_outputs, sen_inputs, 2);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
   } else if (args.size() >= 3) {
+    DEBUGINFO("Size is greater than 3");
     status = gl.Predict(sendnn::Outputs(), {sen_inputs[1]}, 1);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
 
     status = gl.Compute(sen_outputs, sen_inputs, 2);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
   } else {
-    status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
-    if (!status.IsOk()) throw std::runtime_error(status.Message());
+    DEBUGINFO("Size is default");
+    // status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
+    // if (!status.IsOk()) throw std::runtime_error(status.Message());
 
     status = gl.Compute(sen_outputs, sen_inputs, 1);
     if (!status.IsOk()) throw std::runtime_error(status.Message());
@@ -227,6 +253,10 @@ void convertArtifacts(std::string artifacts_path) {
                                                    artifacts_path);
 
   setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
+
+  // TODO: Add DMA program here
+  // we may want to save the pointer for the program
+  // TODO: We will need to save the program address to pass to the compute segment
 
   // Convert compiled artifacts to sendnn g2 graph
   pbd.FromGraph(&g2);
