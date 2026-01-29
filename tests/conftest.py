@@ -296,19 +296,6 @@ def pytest_runtest_logreport(report):
     """
     Aggregate per (filepath, base_function).
     """
-    # config = report.config
-    # filepath, func_base = _split_nodeid(report.nodeid)
-
-    # # Count per function
-    # config._func_agg[(filepath, func_base)].add_outcome(report)
-    # # Count global totals
-    # if report.when == "call":
-    #     if report.outcome == "passed":
-    #         config._totals.passed += 1
-    #     elif report.outcome == "failed":
-    #         config._totals.failed += 1
-    #     elif report.outcome == "skipped":
-    #         config._totals.skipped += 1
     filepath, func_base = _split_nodeid(report.nodeid)
     _FUNC_AGG[(filepath, func_base)].add_outcome(report)
 
