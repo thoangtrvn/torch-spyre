@@ -14,6 +14,7 @@
 
 import functools
 import torch
+from torch_spyre._C import SpyreTensorLayout
 
 DEVICE = torch.device("spyre")
 
@@ -171,7 +172,13 @@ class ParameterizedTestMeta(type):
 # compare with eager
 def compare_with_eager(fn, *args, atol=0, rtol=0, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
+    device_args = [
+        arg.to(
+            DEVICE,
+            device_layout=SpyreTensorLayout(arg.shape, arg.dtype, pad_all_dims=True),
+        )
+        for arg in args
+    ]
     device_kwargs = {"device": DEVICE} if needs_device else {}
     result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
     eager_result = fn(*device_args, **device_kwargs).cpu()
@@ -188,7 +195,13 @@ def compare_with_eager(fn, *args, atol=0, rtol=0, needs_device=False):
 # compare with cpu
 def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
+    device_args = [
+        arg.to(
+            DEVICE,
+            device_layout=SpyreTensorLayout(arg.shape, arg.dtype, pad_all_dims=True),
+        )
+        for arg in args
+    ]
     device_kwargs = {"device": DEVICE} if needs_device else {}
     result = torch.compile(fn)(*device_args, **device_kwargs)
     if not isinstance(result, int):
@@ -207,7 +220,13 @@ def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1, needs_device=False):
 # compare with cpu
 def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
+    device_args = [
+        arg.to(
+            DEVICE,
+            device_layout=SpyreTensorLayout(arg.shape, arg.dtype, pad_all_dims=True),
+        )
+        for arg in args
+    ]
     result = torch.compile(fn)(*device_args).cpu()
     pytorch_result = fn_pytorch(*args)
     torch.testing.assert_close(
@@ -223,7 +242,13 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
 # compare with sendnn
 def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
+    device_args = [
+        arg.to(
+            DEVICE,
+            device_layout=SpyreTensorLayout(arg.shape, arg.dtype, pad_all_dims=True),
+        )
+        for arg in args
+    ]
     device_kwargs = {"device": DEVICE} if needs_device else {}
     result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
     sendnn_result = torch.compile(fn, backend="sendnn")(*args).cpu()
@@ -242,7 +267,13 @@ def compare(
     fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
 ):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
-    device_args = [arg.to(DEVICE) for arg in args]
+    device_args = [
+        arg.to(
+            DEVICE,
+            device_layout=SpyreTensorLayout(arg.shape, arg.dtype, pad_all_dims=True),
+        )
+        for arg in args
+    ]
     device_kwargs = {"device": DEVICE} if needs_device else {}
     result = torch.compile(fn)(*device_args, **device_kwargs).cpu()
 
