@@ -103,7 +103,8 @@ SpyreTensorLayout(device_size=[100, 3, 5, 64], dim_map =[1, 2, 0, 2], num_stick_
 
 Only the stick dimension has been padded, resulting in a total allocation of 187.5KB (1500 sticks).
 
-The memory footprint of this tensor is greatly reduced, but it may not
+The memory footprint of this tensor is greatly reduced, but it may not be in a supported input
+format for some compute operations.
 
 ## Fine-grained control of padding and dimension order
 
@@ -141,7 +142,8 @@ Yields a tensor padded only in the third (stick) dimension with the tiling inver
 SpyreTensorLayout(device_size=[5, 3, 100, 64], dim_map =[0, 2, 1, 2], num_stick_dims=1, format=StickFormat.Dense, device_dtype=DataFormats.SEN169_FP16)
 ```
 
-NOTE: This constructor requires that whichever dimension is chosen as the stick dimension
+NOTE: When using the constructor that takes `padded_size` and `dim_order`,
+the user must ensure whichever dimension is chosen as the stick dimension
 is padded appropriately. An error will be raised if this requirement is not met.
 Running the incorrect program below
 
