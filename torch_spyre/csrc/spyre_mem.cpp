@@ -135,12 +135,15 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
     auto dev_stride = get_dim_device_stride(
         dim, stick_size, stl,
         host2device ? stride_info.stride_dst_ : stride_info.stride_src_);
-
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
-    if (dim == stl.dim_map.front() && requires_padding &&
-        !size_less_than_stick) {  // stick_dim
-      stride_info.size_[i] -= 1;
+
+    if (dim == stl.dim_map.front()) {
+      if (requires_padding && !size_less_than_stick) {
+        stride_info.size_[i] -= 1;
+      }
+    } else {
+      stride_info.size_[i] = cpu_shape[stl.dim_map[i]];
     }
   }
   stride_info.offset_src_ = 0;
@@ -705,6 +708,7 @@ at::Tensor empty_with_layout(
   DEBUGINFO("SpyreTensorLayout: ", device_layout.toString());
   return tensor;
 }
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
