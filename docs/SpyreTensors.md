@@ -1,27 +1,30 @@
 # Overview
 
 This document complements the [Tiled Tensor RFC](../RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md)
-by precisely describing the specific device memory layouts used for Tensors in Torch-Spyre.
+by describing the specific device memory layouts and related APIs used for Tensors in Torch-Spyre.
 
 As detailed in more detail in the Motivation section of the Tiled Tensor RFC, the memory layout used on
 Spyre is more complex than PyTorch's standard stride-based layouts.  Tensor entries are
 grouped into *sticks* of 128 bytes. The sticks of a tensor are linearized in device memory using
-layout algorithm that results in a tiling of the dimensions.  All Spyre Tensors carry metadata
-that can be accessed at runtime that describes their layout.
+a layout algorithm that results in a tiling of the dimensions.  All Spyre Tensors carry metadata
+that describes their layout. The metadata can be accessed via both C++ and Python APIs and is
+used by the compiler to specialize a compiled graph to its inputs.
 
-The runtime defines a default memory layout for Tensors, often referred to as the "generic stick" layout.
-This default layout is used for all Tensors created on the device (via `to` or similar APIs)
+The runtime defines a default memory layout for Tensors, often referred to by Torch-Spyre developers
+as the "generic stick" layout.
+This default layout is used for all Tensors created on the device
 unless overridden by providing a `SpyreTensorLayout` as an explicit argument to the operation that creates
 the Tensor.  Conceptually the default layout (a) pads all dimensions to be evenly divisible into sticks
 (b) designates the last dimension as the stick dimension and (c) tiles along the first dimension.
 
 # Details and Default Layout
 
-The layout metadata is encoded by the runtime class `SpyreTensorLayout` (see [spyre_tensor_impl.h](../torch_spyre/csrc/spyre_tensor_impl.h)).
+The layout metadata is encoded by the runtime C++ class `SpyreTensorLayout` (see [spyre_tensor_impl.h](../torch_spyre/csrc/spyre_tensor_impl.h)).
+An instance of this class is embedded as a field in the `SpyreTensorImpl` class.
 It can be accessed in Python via an added Tensor method `device_tensor_layout()`.
 The key elements of metadata are:
-+ `device_size`: analagous to PyTorch's `size` but with padded values an extra dimensions for tiling
-+ `dim_map`: a vector of the same length as `device_size` giving the index in the PyTorch `size` array for each element of `device_size`
++ `device_size`: analagous to PyTorch's `size` but with padded values an extra dimensions for tiling.
++ `dim_map`: a vector of the same length as `device_size` giving the index in the PyTorch `size` array for each element of `device_size`.
 + `format`: either `Dense` (normal case) or `Sparse` (resulting from reductions in the stick dimension).
 + `device_dtype`: the datatype of the Tensor.
 
@@ -46,9 +49,9 @@ A float16 is two bytes, therefore each stick contains 64 data values.
 The stick dimension of `150` has been padded to `192` and broken into two device dimensions of (`3` and `64`).
 The non-stick dimensions of `5` and `100` have been padded to `64` and `128` respectively.
 The total device memory allocated for the tensor is 3MB (`128*3*64 = 24,576` 128 byte sticks).
-This 3MB of memory contains only 150,000 bytes of real data; the remainder is padding that ensures that
-the data values are arranged in a fashion that will enables any sequence of compute ops to be
-applied to the tensor.
+This 3MB of memory contains only 150,000 bytes of real data; the remainder of the memory is padding
+that ensures that the data values are arranged in a fashion that will enable the tensor to be used
+as an input to any legal sequence of compute operations.
 
 # Controlling Layout Decisions
 
@@ -58,14 +61,16 @@ must be aware of any layout constraints imposed by the compute operations that
 use the tensors as input values.
 
 All of the APIs work by first constructing a `SpyreTensorLayout` the describes the desired
-memory layout, then passing that `SpyreTensorLayout` as a keyword argument to `to`,
+memory layout. The `SpyreTensorLayout` is then passed as a keyword argument to `to`,
 `empty_strided` or similar torch function.
 
 ## Explicit API with default layout
 
 The minimal constructor for a `SpyreTensorLayout` takes a `size` and `dtype` and
-builds a instance that encodes the default layout.  This can be used as an explict argument
-to `to` if desired.
+builds a instance that encodes the default generic stick layout.  This constructor
+is what is used behind the scenes when the user does not specify a layout.
+
+As an example, we can explictly request the default layout in a `to` by doing:
 
 ```
 import torch
