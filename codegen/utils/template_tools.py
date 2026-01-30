@@ -18,6 +18,28 @@ from utils.arg_mapper import map_arguments
 from utils.shape_extractor import infer_output_shape_stride
 
 import re
+from typing import List
+
+def extract_scalar_arg_names(schema_string: str) -> List[str]:
+    """
+    Extract scalar argument names from PyTorch operator schema.
+
+    Examples:
+        extract_scalar_arg_names("aten::add.Tensor(Tensor self, *, Scalar alpha=1) -> Tensor")
+        ['alpha']
+    """
+    # Extract arguments from parentheses
+    match = re.search(r'\((.*?)\)\s*->', schema_string)
+    if not match:
+        return []
+    args_str = match.group(1)
+    # Find all Scalar arguments with their names
+    # Pattern: Scalar (optionally ?) followed by whitespace and name
+    pattern = r'Scalar\??[\s]+([a-zA-Z_][a-zA-Z0-9_]*)'
+    all_scalar_names = re.findall(pattern, args_str)
+    # Filter out alpha and beta
+    return [name for name in all_scalar_names if name not in ['alpha', 'beta']]
+
 
 def get_args_with_default_vals(schema_string):
     """
@@ -178,14 +200,6 @@ def get_argument_names(arguments, schema_string):
     return ", ".join(names)
 
 
-def get_out_argument_name(arguments):
-    """Find and return the 'out' parameter name if it exists."""
-    for arg in arguments:
-        if arg['name'] == 'out':
-            return arg['name']
-    return None
-
-
 def extract_base_op_name(op_name):
     """
     Extract base operation name without suffixes.
@@ -198,7 +212,7 @@ def extract_base_op_name(op_name):
     # Remove common suffixes
     base_name = op_name
 
-    strip_list = ["_names", "_out", "_Tensor", "_default", "_mode", "_dims", "_dimname", "_dim", "_Dimname", "_int"]
+    strip_list = ["_Scalar", "_names", "_out", "_Tensor", "_default", "_mode", "_dims", "_dimname", "_dim", "_Dimname", "_int"]
     for st in strip_list:
         if st in base_name:
             base_name = base_name.replace(st, "")
@@ -206,6 +220,33 @@ def extract_base_op_name(op_name):
         base_name = base_name[:-1]
 
     return base_name
+
+def append_scalar_suffix(arg_names: str, scalar_arg_names: List[str]) -> str:
+    """
+    Append '_scaTensor' suffix to scalar argument names in the arg_names string.
+
+    Args:
+        arg_names: Comma-separated string of argument names
+        scalar_arg_names: List of scalar argument names
+
+    Returns:
+        Modified arg_names string with scalar args suffixed
+
+    Examples:
+        append_scalar_suffix("self, other, alpha", ["other"])
+        'self, other_scaTensor, alpha'
+    """
+    # Split arg_names into individual arguments
+    args = [arg.strip() for arg in arg_names.split(',')]
+    # Modify arguments that are scalars
+    modified_args = []
+    for arg in args:
+        if arg in scalar_arg_names:
+            modified_args.append(f"{arg}_scaTensor")
+        else:
+            modified_args.append(arg)
+    # Rejoin with comma-space
+    return ", ".join(modified_args)
 
 
 def enhance_replacement_data(rep_data):
@@ -222,14 +263,14 @@ def enhance_replacement_data(rep_data):
     rep_data['signature_out'] = format_python_return_type(returns)
     
     # Generate argument name lists
+    rep_data['scalar_arg_names'] = extract_scalar_arg_names(schema_string)
     rep_data['arg_names'] = get_argument_names(arguments, schema_string)
-    rep_data['out_arg_name'] = get_out_argument_name(arguments)
+    rep_data['arg_names'] = append_scalar_suffix(rep_data['arg_names'], rep_data['scalar_arg_names'])
     
     # Extract base operation name
     if 'template_data' in rep_data:
         op_name = rep_data['template_data'].get('op_name', '')
         rep_data['template_data']['base_op_name'] = extract_base_op_name(op_name)
-    
     return rep_data
 
 
@@ -287,9 +328,9 @@ def generate_replacements(
     Generates replacement data for PyTorch ops (specified in declaration and schema files)
 
     Args:
-        all_declarations (list): list of dicts parsed from PyTorch Declarations.yaml
-        all_schemas (list): list of dicts parsed from PyTorch RegistrationDeclarations.yaml (indices match with declarations)
-        metadata (dict): dict of metadata for each operator (contains sendnn_func_name, template_name and arg_mapping) parsed from Metadata.yaml
+        all_declarations (list): list of dicts parsed from pytorch Declarations.yaml
+        all_schemas (list): list of dicts parsed from pytorch RegistrationDeclarations.yaml (indices match with declarations)
+        metadata (dict): dict of metadata for each operator (contains template_name and arg_mapping) parsed from Metadata.yaml
         action (str): what to do if the operator is not supported, options: 'skip', 'fallback', 'native_call'
         only_req (bool): set true to enable filtering with (dispatch=True, default=False)
     """
@@ -354,25 +395,15 @@ def generate_replacements(
                 else "default"
             ),
             "op_label": f'"{declaration["operator_name"].capitalize()}"',
-            "sendnn_func_name": cur_metadata["sendnn_func_name"],
             "reg_name": f'"{declaration["operator_name"]}.{declaration["overload_name"]}"'
             if declaration["overload_name"]
             else f'"{declaration["operator_name"]}"',
+            "torch_prefix": cur_metadata.get("torch_prefix", "torch"),
+            "torch_func_name": cur_metadata.get("torch_func_name", declaration["operator_name"]),
         }
 
         signatures = generate_signature_dict(declaration)
         declaration |= signatures
-
-        # if the template is base or list_inp, will try mapping args between torch and sendnn
-        if declaration["template_name"] in ["base", "list_inp"]:
-            maparg_success_flag = map_arguments(declaration, cur_metadata)
-            if not maparg_success_flag:
-                # Argument mapping has failed, so this operation is skipped
-                print(
-                    f"Warning: {declaration['operator_name']}.{declaration['overload_name']} - Argument mapping failed, skipping..."
-                )
-                continue
-        # For view ops, skip dtype overload
 
         if (
             declaration["template_name"] in ["view", "view_copy"]

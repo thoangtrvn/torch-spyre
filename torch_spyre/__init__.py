@@ -156,11 +156,11 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+    from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-    #import torch_spyre.ops  # noqa: F401
     import torch_spyre.codegen_ops
     import torch_spyre._inductor.preload  # noqa: F401
 

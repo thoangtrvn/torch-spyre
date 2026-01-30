@@ -88,6 +88,7 @@ class FixedTiledLayout(FixedLayout):
     ) -> None:
         super().__init__(device, dtype, size, stride)
         self.device_layout = device_layout
+        self.allocation: dict[str, Any] = {}
 
     def __str__(self) -> str:
         device_index_str = "" if self.device.index is None else f":{self.device.index}"

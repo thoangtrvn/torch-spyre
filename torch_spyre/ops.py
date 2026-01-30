@@ -32,7 +32,7 @@ def spyre__mm_out(
 
 
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])
-def spyre__fill_scalar(
+def spyre__fill_Scalar(
     self: torch.Tensor, other: Union[int, float, bool, complex]
 ) -> torch.Tensor:
     tmp = torch.ones(self.size(), dtype=self.dtype) * other
