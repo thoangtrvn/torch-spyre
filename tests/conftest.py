@@ -260,6 +260,26 @@ def compile_backend(pytestconfig):
     return s or None
 
 
+_ALLOWED_TAG_KEYS = {"yaml", "op", "model"}
+
+
+def _parse_tail_tags(parts: list[str]) -> dict:
+    """
+    Parse trailing ::key=value tags appended to nodeid at collection.
+    Scans from the end until it leaves the tag tail.
+    """
+    kv = {}
+    for p in reversed(parts):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            if k in _ALLOWED_TAG_KEYS:
+                kv[k] = v
+                continue
+        if kv:
+            break
+    return kv
+
+
 def _split_nodeid(nodeid: str):
     """
     Split pytest nodeid into (filepath, test_func_base).
@@ -271,20 +291,24 @@ def _split_nodeid(nodeid: str):
     """
     # nodeid format: path::[class::]func[params][::subnode...]
     parts = nodeid.split("::")
+    kv = _parse_tail_tags(parts)
     filepath = parts[0]
-
-    # Find the first callable-ish part after optional classes, take the function name
     func = None
-    for p in parts[1:]:
-        # ignore class-like parts (start with uppercase or typical class names)
-        # and nested sections; we want the first function-ish thing
-        # Heuristic: test functions typically start with 'test_' or end up as names with params
-        if p.startswith("test_"):
-            func = p
-            break
-    if func is None and len(parts) >= 2:
-        # fallback: take last part if we can't detect; still strip params
-        func = parts[-1]
+    if kv:
+        filepath = kv["yaml"]
+        func = kv["op"]
+    else:
+        # Find the first callable-ish part after optional classes, take the function name
+        for p in parts[1:]:
+            # ignore class-like parts (start with uppercase or typical class names)
+            # and nested sections; we want the first function-ish thing
+            # Heuristic: test functions typically start with 'test_' or end up as names with params
+            if p.startswith("test_"):
+                func = p
+                break
+        if func is None and len(parts) >= 2:
+            # fallback: take last part if we can't detect; still strip params
+            func = parts[-1]
 
     # Strip parametrization: test_model_add[param=foo] -> test_model_add
     func_base = re.sub(r"\[.*\]$", "", func)
@@ -354,6 +378,11 @@ def pytest_configure(config):
     _OUT_PATH = os.environ.get("CUSTOM_MD_REPORT", "custom_md_report.md")
 
 
+# def _safe_tag_value(s: str) -> str:
+# 	# Keep path-ish and dotted tokens readable; sanitize weird chars
+#     return re.sub(r"[^0-9A-Za-z._/+\-\\:]+", "_", str(s)).strip("_")
+
+
 def pytest_collection_modifyitems(config, items):
     selected_models = config.getoption("--model") or []
     if not selected_models:
@@ -373,6 +402,34 @@ def pytest_collection_modifyitems(config, items):
     if deselect:
         config.hook.pytest_deselected(items=deselect)
         items[:] = keep
+    for item in items:
+        if "tests/_inductor/test_model_ops.py::" not in item.nodeid:
+            continue
+
+        callspec = getattr(item, "callspec", None)
+        yaml_path = None
+        op_name = None
+        model = None
+        if callspec is not None:
+            params = callspec.params
+            # 'source_path' is passed via your parametrization (based on _iter_yaml_cases)
+            yaml_path = params.get("source_path")
+            model = params.get("model")
+            case = params.get("case")
+            op_name = None
+            if isinstance(case, dict):
+                op_name = case.get("op")
+            # Fallback: parse from the bracket tail (…::torch.matmul)
+            if not op_name:
+                # op_name = _extract_bracket_tail_op(item.nodeid) or "test_model_ops"
+                op_name = "TUAN_test_model_ops"
+            yaml_val = yaml_path.name
+            # yaml_val  = _safe_tag_value(_rel_to_root(str(yaml_path), root)) if yaml_path else \
+            #             _safe_tag_value(_rel_to_root(item.nodeid.split("::", 1)[0], root))
+            # op_val    = _safe_tag_value(op_name)
+            op_val = op_name
+            tags = [f"yaml={yaml_val}", f"model={model}", f"op={op_val}"]
+            item._nodeid = f"{item.nodeid}::" + "::".join(tags)
 
 
 def _render_table_row(cols):
