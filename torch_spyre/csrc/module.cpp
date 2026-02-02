@@ -105,22 +105,18 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
   auto g2 = sendnn::Graph();
   sendnn::Deserialize(&g2, g2_path);
 
+  // todo: This will be removed
   auto programs = spyre::ExtractProgramsFromGraph(g2);
-  for (const auto& pi : programs) {
-    DEBUGINFO("printing PI");
-    DEBUGINFO(pi.device_dmva);
-    DEBUGINFO(pi.size_bytes);
-  }
 
+  // Transfer program with automatic partition setup
   auto dma_result = runtime->DirectProgramDmaTransfer(
         const_cast<void*>(programs[0].data),
-        programs[0].device_dmva,
         programs[0].size_bytes,
-        0
+        0  // device_idx
   );
-  setenv("PROGRAM_DMVA_TEST", std::to_string(programs[0].device_dmva).c_str(), 1);
-  DEBUGINFO(dma_result.status);
-  DEBUGINFO(dma_result.bytes_transferred);
+
+  // adding this for testing
+  setenv("PROGRAM_DMVA_TEST", std::to_string(dma_result.program_dmpa).c_str(), 1);
 
   for (auto &super_node : g2.compute_ops_) {
     if (super_node->Name() != "DeviceInit" &&
@@ -223,6 +219,7 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
     if (!status.IsOk()) throw std::runtime_error(status.Message());
   } else {
     DEBUGINFO("Size is default");
+    // removed predict as no longer needed
     // status = gl.Predict(sendnn::Outputs(), sendnn::Inputs(), 0);
     // if (!status.IsOk()) throw std::runtime_error(status.Message());
 
