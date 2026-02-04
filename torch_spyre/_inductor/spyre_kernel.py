@@ -427,26 +427,26 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(
                 create_kernel_spec(value.op, False, di, args, scales, op_info)
             )
-        elif (index_tensor := self.get_index_tensor(dst.index)) is not None:
-            input_stride = list(self.get_strides(value.index).values())[0]
-            output_stride = list(self.get_strides(value.index).values())[0]
-            in_di = self.analyze_index_expr(value.index)
-            out_di = self.analyze_index_expr(value.index)
-            args = [
-                create_tensor_arg(True, actuals.index(value.name), value.layout),
-                create_tensor_arg(
-                    True, actuals.index(index_tensor.name), index_tensor.layout
-                ),
-                create_tensor_arg(False, actuals.index(value.name), value.layout),
-            ]
-            scales = [
-                self.analyze_tensor_access(in_di, value.index),
-                self.analyze_tensor_access(in_di, index_tensor.index),
-                self.analyze_tensor_access(out_di, value.index),
-            ]
-            self.kernel_specs.append(
-                create_kernel_spec("indexcopy", False, in_di, args, scales, op_info)
-            )
+        # elif (index_tensor := self.get_index_tensor(dst.index)) is not None:
+        #     input_stride = list(self.get_strides(value.index).values())[0]
+        #     output_stride = list(self.get_strides(value.index).values())[0]
+        #     in_di = self.analyze_index_expr(value.index)
+        #     out_di = self.analyze_index_expr(value.index)
+        #     args = [
+        #         create_tensor_arg(True, actuals.index(value.name), value.layout),
+        #         create_tensor_arg(
+        #             True, actuals.index(index_tensor.name), index_tensor.layout
+        #         ),
+        #         create_tensor_arg(False, actuals.index(value.name), value.layout),
+        #     ]
+        #     scales = [
+        #         self.analyze_tensor_access(in_di, value.index),
+        #         self.analyze_tensor_access(in_di, index_tensor.index),
+        #         self.analyze_tensor_access(out_di, value.index),
+        #     ]
+        #     self.kernel_specs.append(
+        #         create_kernel_spec("indexcopy", False, in_di, args, scales, op_info)
+        #     )
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops
             input_stride = list(self.get_strides(value.index).values())[0]

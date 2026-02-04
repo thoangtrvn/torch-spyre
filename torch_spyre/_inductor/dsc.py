@@ -80,11 +80,27 @@ class SuperDSCScheduling(SIMDScheduling):
         kernel_args: list[Any],
         kernel_kwargs: dict[str, Any],
     ) -> list[SpyreKernel | SpyreTritonKernel]:
-        if os.getenv("TORCH_SPYRE_TRITON") == "1":
+        if os.getenv("TORCH_SPYRE_TRITON_FORCE") == "1":
+            print("Using SpyreTritonKernel (forced)")
             self.triton_scheduling.kernel_type = SpyreTritonKernel
             return self.triton_scheduling.create_kernel_choices(
                 kernel_features, kernel_args, kernel_kwargs
             )
+        elif os.getenv("TORCH_SPYRE_TRITON") == "1":
+            try:
+                self.kernel_type = SpyreKernel
+                kernel = self.kernel_type(*kernel_args, **kernel_kwargs)
+                self.codegen_node_schedule_with_kernel(
+                    kernel_features.node_schedule, kernel
+                )
+            # except Unsupported as e:
+            except Exception as e:
+                print(f"Using SpyreTritonKernel reason={e}")
+                self.triton_scheduling.kernel_type = SpyreTritonKernel
+                return self.triton_scheduling.create_kernel_choices(
+                    kernel_features, kernel_args, kernel_kwargs
+                )
+        print("Using SpyreKernel")
         self.kernel_type = SpyreKernel
         return [
             self.kernel_type(

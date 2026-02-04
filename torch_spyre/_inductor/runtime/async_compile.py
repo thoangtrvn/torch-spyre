@@ -25,17 +25,10 @@ from torch_spyre._inductor.constants import SEGMENT_OFFSETS
 from . import KernelSpec, ConstantArg, UnimplementedOp
 from .kernel_runner import (
     SpyreSDSCKernelRunner,
-    SpyreTritonKernelRunner,
     SpyreUnimplementedRunner,
 )
 
 from torch._inductor.codecache import PyCodeCache
-from torch._inductor.runtime.triton_compat import (
-    ASTSource,
-    cc_warp_size,
-    GPUTarget,
-    triton,
-)
 
 _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
 
@@ -56,9 +49,13 @@ class SpyreAsyncCompile:
             print(f"WARNING: Compiling unimplemented {ks.op} to runtime exception")
             return SpyreUnimplementedRunner(kernel_name, ks.op)
 
+        kernel_output_dir, arg_mapping = self.generate_sdsc(kernel_name, ks)
+        return self.run_dxp_standalone(kernel_name, kernel_output_dir, arg_mapping)
+
+    def generate_sdsc(self, kernel_name: str, ks: KernelSpec) -> tuple[str, list[int]]:
         inputs = []
         outputs = []
-        arg_mapping = []
+        arg_mapping: list[int] = []
         for index, ts in enumerate(ks.args):
             if isinstance(ts, ConstantArg):
                 raise RuntimeError("TOOO: implement SDSC generation for constants")
@@ -98,6 +95,11 @@ class SpyreAsyncCompile:
         with open(os.path.join(subdir, "sdsc.json"), "w") as file:
             print(f"Generating {file.name}")
             json.dump(dt_sdsc, file, indent=2)
+        return kernel_output_dir, arg_mapping
+
+    def run_dxp_standalone(
+        self, kernel_name: str, kernel_output_dir: str, arg_mapping: list[int]
+    ):
         subprocess.run(["dxp_standalone", "-d", kernel_output_dir], check=True)
         convert_artifacts(kernel_output_dir)
         return SpyreSDSCKernelRunner(kernel_name, kernel_output_dir, arg_mapping)
@@ -112,26 +114,28 @@ class SpyreAsyncCompile:
         compile_meta["device_type"] = cat.device_props.type
         compile_meta["cc"] = cat.device_props.cc
         compile_meta["constants"].update(cfg.kwargs)
-        compile_args = (
-            ASTSource(
-                cat.fn,
-                compile_meta["signature"],
-                compile_meta["constants"],
-                compile_meta["configs"][0],
-            ),
-        )
-        target = GPUTarget(
-            compile_meta["device_type"],
-            compile_meta["cc"],
-            cc_warp_size(compile_meta["cc"]),
-        )
-        options = {
-            "spyre_options": compile_meta["spyre_options"],
-        }
-        compile_kwargs = {
-            "target": target,
-            "options": options,
-        }
-        tkc = triton.compile(*compile_args, **compile_kwargs)
+        # compile_args = (
+        #     ASTSource(
+        #         cat.fn,
+        #         compile_meta["signature"],
+        #         compile_meta["constants"],
+        #         compile_meta["configs"][0],
+        #     ),
+        # )
+        # target = GPUTarget(
+        #     compile_meta["device_type"],
+        #     compile_meta["cc"],
+        #     cc_warp_size(compile_meta["cc"]),
+        # )
+        # options = {
+        #     "spyre_options": compile_meta["spyre_options"],
+        # }
+        # compile_kwargs = {
+        #     "target": target,
+        #     "options": options,
+        # }
 
-        return SpyreTritonKernelRunner(kernel_name, tkc)
+        ks: KernelSpec = compile_meta["spyre_options"]["kernel_specs"][0]
+        kernel_output_dir, arg_mapping = self.generate_sdsc(kernel_name, ks)
+        # tkc = triton.compile(*compile_args, **compile_kwargs)
+        return self.run_dxp_standalone(kernel_name, kernel_output_dir, arg_mapping)
