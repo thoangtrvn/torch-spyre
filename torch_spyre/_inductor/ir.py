@@ -120,14 +120,15 @@ class FixedTiledLayout(FixedLayout):
         stl = self.device_layout
 
         def indexer(index: Sequence[Expr]) -> Expr:
-            for d in stl.dim_map:
-                assert d < len(index)
             result = offset
             stick_dim = stl.dim_map[-1]
             for hd, stride in zip(stl.dim_map, stl.device_strides()):
+                if hd >= len(index):
+                    continue  # Skip extra dims for sparse tensors
                 if hd != stick_dim:
                     result = result + (index[hd] * stride)
-            result = result + index[stick_dim]  # stride of 1!
+            if stick_dim < len(index):
+                result = result + index[stick_dim]  # stride of 1!
             return result
 
         return indexer
