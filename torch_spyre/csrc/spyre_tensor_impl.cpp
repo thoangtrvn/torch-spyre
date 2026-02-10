@@ -147,18 +147,19 @@ std::vector<int32_t> SpyreTensorLayout::similar_dim_order(
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
-                             c10::ScalarType dtype) {
+                             c10::ScalarType dtype, bool pad_all_dims) {
   int host_dims = static_cast<int32_t>(host_size.size());
   std::vector<int32_t> dim_order;
   for (int32_t i = 0; i < host_dims; i++) {
     dim_order.push_back(i);
   }
-  init(host_size, dtype, dim_order);
+  init(host_size, dtype, dim_order, pad_all_dims);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
-                             std::vector<int32_t> dim_order) {
+                             std::vector<int32_t> dim_order,
+                             bool pad_all_dims) {
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
                   (((host_size.size() + 1) == dim_order.size()) &&
                    dim_order.back() == -1),
@@ -199,16 +200,23 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
   // Computing tiling
   this->dim_map = spyre::get_generic_stick_layout(filtered_dim_order);
   this->device_size.resize(this->dim_map.size());
-  auto elems_in_stick = sparse ? 1 : this->elems_per_stick();
+  auto elems_in_stick = this->elems_per_stick();
+  auto stick_dim_divisor = sparse ? 1 : elems_in_stick;
   auto stick_dim = this->host_stick_dim();
-  this->device_size[this->dim_map.size() - 1] = this->elems_per_stick();
+  this->device_size[this->dim_map.size() - 1] = elems_in_stick;
   for (int i = 0; i < this->dim_map.size() - 1; i++) {
     auto dim = this->dim_map[i];
     if (dim == stick_dim) {
       this->device_size[i] =
-          (host_size[stick_dim] + elems_in_stick - 1) / elems_in_stick;
+          (host_size[stick_dim] + stick_dim_divisor - 1) / stick_dim_divisor;
     } else {
-      this->device_size[i] = host_size[dim];
+      if (pad_all_dims) {
+        this->device_size[i] =
+            ((host_size[dim] + elems_in_stick - 1) / elems_in_stick) *
+            elems_in_stick;
+      } else {
+        this->device_size[i] = host_size[dim];
+      }
     }
   }
 }
