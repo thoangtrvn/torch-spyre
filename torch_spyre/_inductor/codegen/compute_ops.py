@@ -378,8 +378,6 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
                 )
             else:  # keepdim=0 case
                 tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
-
-                print(tensor_dim_indices)
         else:
             # Indices and order unchanged
             tensor_dim_indices = dim_indices
