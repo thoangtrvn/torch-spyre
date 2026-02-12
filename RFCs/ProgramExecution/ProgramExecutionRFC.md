@@ -24,7 +24,7 @@ ExecutionPlans remain lightweight containers of Operations built from compiler o
 
 As a secondary benefit, SpyreStream's `LaunchTiled` makes it straightforward to reuse a kernel compiled for a smaller tile size (e.g., 1024) against larger tensors (e.g., 4096) by enqueuing multiple rounds of FlexStream operations, without recompilation.
 
-The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated segments with block-level offsets rather than independently allocated, and the execution pipeline accounts for this addressing model natively.
+The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated memory regions with block-level offsets rather than independently allocated, and the execution pipeline accounts for this addressing model natively.
 
 ## Design
 
@@ -39,7 +39,7 @@ Implementations:
 | Variant | Properties | Description |
 |---------|------------|-------------|
 | `PFDeviceHandle` | `physical_address` | A direct physical address on the device. Used in PF mode where each allocation is independently mapped. |
-| `VFDeviceHandle` | `segment_id`, `vf_offset` | A location within a pre-allocated segment. `segment_id` identifies the segment, `vf_offset` is the byte offset of the block within that segment. Used in VF mode. |
+| `VFDeviceHandle` | `region_id`, `vf_offset` | A location within a pre-allocated memory region. `region_id` identifies the region, `vf_offset` is the byte offset of the block within that region. Used in VF mode. |
 
 All APIs that accept or return a `DeviceHandle` are agnostic to the variant — the underlying mode is determined by how SpyreAllocator is configured.
 
@@ -48,9 +48,9 @@ All APIs that accept or return a `DeviceHandle` are agnostic to the variant — 
 Manages device memory and produces `DeviceHandle`s in one of two modes:
 
 - **PF Mode**: Each allocation is independently mapped on hardware. Returns a `PFDeviceHandle` containing the physical address.
-- **VF Mode**: Pre-allocates a fixed pool of large segments (default: 8 segments x 12 GB = 96 GB). Individual allocations carve blocks from these segments with 128-byte alignment. Returns a `VFDeviceHandle` containing the segment_id and vf_offset.
+- **VF Mode**: Pre-allocates a fixed pool of large memory regions (default: 8 regions x 12 GB = 96 GB). Individual allocations carve blocks from these regions with 128-byte alignment. Returns a `VFDeviceHandle` containing the region_id and vf_offset.
 
-See the SpyreAllocator RFC (TBD) for full details on allocation strategies, segment management, and memory lifecycle.
+See the SpyreAllocator RFC (TBD) for full details on allocation strategies, memory region management, and memory lifecycle.
 
 #### SpyreTensor
 
@@ -120,7 +120,7 @@ Properties:
 
 | Property | Description |
 |----------|-------------|
-| `segment_table` | Expected input/output tensor metadata from the compiler |
+| `tensor_input_metadata` | Expected input/output tensor metadata from the compiler |
 | `operations` | Ordered list of Operations — each Operation carries its own device handles after loading |
 | `correction_metadata` | Program correction metadata (including the byte size of the correction input buffer per Operation) |
 | `init_packets` | Init packets from the compiler |
