@@ -169,7 +169,7 @@ Each of these is enqueued on the underlying FlexStream in order. Because FlexStr
 
 **LaunchTiled(Operation, List\<device_handle\>)**
 
-Handles the case where tensor shapes exceed the compiled tile size. SpyreStream compares each tensor's shape against the kernel's expected input shapes (from the ExecutionPlan's per-SpyreCompute metadata), infers the tiling dimension(s) and iteration count, and enqueues multiple rounds of FlexStream operations — one full Launch decomposition per iteration, each with updated tensor offsets.
+Handles the case where tensor shapes exceed the compiled tile size. SpyreStream compares each tensor's shape against the kernel's expected input shapes (from the ExecutionPlan's per-SpyreCompute metadata), infers the tiling dimension(s) and iteration count, and enqueues multiple rounds of FlexStream operations — one full Launch decomposition per tile iteration, each with updated tensor offsets.
 
 **Synchronize()**
 
