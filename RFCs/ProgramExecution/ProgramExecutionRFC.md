@@ -204,7 +204,7 @@ Enqueues a device-to-host data transfer. The `device_handle` is a `DeviceHandle`
 
 **Launch(device_handle)**
 
-Enqueues execution of a binary that has been previously loaded to device. The `device_handle` references the binary's location on device (e.g., a program correction binary or a compute binary from an Operation). Before a Launch is submitted to hardware, control blocks are specialized with the appropriate tensor device addresses. For tiled execution, multiple Launch operations are enqueued for the same binary, each with updated tensor offsets.
+Enqueues execution of a binary that has been previously loaded to device. The `device_handle` references the binary's location on device (e.g., a program correction binary or a compute binary from an Operation). For tiled execution, multiple Launch operations are enqueued for the same binary, each with updated tensor offsets.
 
 **Synchronize()**
 
