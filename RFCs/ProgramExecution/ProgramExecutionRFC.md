@@ -1,14 +1,13 @@
-# RFC: Program Execution Pipeline
+# Program Execution Pipeline
 
-## Status
+**Authors:**
+* @JRosenkranz
 
-Draft
-
-## Summary
+## **Summary**
 
 This RFC introduces a layered stream-based execution model for torch-spyre. At the top, `SpyreStream` (in torch-spyre) provides a high-level interface that accepts Operations — representing both compute and data transfers — and decomposes them into primitive operations on an underlying `FlexStream` (in flex). All device work flows through SpyreStream via a unified `Launch(Operation, ...)` interface. FlexStream, modeled after CUDA streams, provides an asynchronous interface for data movement and kernel launch — `CopyToDevice`, `CopyFromDevice`, `Launch`, and `Synchronize` — where all operations return control to the host immediately and are queued for sequential execution on the device. A `Scheduler` layer underneath serializes operations across streams for the current hardware, while the stream abstraction preserves forward compatibility with future concurrent execution support.
 
-## Motivation
+## **Motivation**
 
 The current connection between torch-spyre and the flex runtime relies on graph execution, which carries significant overhead for what is fundamentally a kernel launch operation. The graph-based approach requires constructing, optimizing, and traversing a graph structure even for single-kernel execution, adding complexity and latency that is unnecessary for the common case.
 
@@ -26,7 +25,7 @@ As a secondary benefit, SpyreStream's `LaunchTiled` makes it straightforward to 
 
 The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated memory regions with block-level offsets rather than independently allocated, and the execution pipeline accounts for this addressing model natively.
 
-## Design
+## **Proposed Implementation**
 
 ### Core Components
 
@@ -269,9 +268,9 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 
 **LaunchKernel(SpyreStream, ExecutionPlan, List\<SpyreTensor\>)** — The entry point in torch-spyre. For each Operation in the ExecutionPlan, determines whether the tensors match the compiled tile size exactly or require tiling, then delegates to either `SpyreStream.Launch` or `SpyreStream.LaunchTiled` accordingly. Control returns to the host immediately; use `SpyreStream.Synchronize()` to wait for completion.
 
-## Workflows
+### Workflows
 
-### Workflow 1: Tensor Allocation and Transfer
+#### Workflow 1: Tensor Allocation and Transfer
 
 ```
 ┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐     ┌────────────┐
@@ -289,7 +288,7 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 5. Result is a `SpyreTensor` carrying the device address metadata
 6. Host may continue work; data transfer proceeds asynchronously on the stream
 
-### Workflow 2: Compilation and Loading
+#### Workflow 2: Compilation and Loading
 
 ```
 ┌──────────┐     ┌───────────┐     ┌───────────────┐     ┌──────────────────┐     ┌────────────┐
@@ -308,7 +307,7 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
    c. `SpyreStream.Launch(operation, [])` decomposes into `FlexStream.CopyToDevice(...)` — `device_handle` is stored on the Operation
 4. ExecutionPlan (with all Operation device handles populated) is cached for reuse
 
-### Workflow 3: Detailed Execution — LaunchKernel to Hardware
+#### Workflow 3: Detailed Execution — LaunchKernel to Hardware
 
 This diagram shows the full path from `LaunchKernel` through every layer for a matmul with program correction, illustrating how SpyreStream decomposes a single high-level Operation into primitive FlexStream operations that the Scheduler drains onto hardware.
 
@@ -412,7 +411,7 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 7. Scheduler drains control blocks onto hardware in FIFO order
 8. Host returns immediately; call `SpyreStream.Synchronize()` when results are needed
 
-### Workflow 4: Tiled Execution
+#### Workflow 4: Tiled Execution
 
 ```
  torch-spyre                                    flex
@@ -464,7 +463,7 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 7. Scheduler drains all operations onto hardware in FIFO order
 8. Host returns immediately; call `SpyreStream.Synchronize()` to block until all iterations complete
 
-### Workflow 5: End-to-End
+#### Workflow 5: End-to-End
 
 ```
                                                     # Default SpyreStream created at runtime start
@@ -487,7 +486,7 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 6. result_cpu = result.to("cpu")                   # Operation([CopyFromDevice]) → FlexStream.CopyFromDevice
 ```
 
-### Workflow 6: Multi-Stream (Future Hardware)
+#### Workflow 6: Multi-Stream (Future Hardware)
 
 ```
 stream_a = SpyreStream()                           # Stream for layer 1
@@ -504,7 +503,27 @@ stream_a.Synchronize()
 stream_b.Synchronize()
 ```
 
-## Open Questions
+## **Metrics**
+
+TBD
+
+## **Drawbacks**
+
+TBD
+
+## **Alternatives**
+
+TBD
+
+## **Prior Art**
+
+TBD
+
+## **How we teach this**
+
+TBD
+
+## **Unresolved questions**
 
 1. **Reduction tiling**: When tiling along the reduction dimension (K in matmul), partial results must be accumulated. Should the runtime handle accumulation internally, or should this be expressed as a separate operation in the ExecutionPlan?
 
@@ -521,3 +540,27 @@ stream_b.Synchronize()
 7. **Default stream**: Should there be a default FlexStream (like CUDA's default stream) that is used when the user does not explicitly create one?
 
 8. **Program correction across PF/VF modes**: The correction input buffer contains tensor locations — offsets in VF mode, addresses in PF mode. How should SpyreStream assemble this buffer uniformly from DeviceHandles when the correction program expects mode-specific values?
+
+## Resolution
+
+TBD
+
+### Level of Support
+
+TBD
+
+#### Additional Context
+
+TBD
+
+### Next Steps
+
+TBD
+
+#### Tracking issue
+
+TBD
+
+#### Exceptions
+
+TBD
