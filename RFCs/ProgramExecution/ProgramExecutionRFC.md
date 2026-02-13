@@ -48,7 +48,7 @@ All APIs that accept or return a `DeviceHandle` are agnostic to the variant — 
 Manages device memory and produces `DeviceHandle`s in one of two modes:
 
 - **PF Mode**: Each allocation is independently mapped on hardware. Returns a `PFDeviceHandle` containing the physical address.
-- **VF Mode**: Pre-allocates a fixed pool of large memory regions (default: 8 regions x 12 GB = 96 GB). Individual allocations carve blocks from these regions with 128-byte alignment. Returns a `VFDeviceHandle` containing the region_id and vf_offset.
+- **VF Mode**: Manages a pool of up to 8 memory regions. Individual allocations carve blocks from these regions with 128-byte alignment. Returns a `VFDeviceHandle` containing the region_id and vf_offset.
 
 See the SpyreAllocator RFC (TBD) for full details on allocation strategies, memory region management, and memory lifecycle.
 
@@ -61,6 +61,7 @@ A tensor residing on-device. Carries metadata required for execution:
 - **data_type**: Element type (e.g., float32, uint32)
 - **device_handle**: A `DeviceHandle` referencing the tensor's location on device (from SpyreAllocator)
 - **size_bytes**: Total byte size of the tensor data
+- **layout**: A `SpyreTensorLayout` describing the tensor's tiled layout on device — includes `device_size` (tiled dimensions on device), `device_dtype` (on-device data type), and `dim_map` (mapping between logical shape and device dimensions)
 
 #### Operation
 
@@ -518,3 +519,5 @@ stream_b.Synchronize()
 6. **Scheduler policies**: When draining multiple streams onto serialized hardware, what scheduling policy should be used? Options: round-robin, priority-based, drain-one-first, etc.
 
 7. **Default stream**: Should there be a default FlexStream (like CUDA's default stream) that is used when the user does not explicitly create one?
+
+8. **Program correction across PF/VF modes**: The correction input buffer contains tensor locations — offsets in VF mode, addresses in PF mode. How should SpyreStream assemble this buffer uniformly from DeviceHandles when the correction program expects mode-specific values?
