@@ -56,9 +56,8 @@ class SpyreTensorLayout {
    * major order of dimensions using the default device memory layout.
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
-  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
-                    bool pad_all_dims = false) {
-    init(host_size, dtype, pad_all_dims);
+  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype) {
+    init(host_size, dtype);
   }
 
   /**
@@ -68,8 +67,19 @@ class SpyreTensorLayout {
    * See docs/SpyreTensors.md for a precise definition of this layout.
    */
   SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
-                    std::vector<int32_t> dim_order, bool pad_all_dims = false) {
-    init(host_size, dtype, dim_order, pad_all_dims);
+                    std::vector<int32_t> dim_order) {
+    init(host_size, dtype, dim_order);
+  }
+
+  /**
+   * Construct a SpyreTensorLayout for the argument host_size
+   * with the given order of dimensions in decreasing stride order
+   * and padded dimensions using the default device layout.
+   * See docs/SpyreTensors.md for a precise definition of this layout.
+   */
+  SpyreTensorLayout(std::vector<int64_t> host_size, c10::ScalarType dtype,
+                    std::vector<int32_t> dim_order, std::vector<bool> pad_dim) {
+    init(host_size, dtype, dim_order, pad_dim);
   }
 
   /**
@@ -85,11 +95,13 @@ class SpyreTensorLayout {
         dim_map(dim_map),
         device_dtype(device_dtype) {}
 
-  void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
-            bool pad_all_dims);
+  void init(std::vector<int64_t> host_size, c10::ScalarType dtype);
 
   void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
-            std::vector<int32_t> dim_order, bool pad_all_dims);
+            std::vector<int32_t> dim_order);
+
+  void init(std::vector<int64_t> host_size, c10::ScalarType dtype,
+            std::vector<int32_t> dim_order, std::vector<bool> pad_dim);
 
   std::string toString() const;
 

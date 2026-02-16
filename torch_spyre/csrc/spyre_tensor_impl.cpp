@@ -146,24 +146,58 @@ std::vector<int32_t> SpyreTensorLayout::similar_dim_order(
   return result;
 }
 
+#define ENABLE_PADDING false
+
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
-                             c10::ScalarType dtype, bool pad_all_dims) {
+                             c10::ScalarType dtype) {
   int host_dims = static_cast<int32_t>(host_size.size());
   std::vector<int32_t> dim_order;
+  std::vector<bool> pad_dim;
   for (int32_t i = 0; i < host_dims; i++) {
     dim_order.push_back(i);
+    pad_dim.push_back(false);
   }
-  init(host_size, dtype, dim_order, pad_all_dims);
+  // Must pad stick dim
+  if (host_dims > 0) {
+    pad_dim[host_dims - 1] = true;
+  }
+  // Heuristically pad one more dimension
+  if (ENABLE_PADDING && (host_dims > 1)) {
+    pad_dim[host_dims - 2] = true;
+  }
+  init(host_size, dtype, dim_order, pad_dim);
+}
+
+void SpyreTensorLayout::init(std::vector<int64_t> host_size,
+                             c10::ScalarType dtype,
+                             std::vector<int32_t> dim_order) {
+  int host_dims = static_cast<int32_t>(host_size.size());
+  std::vector<bool> pad_dim;
+  for (int32_t i = 0; i < host_dims; i++) {
+    pad_dim.push_back(false);
+  }
+  // Must pad stick dim
+  if (host_dims > 0) {
+    pad_dim[host_dims - 1] = true;
+  }
+  // Heuristically pad one more dimension
+  if (ENABLE_PADDING && (host_dims > 1)) {
+    pad_dim[host_dims - 2] = true;
+  }
+  init(host_size, dtype, dim_order, pad_dim);
 }
 
 void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order,
-                             bool pad_all_dims) {
+                             std::vector<bool> pad_dim) {
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
                   (((host_size.size() + 1) == dim_order.size()) &&
                    dim_order.back() == -1),
               "Incompatible host_size and dim_order");
+
+  TORCH_CHECK(host_size.size() == pad_dim.size(),
+              "Incompatible host_size and pad_dim");
 
   auto str_type = torchScalarToString[dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
@@ -210,7 +244,7 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
       this->device_size[i] =
           (host_size[stick_dim] + stick_dim_divisor - 1) / stick_dim_divisor;
     } else {
-      if (pad_all_dims) {
+      if (pad_dim[dim]) {
         this->device_size[i] =
             ((host_size[dim] + elems_in_stick - 1) / elems_in_stick) *
             elems_in_stick;

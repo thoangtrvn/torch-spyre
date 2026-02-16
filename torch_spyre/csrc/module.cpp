@@ -282,13 +282,15 @@ PYBIND11_MODULE(_C, m) {
       .def("host_stick_dim", &spyre::SpyreTensorLayout::host_stick_dim)
       .def("similar_dim_order", &spyre::SpyreTensorLayout::similar_dim_order)
       .def(py::self == py::self)
-      .def(py::init<std::vector<int64_t>, c10::ScalarType, bool>(),
-           py::arg("host_size"), py::arg("dtype"),
-           py::arg("pad_all_dims") = false)
+      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
+           py::arg("host_size"), py::arg("dtype"))
+      .def(py::init<std::vector<int64_t>, c10::ScalarType,
+                    std::vector<int32_t>>(),
+           py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"))
       .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
-                    bool>(),
+                    std::vector<bool>>(),
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
-           py::arg("pad_all_dims") = false)
+           py::arg("pad_dim"))
       .def(py::init<std::vector<int64_t>, std::vector<int32_t>, DataFormats>(),
            py::arg("device_size"), py::arg("dim_map"), py::arg("device_dtype"));
 
