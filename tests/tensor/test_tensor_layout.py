@@ -65,6 +65,20 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(stl.dim_map, [1, 0, -1])
         self.assertEqual(stl.host_stick_dim(), 1)
 
+    def test_padding(self):
+        stl = SpyreTensorLayout(
+            [3, 5, 128], torch.float16, [0, 1, 2], [False, False, True]
+        )
+        self.assertEqual(stl.device_size, [5, 2, 3, 64])
+        stl = SpyreTensorLayout(
+            [3, 5, 128], torch.float16, [0, 1, 2], [False, True, True]
+        )
+        self.assertEqual(stl.device_size, [64, 2, 3, 64])
+        stl = SpyreTensorLayout(
+            [3, 5, 128], torch.float16, [0, 1, 2], [True, False, True]
+        )
+        self.assertEqual(stl.device_size, [5, 2, 64, 64])
+
     def test_stl_str(self):
         stl = SpyreTensorLayout([512, 256], torch.float16)
         self.assertEqual(
