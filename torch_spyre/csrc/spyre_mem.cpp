@@ -729,8 +729,11 @@ at::Tensor spyre_reinterpret_tensor(const at::Tensor& self,
                                     c10::IntArrayRef size,
                                     c10::IntArrayRef stride,
                                     int64_t offset_increment) {
-  DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", self.device()); 
-  auto device_layout = static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl())->spyre_layout;
+  DEBUGINFO("Size:", size, ", Stride: ", stride, " on device ", self.device());
+  auto orig_layout = get_spyre_tensor_layout(self);
+  auto dim_order = orig_layout.similar_dim_order(size.size());
+  auto device_layout = SpyreTensorLayout(
+      size.vec(), c10::typeMetaToScalarType(self.dtype()), dim_order);
   auto self_ = at::detail::make_tensor_base<SpyreTensorImpl>(
       self.storage(), self.key_set(), self.dtype(), device_layout);
   auto* self_tmp_ = self_.unsafeGetTensorImpl();
