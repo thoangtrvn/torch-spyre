@@ -147,9 +147,12 @@ auto get_device_stride_info(c10::IntArrayRef sizes, c10::IntArrayRef strides,
 
     stride_info.stride_src_.push_back(host2device ? cpu_stride : dev_stride);
     stride_info.stride_dst_.push_back(host2device ? dev_stride : cpu_stride);
-    if (dim == stl.dim_map.back() && requires_padding &&
-        !size_less_than_stick) {  // stick_dim
-      stride_info.size_[i] -= 1;
+    if (dim == stl.dim_map.back()) {
+      if (requires_padding && !size_less_than_stick) {  // stick_dim
+        stride_info.size_[i] -= 1;
+      }
+    } else {
+      stride_info.size_[i] = cpu_shape[dim];
     }
   }
   stride_info.offset_src_ = 0;
