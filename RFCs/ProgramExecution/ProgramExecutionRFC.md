@@ -5,7 +5,7 @@
 
 ## **Summary**
 
-This RFC introduces a layered stream-based execution model for torch-spyre. At the top, `SpyreStream` (in torch-spyre) provides a high-level interface that accepts SpyreOperations — representing both compute and data transfers — and decomposes them into FlexOperations on an underlying `FlexStream` (in flex). All device work flows through SpyreStream via a unified `Launch(SpyreOperation, ...)` interface. FlexStream, modeled after CUDA streams, provides an asynchronous interface for data movement and kernel launch — `CopyToDevice`, `CopyFromDevice`, `Launch`, and `Synchronize` — where all operations return control to the host immediately and are queued for sequential execution on the device. A `Scheduler` layer underneath serializes operations across streams for the current hardware, while the stream abstraction preserves forward compatibility with future concurrent execution support.
+This RFC introduces a layered stream-based execution model for torch-spyre. `SpyreStream` (in torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough that translates PyTorch-native data into the types `FlexStream` (in flex) understands. `FlexStream` is the core execution engine — modeled after CUDA streams, it accepts Operations (representing both compute and data transfers), decomposes them into the correct sequence of low-level steps (copies, launches), and forwards those steps to the Scheduler for hardware dispatch. FlexStream's single `Launch` method automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — no separate tiling API is needed. All FlexStream methods are asynchronous, returning control to the host immediately, with operations executing sequentially within a stream. A `Scheduler` layer underneath dispatches work onto hardware, respecting the intra-stream FIFO ordering guarantee, while the stream abstraction preserves forward compatibility with future concurrent execution support.
 
 ## **Motivation**
 
@@ -13,17 +13,15 @@ The current connection between torch-spyre and the flex runtime relies on graph 
 
 This RFC replaces that approach with a layered stream architecture:
 
-- **SpyreStream** (torch-spyre) provides the high-level interface. All device work — compute and data movement alike — is expressed as SpyreOperations and submitted through `SpyreStream.Launch`. A SpyreOperation bundles an optional compute with a list of preprocessing steps (which may include data transfers such as CopyToDevice/CopyFromDevice, as well as device-side operations like program correction). SpyreStream decomposes each SpyreOperation into the correct sequence of FlexOperations via FlexStream calls. SpyreStream also owns the `LaunchTiled` logic for reusing compilation artifacts when tensor shapes exceed the compiled tile size.
+- **SpyreStream** (torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough layer. It translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Operations, VirtualAddresses) and delegates all execution logic to FlexStream.
 
-- **FlexStream** (flex) provides the low-level, CUDA-stream-like API: `CopyToDevice`, `CopyFromDevice`, `Launch`, and `Synchronize`. All methods are asynchronous — operations enqueued on a stream return immediately. Within a single stream, operations execute in FIFO order; across streams, no ordering is guaranteed.
+- **FlexStream** (flex) is the core execution engine, modeled after CUDA streams. It accepts Operations — each representing a unit of work with an optional Compute and a list of preprocessing steps — and decomposes them into the correct sequence of low-level steps (copies, launches) that are forwarded to the Scheduler. FlexStream understands that a single logical operation like a matmul may require multiple steps (a DMA of offset inputs, a program correction launch, and the actual compute launch) and owns this decomposition. FlexStream's `Launch` method automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — reusing compilation artifacts by enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call. All methods are asynchronous — operations enqueued on a stream return immediately. Within a single stream, operations execute in FIFO order; across streams, no ordering is guaranteed.
 
-- **Scheduler** (flex) sits underneath FlexStream and serializes operations from all active streams onto the hardware. Since the current Spyre hardware does not support concurrent execution of multiple streams, the Scheduler ensures all operations are dispatched in a valid order. This design cleanly separates the programming model (streams) from the hardware reality (serialized execution), allowing the stream API to remain stable as hardware capabilities evolve.
+- **Scheduler** (flex) sits underneath FlexStream and dispatches low-level steps onto hardware, respecting the intra-stream FIFO ordering guarantee. The Scheduler's internal design is covered in a separate Scheduler RFC.
 
-The separation between SpyreStream and FlexStream is deliberate: SpyreStream understands that a single logical operation like a matmul may require multiple steps — a DMA of offset inputs, a program correction launch, and the actual compute launch — and knows how to decompose a SpyreOperation into that sequence of FlexOperations. FlexStream has no knowledge of this breakdown; it only sees individual FlexOperations (copy and launch primitives). This keeps flex simple and generic while torch-spyre owns the operation-level semantics.
+ExecutionPlans remain lightweight containers of Operations built from compiler output. They do not own execution logic — instead, each Operation's binaries are individually loaded to device (each via a preprocessing-only Operation containing a CopyToDevice), and then the compute Operations are submitted through SpyreStream → FlexStream, which decomposes them into low-level steps for the Scheduler.
 
-ExecutionPlans remain lightweight containers of SpyreOperations built from compiler output. They do not own execution logic — instead, each SpyreOperation's binaries are individually loaded to device (each via a preprocessing-only SpyreOperation containing a CopyToDevice), and then the compute SpyreOperations are submitted through SpyreStream, which decomposes them into FlexOperations.
-
-As a secondary benefit, SpyreStream's `LaunchTiled` makes it straightforward to reuse a kernel compiled for a smaller tile size (e.g., 1024) against larger tensors (e.g., 4096) by enqueuing multiple rounds of FlexStream operations, without recompilation.
+As a secondary benefit, FlexStream's `Launch` automatically detects when tensors exceed the compiled tile size and transparently reuses the kernel by enqueuing multiple rounds of low-level steps with updated offsets — no recompilation or separate API call required.
 
 The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated memory regions with block-level offsets rather than independently allocated, and the execution pipeline accounts for this addressing model natively.
 
@@ -31,25 +29,27 @@ The introduction of the SpyreAllocator's VF mode also shapes this design: tensor
 
 ### Core Components
 
-#### DeviceHandle
+#### VirtualAddress
 
-An opaque reference to a location in device memory, produced by SpyreAllocator. DeviceHandle abstracts over the two allocation modes so that all downstream components (SpyreTensor, SpyreOperation, FlexStream) can work uniformly regardless of whether the hardware is in PF or VF mode. A DeviceHandle identifies only a location — size is stored separately alongside it.
+A reference to a location in device memory, produced by SpyreAllocator. A VirtualAddress identifies only a location — size is stored separately alongside it.
 
-Implementations:
+Properties:
 
-| Variant | Properties | Description |
-|---------|------------|-------------|
-| `PFDeviceHandle` | `physical_address` | A direct physical address on the device. Used in PF mode where each allocation is independently mapped. |
-| `VFDeviceHandle` | `region_id`, `vf_offset` | A location within a pre-allocated memory region. `region_id` identifies the region, `vf_offset` is the byte offset of the block within that region. Used in VF mode. |
+| Property | Description |
+|----------|-------------|
+| `region_id` | Identifies the memory region. In VF mode, this is an index into a firmware lookup table that maps to the physical address of the region. In PF mode, this is the physical address of the region itself. |
+| `offset` | Byte offset of the allocation within the region. |
 
-All APIs that accept or return a `DeviceHandle` are agnostic to the variant — the underlying mode is determined by how SpyreAllocator is configured.
+The same structure is used in both PF and VF modes — only the interpretation of `region_id` differs. All downstream components (SpyreTensor, Operation, FlexStream) work uniformly with VirtualAddress regardless of mode.
 
 #### SpyreAllocator
 
-Manages device memory and produces `DeviceHandle`s in one of two modes:
+Manages device memory and produces `VirtualAddress` values in one of two modes:
 
-- **PF Mode**: Each allocation is independently mapped on hardware. Returns a `PFDeviceHandle` containing the physical address.
-- **VF Mode**: Manages a pool of up to 8 memory regions. Individual allocations carve blocks from these regions with 128-byte alignment. Returns a `VFDeviceHandle` containing the region_id and vf_offset.
+- **PF Mode**: Manages a pool of up to 8 memory regions. Returns a `VirtualAddress` where `region_id` is the physical address of the region itself.
+- **VF Mode**: Manages a pool of up to 8 memory regions. Returns a `VirtualAddress` where `region_id` is an index into a firmware lookup table that maps to the physical address of the region.
+
+In both modes, individual allocations carve blocks from these regions with 128-byte alignment, and the `offset` field of the returned VirtualAddress is the byte offset of the block within the region.
 
 See the SpyreAllocator RFC (TBD) for full details on allocation strategies, memory region management, and memory lifecycle.
 
@@ -60,56 +60,56 @@ A tensor residing on-device. Carries metadata required for execution:
 - **shape**: Logical dimensions (e.g., `[4096, 1024]`)
 - **stride**: Memory stride per dimension (bytes between consecutive elements along each axis)
 - **data_type**: Element type (e.g., float32, uint32)
-- **device_handle**: A `DeviceHandle` referencing the tensor's location on device (from SpyreAllocator)
+- **virtual_address**: A `VirtualAddress` referencing the tensor's location on device (from SpyreAllocator)
 - **size_bytes**: Total byte size of the tensor data
 - **layout**: A `SpyreTensorLayout` describing the tensor's tiled layout on device — includes `device_size` (tiled dimensions on device), `device_dtype` (on-device data type), and `dim_map` (mapping between logical shape and device dimensions)
 
-#### SpyreOperation
+#### Operation
 
-A SpyreOperation encapsulates a unit of work to be submitted through SpyreStream. A SpyreOperation is composed of an optional SpyreCompute and a list of PreProcessCompute steps. PreProcessCompute steps may include data transfers (CopyToDevice, CopyFromDevice) as well as device-side preprocessing (e.g., program correction). When SpyreStream decomposes a SpyreOperation, each PreProcessCompute maps to the appropriate FlexStream primitive (CopyToDevice, CopyFromDevice, or Launch), followed by a Launch for the SpyreCompute if present.
+An Operation encapsulates a unit of work to be submitted through FlexStream. An Operation is composed of an optional Compute and a list of PreProcessCompute steps. PreProcessCompute steps may include data transfers (CopyToDevice, CopyFromDevice) as well as device-side preprocessing (e.g., program correction). When FlexStream decomposes an Operation, each PreProcessCompute maps to the appropriate low-level step (copy or launch), followed by a launch for the Compute if present.
 
-Each SpyreOperation carries its own `device_handles` — one per binary that has been loaded to device (e.g., a program correction binary and a compute binary). These handles are set when the SpyreOperation's binaries are individually copied to device during ExecutionPlan loading.
+Each Operation carries its own `virtual_addresses` — one per binary that has been loaded to device (e.g., a program correction binary and a compute binary). These are set when the Operation's binaries are individually copied to device during ExecutionPlan loading.
 
 Constructors:
 
 | Constructor | Description |
 |-------------|-------------|
-| `SpyreOperation(SpyreCompute)` | Single compute operation with no preprocessing |
-| `SpyreOperation(SpyreCompute, List<PreProcessCompute>)` | Compute with required preprocessing (e.g., data transfer for program correction inputs, then program correction, then compute) |
-| `SpyreOperation(List<PreProcessCompute>)` | Preprocessing only — no compute. Used for standalone data transfers such as loading a tensor or program binary to device |
+| `Operation(Compute)` | Single compute operation with no preprocessing |
+| `Operation(Compute, List<PreProcessCompute>)` | Compute with required preprocessing (e.g., data transfer for program correction inputs, then program correction, then compute) |
+| `Operation(List<PreProcessCompute>)` | Preprocessing only — no compute. Used for standalone data transfers such as loading a tensor or program binary to device |
 
-A SpyreOperation should be self-contained: if a compute requires program correction, the data transfer for correction inputs, the correction itself, and the compute must all be part of the same SpyreOperation. For pure data movement (e.g., tensor `.to(device)` or program loading), a SpyreOperation with only PreProcessCompute entries and no SpyreCompute is used.
+An Operation should be self-contained: if a compute requires program correction, the data transfer for correction inputs, the correction itself, and the compute must all be part of the same Operation. For pure data movement (e.g., tensor `.to(device)` or program loading), an Operation with only PreProcessCompute entries and no Compute is used.
 
 #### PreProcessCompute
 
-A preprocessing step within a SpyreOperation. Each PreProcessCompute maps to a single FlexStream primitive when SpyreStream decomposes a SpyreOperation. PreProcessCompute is a tagged variant — it represents either a data transfer or a device-side compute that must run before the SpyreOperation's main SpyreCompute.
+A preprocessing step within an Operation. Each PreProcessCompute maps to a single low-level step when FlexStream decomposes an Operation. PreProcessCompute is a tagged variant — it represents either a data transfer or a device-side compute that must run before the Operation's main Compute.
 
 Variants:
 
 | Variant | Properties | Description |
 |---------|------------|-------------|
-| `CopyToDevice` | `host_address`, `device_handle`, `size` | Host-to-device data transfer. Used for copying tensor data, program binaries, or correction input metadata to device. `size` is the byte count to transfer. |
-| `CopyFromDevice` | `host_address`, `device_handle`, `size` | Device-to-host data transfer. Used for reading results back from device. |
-| `DeviceLaunch` | `device_handle` | Execute a binary already resident on device. Used for device-side preprocessing such as program correction. |
+| `CopyToDevice` | `host_address`, `virtual_address`, `size` | Host-to-device data transfer. Used for copying tensor data, program binaries, or correction input metadata to device. `size` is the byte count to transfer. |
+| `CopyFromDevice` | `host_address`, `virtual_address`, `size` | Device-to-host data transfer. Used for reading results back from device. |
+| `DeviceLaunch` | `virtual_address` | Execute a binary already resident on device. Used for device-side preprocessing such as program correction. |
 
-**Program correction metadata**: When a PreProcessCompute of type `CopyToDevice` is used for program correction inputs, it copies a host-assembled buffer of tensor location metadata (DeviceHandles of the resident input/output tensors) to the correction program's input area on device. The size of this buffer is determined at compile time — the compiler knows how many inputs/outputs the kernel expects and the format the correction program requires — and is encoded in the ExecutionPlan's program correction metadata, then captured on the PreProcessCompute when the SpyreOperation is constructed.
+**Program correction metadata**: When a PreProcessCompute of type `CopyToDevice` is used for program correction inputs, it copies a host-assembled buffer of tensor location metadata (VirtualAddresses of the resident input/output tensors) to the correction program's input area on device. The size of this buffer is determined at compile time — the compiler knows how many inputs/outputs the kernel expects and the format the correction program requires — and is encoded in the ExecutionPlan's program correction metadata, then captured on the PreProcessCompute when the Operation is constructed.
 
-#### SpyreCompute
+#### Compute
 
-Represents the actual compute to be executed on the Spyre device. A SpyreCompute maps to a compiled binary that has been loaded to device and is launched via `FlexStream.Launch(device_handle)`. It is the terminal step in a SpyreOperation's decomposition — all PreProcessCompute steps run first, then the SpyreCompute is launched.
+Represents the actual compute to be executed on the Spyre device. A Compute maps to a compiled binary that has been loaded to device. It is the terminal step in an Operation's decomposition — all PreProcessCompute steps run first, then the Compute is launched.
 
 Properties:
 
 | Property | Description |
 |----------|-------------|
-| `device_handle` | `DeviceHandle` referencing the compute binary's location on device (set during ExecutionPlan loading) |
-| `expected_input_shapes` | Expected tensor shapes for this compute's inputs, as determined by the compiler. Used by SpyreStream to detect tiling requirements. |
+| `virtual_address` | `VirtualAddress` referencing the compute binary's location on device (set during ExecutionPlan loading) |
+| `expected_input_shapes` | Expected tensor shapes for this compute's inputs, as determined by the compiler. Used by FlexStream to detect tiling requirements. |
 
-A SpyreCompute is produced by the backend compiler (deeptools) as part of the ExecutionPlan. The binary is loaded to device during ExecutionPlan loading, at which point the `device_handle` is set. At launch time, SpyreStream enqueues a `FlexStream.Launch(device_handle)`, and FlexStream constructs the appropriate control block (CB) for hardware submission.
+A Compute is produced by the backend compiler (deeptools) as part of the ExecutionPlan. The binary is loaded to device during ExecutionPlan loading, at which point the `virtual_address` is set. At launch time, FlexStream decomposes the containing Operation and constructs the appropriate control block (CB) for hardware submission.
 
 #### ExecutionPlan
 
-Produced by the backend compiler (deeptools). An ExecutionPlan starts as compiler output describing the ordered sequence of computes and preprocessing required, then becomes the runtime artifact once its SpyreOperations are loaded to device. Loading an ExecutionPlan means loading each SpyreOperation's binaries individually — each binary gets its own CopyToDevice and its own device_handle stored on the SpyreOperation.
+Produced by the backend compiler (deeptools). An ExecutionPlan starts as compiler output describing the ordered sequence of computes and preprocessing required, then becomes the runtime artifact once its Operations are loaded to device. Loading an ExecutionPlan means loading each Operation's binaries individually — each binary gets its own CopyToDevice and its own virtual_address stored on the Operation.
 
 Constructors:
 
@@ -123,68 +123,38 @@ Properties:
 | Property | Description |
 |----------|-------------|
 | `tensor_input_metadata` | Expected input/output tensor metadata from the compiler |
-| `operations` | Ordered list of SpyreOperations — each SpyreOperation carries its own device handles after loading |
-| `correction_metadata` | Program correction metadata (including the byte size of the correction input buffer per SpyreOperation) |
+| `operations` | Ordered list of Operations — each Operation carries its own virtual addresses after loading |
+| `correction_metadata` | Program correction metadata (including the byte size of the correction input buffer per Operation) |
 | `init_packets` | Init packets from the compiler |
 
-ExecutionPlans do not own execution logic. They are passive data structures whose SpyreOperations have their binaries individually loaded to device memory (one DMA per binary) and are then submitted through SpyreStream for execution.
+ExecutionPlans do not own execution logic. They are passive data structures whose Operations have their binaries individually loaded to device memory (one DMA per binary) and are then submitted through SpyreStream → FlexStream for execution.
 
 #### SpyreStream
 
-The high-level stream abstraction in torch-spyre. A SpyreStream internally holds a `FlexStream` and serves as the single entry point for all device work — both data movement and compute. It translates high-level SpyreOperations into the correct sequence of primitive FlexStream calls. This is the layer where torch-spyre's understanding of SpyreOperations, program correction, data transfers, and tiling is converted into the flat copy/launch primitives that flex understands.
+A thin wrapper around `FlexStream` that implements the PyTorch Stream interface. SpyreStream is the torch-spyre-facing API — it translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Operations, VirtualAddresses) and delegates all execution logic to the underlying FlexStream.
+
+SpyreStream contains no decomposition logic, tiling logic, or understanding of Operation internals. It is a passthrough layer whose purpose is to bridge the PyTorch runtime conventions with the flex execution engine.
 
 **Semantics:**
-- SpyreStream is the torch-spyre-facing API; FlexStream is the flex-facing API
-- All methods are **asynchronous** — control returns to the host immediately
-- Within a SpyreStream, operations execute **sequentially** (inherited from the underlying FlexStream's FIFO ordering)
-- SpyreStream understands SpyreOperations and their internal structure (compute, preprocessing, program correction); FlexStream does not
+- Implements the PyTorch Stream interface so that torch-spyre integrates with PyTorch's stream management (e.g., `torch.spyre.Stream`, `torch.spyre.current_stream()`)
+- All methods are **asynchronous** — control returns to the host immediately (inherited from FlexStream)
+- Within a SpyreStream, operations execute **sequentially** (inherited from FlexStream's FIFO ordering)
 
 Methods:
 
 | Method | Description |
 |--------|-------------|
-| `Launch(SpyreOperation, List<device_handle>)` | Decompose a SpyreOperation into FlexStream primitives and enqueue them, given the resident tensor device handles |
-| `LaunchTiled(SpyreOperation, List<device_handle>)` | Like Launch, but handles tensors larger than the compiled tile size by enqueuing multiple iterations |
-| `Synchronize()` | Block the host until all previously enqueued operations have completed (delegates to FlexStream.Synchronize) |
-
-**Launch(SpyreOperation, List\<device_handle\>)**
-
-Takes a SpyreOperation and the device handles for resident input/output tensors. SpyreStream walks the SpyreOperation's PreProcessCompute list, mapping each entry to the appropriate FlexStream primitive (CopyToDevice, CopyFromDevice, or Launch), then enqueues a Launch for the SpyreCompute if present.
-
-**Example 1 — Tensor load (preprocessing only, no compute):**
-
-A SpyreOperation with a single CopyToDevice PreProcessCompute and no SpyreCompute:
-
-1. **CopyToDevice** — Copy tensor data from host to device
-
-Single FlexStream call. No Launch follows because there is no SpyreCompute.
-
-**Example 2 — Matmul with program correction (preprocessing + compute):**
-
-A SpyreOperation with PreProcessCompute entries (CopyToDevice for correction inputs, Launch for program correction) and a SpyreCompute (matmul):
-
-1. **CopyToDevice** — Copy the offset inputs (tensor device addresses used for program correction) from host to the correction program's input location on device
-2. **Launch** (program correction) — Execute the program correction compute, which patches the matmul program with the correct tensor addresses
-3. **Launch** (matmul compute) — Execute the corrected matmul program
-
-Each of these is enqueued on the underlying FlexStream in order. Because FlexStream is FIFO, the correction completes before the matmul begins, and the matmul begins only after its program has been corrected.
-
-**LaunchTiled(SpyreOperation, List\<device_handle\>)**
-
-Handles the case where tensor shapes exceed the compiled tile size. SpyreStream compares each tensor's shape against the kernel's expected input shapes (from the SpyreOperation's SpyreCompute metadata), infers the tiling dimension(s) and iteration count, and enqueues multiple rounds of FlexStream operations — one full Launch decomposition per tile iteration, each with updated tensor offsets.
-
-**Synchronize()**
-
-Delegates to `FlexStream.Synchronize()`. Blocks the calling host thread until all operations previously enqueued on this stream have completed.
+| `Launch(Operation, List<SpyreTensor>, allow_tiled_launch=true)` | Translate SpyreTensors to VirtualAddresses and delegate to `FlexStream.Launch(operation, virtual_addresses, allow_tiled_launch)` |
+| `Synchronize()` | Delegate to `FlexStream.Synchronize()` |
 
 #### FlexStream
 
-The low-level execution primitive in flex, modeled after CUDA streams. A FlexStream provides an asynchronous, ordered queue of FlexOperations to be executed on the Spyre device. FlexStream has no knowledge of SpyreOperations, program correction, or tiling — it only understands raw copies and program launches by device handle. SpyreStream is the layer that translates higher-level SpyreOperations into FlexStream calls.
+The core execution engine in flex, modeled after CUDA streams. A FlexStream accepts Operations — each representing a unit of work with an optional Compute and preprocessing steps — and decomposes them into the correct sequence of low-level steps (copies, launches) that are forwarded to the Scheduler as control blocks (CBs) for hardware dispatch.
 
-Each FlexStream method produces a **FlexOperation** — a single primitive (copy or launch) that maps directly to a control block (CB) for hardware submission. A FlexOperation is the unit of work that the Scheduler accepts and drains onto hardware.
+FlexStream understands the internal structure of Operations: it knows that a matmul may require a DMA of correction metadata, a program correction launch, and the actual compute launch, and it generates the correct sequence of low-level steps for each. FlexStream's `Launch` method also automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call.
 
 **Semantics:**
-- All methods are **asynchronous** — control returns to the host immediately after enqueuing the operation
+- All methods are **asynchronous** — control returns to the host immediately after enqueuing
 - Within a single FlexStream, operations execute **sequentially** in FIFO order
 - Across different FlexStreams, operations have **no ordering guarantees**
 - Each FlexStream is identified by a `stream_index`
@@ -193,22 +163,38 @@ Methods:
 
 | Method | Description |
 |--------|-------------|
-| `CopyToDevice(host_address, device_handle, size)` | Enqueue a host-to-device copy of `size` bytes from `host_address` to `device_handle` |
-| `CopyFromDevice(host_address, device_handle, size)` | Enqueue a device-to-host copy of `size` bytes from `device_handle` to `host_address` |
-| `Launch(device_handle)` | Enqueue execution of the binary identified by `device_handle` |
+| `Launch(Operation, List<virtual_address>, allow_tiled_launch=true)` | Decompose an Operation into low-level steps and enqueue them. If tensor shapes exceed the compiled tile size and `allow_tiled_launch` is true, automatically enqueues multiple tiled iterations. If shapes exceed the tile size and `allow_tiled_launch` is false, raises an exception. |
 | `Synchronize()` | Block the host until all previously enqueued operations on this stream have completed |
 
-**CopyToDevice(host_address, device_handle, size)**
+**Launch(Operation, List\<virtual_address\>, allow_tiled_launch=true)**
 
-Enqueues a host-to-device data transfer. The `host_address` is a pointer to source data in host memory. The `device_handle` is a `DeviceHandle` identifying the target location on device. `size` specifies the number of bytes to transfer.
+Takes an Operation, the virtual addresses for resident input/output tensors, and an optional `allow_tiled_launch` flag (defaults to true).
 
-**CopyFromDevice(host_address, device_handle, size)**
+FlexStream first compares each tensor's shape against the kernel's expected input shapes (from the Operation's Compute metadata). There are three cases:
 
-Enqueues a device-to-host data transfer. The `device_handle` is a `DeviceHandle` identifying the source location on device. The `host_address` is a pointer to the destination in host memory. `size` specifies the number of bytes to transfer.
+1. **Shapes match exactly** — FlexStream walks the Operation's PreProcessCompute list, mapping each entry to the appropriate low-level step (CopyToDevice, CopyFromDevice, or device launch), then enqueues a launch for the Compute if present. Each low-level step maps directly to a control block (CB) forwarded to the Scheduler.
 
-**Launch(device_handle)**
+2. **Shapes exceed tile size and `allow_tiled_launch` is true** — FlexStream infers the tiling dimension(s) and iteration count, then enqueues multiple rounds of low-level steps — one full Operation decomposition per tile iteration, each with updated tensor offsets. See [Tiled Execution](#tiled-execution) for details.
 
-Enqueues execution of a binary that has been previously loaded to device. The `device_handle` references the binary's location on device (e.g., a program correction binary or a compute binary from a SpyreOperation). For tiled execution, multiple Launch FlexOperations are enqueued for the same binary, each with updated tensor offsets.
+3. **Shapes exceed tile size and `allow_tiled_launch` is false** — FlexStream raises an exception indicating that the tensor shapes do not match the compiled tile size and tiled launch is not permitted.
+
+**Example 1 — Tensor load (preprocessing only, no compute):**
+
+An Operation with a single CopyToDevice PreProcessCompute and no Compute:
+
+1. **CopyToDevice** — Copy tensor data from host to device
+
+Single low-level step. No launch follows because there is no Compute.
+
+**Example 2 — Matmul with program correction (preprocessing + compute):**
+
+An Operation with PreProcessCompute entries (CopyToDevice for correction inputs, DeviceLaunch for program correction) and a Compute (matmul):
+
+1. **CopyToDevice** — Copy the offset inputs (tensor device addresses used for program correction) from host to the correction program's input location on device
+2. **Launch** (program correction) — Execute the program correction compute, which patches the matmul program with the correct tensor addresses
+3. **Launch** (matmul compute) — Execute the corrected matmul program
+
+Each of these is enqueued on the stream in order. Because FlexStream is FIFO, the correction completes before the matmul begins, and the matmul begins only after its program has been corrected.
 
 **Synchronize()**
 
@@ -216,24 +202,11 @@ Blocks the calling host thread until all operations previously enqueued on this 
 
 #### Scheduler
 
-The Scheduler sits underneath FlexStream and is responsible for serializing FlexOperations for execution on hardware. Since the current Spyre hardware does not support concurrent execution of multiple streams, the Scheduler ensures all FlexOperations are dispatched in a valid order.
-
-Methods:
-
-| Method | Description |
-|--------|-------------|
-| `QueueOperation(stream_index, flex_op)` | Accept a FlexOperation from the given stream and schedule it for execution on hardware |
-
-**Behavior:**
-- Each FlexStream method constructs a FlexOperation (which maps to a control block) and calls `Scheduler.QueueOperation(stream_index, flex_op)` to submit work
-- The Scheduler maintains per-stream FIFO queues and drains them onto the hardware
-- Within a stream, FlexOperations are strictly ordered — a FlexOperation does not begin until the previous one completes
-- Across streams, the Scheduler is free to interleave FlexOperations in any order, though with current hardware constraints it serializes all FlexOperations into a single execution sequence
-- The Scheduler abstracts the hardware's execution constraints, allowing the FlexStream API to remain unchanged as hardware evolves to support true concurrent stream execution
+The Scheduler sits underneath FlexStream and is responsible for dispatching low-level steps onto hardware. From the perspective of this RFC, the Scheduler is an opaque component — FlexStream submits control blocks to it, and the Scheduler ensures they are executed respecting the intra-stream FIFO ordering guarantee. The Scheduler's internal design (scheduling policies, hardware serialization strategy, multi-stream interleaving) is covered in a separate Scheduler RFC.
 
 ### Tiled Execution
 
-Tiled execution is owned by `SpyreStream.LaunchTiled`. When a tensor is larger than the compiled tile size, SpyreStream reuses the compiled kernel across the full tensor by enqueuing multiple rounds of FlexOperations — one full SpyreOperation decomposition per iteration, each with updated tensor offsets.
+Tiled execution is handled automatically by `FlexStream.Launch` when `allow_tiled_launch` is true (the default). When a tensor is larger than the compiled tile size, FlexStream reuses the compiled kernel across the full tensor by enqueuing multiple rounds of low-level steps — one full Operation decomposition per iteration, each with updated tensor offsets. If `allow_tiled_launch` is false and shapes exceed the tile size, Launch raises an exception.
 
 **Preconditions:**
 - Each tensor dimension is greater than or equal to the corresponding compiled tile dimension
@@ -241,12 +214,12 @@ Tiled execution is owned by `SpyreStream.LaunchTiled`. When a tensor is larger t
 - Tensor strides are consistent with the tiling dimension
 
 **Behavior:**
-1. Compare each tensor's shape against the kernel's expected input shapes (from the ExecutionPlan's per-SpyreCompute metadata)
+1. Compare each tensor's shape against the kernel's expected input shapes (from the Operation's Compute metadata)
 2. Infer the tiling dimension(s) and compute `num_iterations = tensor_dim / tile_dim`
 3. For each iteration `i`:
-   a. Compute per-tensor offset: `offset_i = base_vf_offset + (i * tensor_stride_along_tiled_dim * tile_size * element_size)`
-   b. Decompose the SpyreOperation into FlexOperations with updated device addresses (CopyToDevice for correction inputs, Launch for correction, Launch for compute)
-   c. All operations enqueued asynchronously on the underlying FlexStream — sequential within the stream
+   a. Compute per-tensor offset: `offset_i = base_offset + (i * tensor_stride_along_tiled_dim * tile_size * element_size)`
+   b. Decompose the Operation into low-level steps with updated device addresses (CopyToDevice for correction inputs, Launch for correction, Launch for compute)
+   c. All steps enqueued asynchronously — sequential within the stream
 
 **Example — Matmul tiling along M (with program correction):**
 
@@ -270,50 +243,51 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 
 ### Front-End Interface
 
-**LaunchKernel(SpyreStream, ExecutionPlan, List\<SpyreTensor\>)** — The entry point in torch-spyre. For each SpyreOperation in the ExecutionPlan, determines whether the tensors match the compiled tile size exactly or require tiling, then delegates to either `SpyreStream.Launch` or `SpyreStream.LaunchTiled` accordingly. Control returns to the host immediately; use `SpyreStream.Synchronize()` to wait for completion.
+**LaunchKernel(SpyreStream, ExecutionPlan, List\<SpyreTensor\>)** — The entry point in torch-spyre. For each Operation in the ExecutionPlan, delegates to `SpyreStream.Launch(operation, tensors, allow_tiled_launch)`. The `allow_tiled_launch` value can be controlled by a user environment setting (e.g., `SPYRE_ALLOW_TILED_LAUNCH`), allowing users to disable automatic tiling for debugging or to enforce that tensor shapes exactly match the compiled tile size. SpyreStream translates the SpyreTensors to VirtualAddresses and passes through to `FlexStream.Launch`, which automatically detects whether tensor shapes match the compiled tile size or require tiled execution. Control returns to the host immediately; use `SpyreStream.Synchronize()` to wait for completion.
 
 ### Workflows
 
 #### Workflow 1: Tensor Allocation and Transfer
 
 ```
-┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐     ┌────────────┐
-│  CPUTensor   │────▶│ SpyreAllocator  │────▶│   SpyreStream    │────▶│ FlexStream │
-│  (host)      │     │ allocate block  │     │ Launch(SpyreOp   │     │ CopyTo     │
-│              │     │ → DeviceHandle  │     │  [CopyToDevice]) │     │ Device()   │
-│              │     │      │         │                  │     │ (async)    │
-└─────────────┘     └─────────────────┘     └──────────────────┘     └────────────┘
+┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  CPUTensor   │────▶│ SpyreAllocator  │────▶│   SpyreStream    │────▶│    FlexStream    │
+│  (host)      │     │ allocate block  │     │ (translate data, │     │ Launch(Operation │
+│              │     │ → VirtualAddress│     │  passthrough)    │     │  [CopyToDevice]) │
+│              │     │                 │     │                  │     │ decompose→sched  │
+└─────────────┘     └─────────────────┘     └──────────────────┘     └──────────────────┘
 ```
 
 1. User creates a `CPUTensor` and calls `.to(device)`
-2. SpyreAllocator allocates a block, producing a `DeviceHandle` (PFDeviceHandle or VFDeviceHandle depending on mode)
-3. A preprocessing-only SpyreOperation is created with a CopyToDevice PreProcessCompute (host_address, device_handle, size)
-4. `SpyreStream.Launch(spyre_op, [])` decomposes into `FlexStream.CopyToDevice(...)` — returns immediately
-5. Result is a `SpyreTensor` carrying the device address metadata
-6. Host may continue work; data transfer proceeds asynchronously on the stream
+2. SpyreAllocator allocates a block, producing a `VirtualAddress` (`region_id` + `offset`; interpretation of `region_id` depends on PF vs VF mode)
+3. A preprocessing-only Operation is created with a CopyToDevice PreProcessCompute (host_address, virtual_address, size)
+4. `SpyreStream.Launch(op, tensors)` translates SpyreTensors → VirtualAddresses, then delegates to `FlexStream.Launch(op, virtual_addresses)`
+5. FlexStream decomposes the Operation into a CopyToDevice low-level step and forwards it to the Scheduler — returns immediately
+6. Result is a `SpyreTensor` carrying the device address metadata
+7. Host may continue work; data transfer proceeds asynchronously on the stream
 
 #### Workflow 2: Compilation and Loading
 
 ```
-┌──────────┐     ┌───────────┐     ┌───────────────┐     ┌──────────────────┐     ┌────────────┐
-│ Inductor │────▶│ Deeptools │────▶│ ExecutionPlan │────▶│   SpyreStream    │────▶│ FlexStream │
-│ (sdsc)   │     │ (compile) │     │               │     │ Launch(SpyreOp   │     │ CopyTo     │
-└──────────┘     └───────────┘     └───────────────┘     │  [CopyToDevice]) │     │ Device()   │
-                                                          │ × N (per binary) │     │ × N        │
-                                                          └──────────────────┘     └────────────┘
+┌──────────┐     ┌───────────┐     ┌───────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ Inductor │────▶│ Deeptools │────▶│ ExecutionPlan │────▶│   SpyreStream    │────▶│    FlexStream    │
+│ (sdsc)   │     │ (compile) │     │               │     │ (passthrough)    │     │ Launch(Operation │
+└──────────┘     └───────────┘     └───────────────┘     │ × N (per binary) │     │  [CopyToDevice]) │
+                                                          └──────────────────┘     │ × N              │
+                                                                                   └──────────────────┘
 ```
 
 1. `torch.compile` triggers the inductor frontend, producing sdsc inputs for deeptools
-2. Deeptools (backend compiler) produces an `ExecutionPlan` — an ordered list of SpyreOperations, each containing `SpyreCompute` and `PreProcessCompute` steps
-3. For each SpyreOperation in the ExecutionPlan, for each binary that needs to be on device (e.g., program correction binary, compute binary):
-   a. SpyreAllocator allocates space for the binary → `device_handle`
-   b. A preprocessing-only SpyreOperation is created with a CopyToDevice PreProcessCompute
-   c. `SpyreStream.Launch(spyre_op, [])` decomposes into `FlexStream.CopyToDevice(...)` — `device_handle` is stored on the SpyreOperation
-4. ExecutionPlan (with all SpyreOperation device handles populated) is cached for reuse
+2. Deeptools (backend compiler) produces an `ExecutionPlan` — an ordered list of Operations, each containing `Compute` and `PreProcessCompute` steps
+3. For each Operation in the ExecutionPlan, for each binary that needs to be on device (e.g., program correction binary, compute binary):
+   a. SpyreAllocator allocates space for the binary → `virtual_address`
+   b. A preprocessing-only Operation is created with a CopyToDevice PreProcessCompute
+   c. `SpyreStream.Launch(op, [])` passes through to `FlexStream.Launch(op, [])`, which decomposes into a CopyToDevice step — `virtual_address` is stored on the Operation
+4. ExecutionPlan (with all Operation virtual addresses populated) is cached for reuse
 
 #### Workflow 3: Detailed Execution — LaunchKernel to Hardware
 
-This diagram shows the full path from `LaunchKernel` through every layer for a matmul with program correction, illustrating how SpyreStream decomposes a single SpyreOperation into FlexOperations that the Scheduler drains onto hardware.
+This diagram shows the full path from `LaunchKernel` through every layer for a matmul with program correction, illustrating how FlexStream decomposes a single Operation into low-level steps that the Scheduler drains onto hardware.
 
 ```
  torch-spyre                          flex
@@ -323,58 +297,60 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 │        exec_plan, tensors)      │  │                                                  │
 │         │                       │  │                                                  │
 │         ▼                       │  │                                                  │
-│  ┌─────────────┐                │  │                                                  │
-│  │  Validate   │                │  │                                                  │
-│  │  shapes vs  │                │  │                                                  │
-│  │  SpyreComp  │                │  │                                                  │
-│  │  expected   │                │  │                                                  │
-│  └──────┬──────┘                │  │                                                  │
+│  SpyreStream.Launch(op, tensors,│  │                                                  │
+│    allow_tiled_launch)          │  │                                                  │
 │         │                       │  │                                                  │
-│         ▼                       │  │                                                  │
-│  ┌──────────────┐               │  │                                                  │
-│  │ shapes match │──── yes ──────┼──┼─▶ SpyreStream.Launch(spyre_op, tensor_handles) │
-│  │ tile size?   │               │  │                         │                        │
-│  └──────┬───────┘               │  │                         │                        │
-│         │ no                    │  │                         │                        │
-│         ▼                       │  │                         │                        │
-│  SpyreStream.LaunchTiled(       │  │                         │                        │
-│    spyre_op, tensor_handles)    │  │                         │                        │
-│         │                       │  │                         │                        │
-│  (see Workflow 4 for tiling)    │  │                         │                        │
-│                                 │  │                         │                        │
-└─────────────────────────────────┘  │                         │                        │
-                                     │    ┌────────────────────┘                        │
-                                     │    │  SpyreStream decomposes SpyreOperation:      │
+│  (translate tensors →           │  │                                                  │
+│   virtual_addresses, delegate)  │  │                                                  │
+│         │                       │  │                                                  │
+│         └───────────────────────┼──┼─▶ FlexStream.Launch(op, vaddrs,                 │
+│                                 │  │     allow_tiled_launch)                          │
+│                                 │  │         │                                        │
+└─────────────────────────────────┘  │         │                                        │
+                                     │    ┌────┘                                        │
+                                     │    │  FlexStream compares tensor shapes           │
+                                     │    │  against Compute.expected_input_shapes:      │
                                      │    │                                             │
-                                     │    │  SpyreOperation contains:                        │
-                                     │    │    SpyreCompute (matmul)                    │
+                                     │    │  ┌──────────────────────────────────────┐   │
+                                     │    │  │ shapes match exactly?                │   │
+                                     │    │  │   YES → decompose single iteration   │   │
+                                     │    │  │   NO  → allow_tiled_launch?          │   │
+                                     │    │  │         YES → tiled iterations       │   │
+                                     │    │  │         NO  → raise exception        │   │
+                                     │    │  └──────────────────────────────────────┘   │
+                                     │    │                                             │
+                                     │    │  (showing exact-match case below;           │
+                                     │    │   see Workflow 4 for tiled case)            │
+                                     │    │                                             │
+                                     │    │  Operation contains:                        │
+                                     │    │    Compute (matmul)                         │
                                      │    │    PreProcessCompute (program correction)   │
-                                     │    │    tensor device handles: [A_hdl, B_hdl]    │
+                                     │    │    tensor virtual addresses: [A, B]         │
                                      │    │                                             │
-                                     │    │  Decomposed into FlexOperations:            │
+                                     │    │  Decomposed into low-level steps:           │
                                      │    ▼                                             │
                                      │  ┌───────────────────────────────────────────┐   │
-                                     │  │            FlexStream Queue               │   │
+                                     │  │            FlexStream                     │   │
                                      │  │  (FIFO — sequential within stream)        │   │
                                      │  │                                           │   │
                                      │  │  ┌─────────────────────────────────────┐  │   │
                                      │  │  │ 1. CopyToDevice(                    │  │   │
                                      │  │  │      correction_offsets_host,       │  │   │
-                                     │  │  │      correction_input_device_hdl,   │  │   │
+                                     │  │  │      correction_input_vaddr,        │  │   │
                                      │  │  │      size)                          │  │   │
                                      │  │  │    Copy tensor offset inputs to     │  │   │
                                      │  │  │    device for program correction    │  │   │
                                      │  │  ├─────────────────────────────────────┤  │   │
                                      │  │  │ 2. Launch(                          │  │   │
-                                     │  │  │      program_correction_device_hdl) │  │   │
+                                     │  │  │      program_correction_vaddr)      │  │   │
                                      │  │  │    Execute program correction —     │  │   │
                                      │  │  │    patches matmul program with      │  │   │
                                      │  │  │    correct tensor addresses         │  │   │
                                      │  │  ├─────────────────────────────────────┤  │   │
                                      │  │  │ 3. Launch(                          │  │   │
-                                     │  │  │      matmul_compute_device_hdl)     │  │   │
+                                     │  │  │      matmul_compute_vaddr)          │  │   │
                                      │  │  │    Execute the corrected matmul     │  │   │
-                                     │  │  │    A_hdl × B_hdl → C_hdl            │  │   │
+                                     │  │  │    A × B → C                        │  │   │
                                      │  │  └─────────────────────────────────────┘  │   │
                                      │  └──────────────────┬────────────────────────┘   │
                                      │                     │                            │
@@ -382,9 +358,10 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
                                      │  ┌──────────────────────────────────────────┐    │
                                      │  │              Scheduler                   │    │
                                      │  │                                          │    │
-                                     │  │  QueueOperation(stream_idx, copy_cb)     │    │
-                                     │  │  QueueOperation(stream_idx, corr_cb)     │    │
-                                     │  │  QueueOperation(stream_idx, matmul_cb)   │    │
+                                     │  │  Receives CBs from FlexStream:           │    │
+                                     │  │    CB(copy offsets)                      │    │
+                                     │  │    CB(correction launch)                │    │
+                                     │  │    CB(matmul launch)                    │    │
                                      │  │                                          │    │
                                      │  │  Drains FIFO onto hardware:              │    │
                                      │  │  ┌────────┐ ┌────────┐ ┌────────┐       │    │
@@ -402,17 +379,20 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 **Step-by-step:**
 
 1. `LaunchKernel(spyre_stream, exec_plan, tensors)` is called from torch-spyre
-2. Tensor shapes are validated against the ExecutionPlan's expected input shapes
-3. Shapes match exactly → delegates to `SpyreStream.Launch(spyre_op, tensor_device_handles)`
-4. SpyreStream inspects the SpyreOperation's internal structure:
-   - Identifies the PreProcessCompute (program correction) and SpyreCompute (matmul)
+2. For each Operation, delegates to `SpyreStream.Launch(op, tensors, allow_tiled_launch)`
+3. SpyreStream translates SpyreTensors → VirtualAddresses and calls `FlexStream.Launch(op, virtual_addresses, allow_tiled_launch)`
+4. FlexStream compares tensor shapes against the Compute's expected input shapes:
+   - Shapes match exactly → proceeds with single-iteration decomposition (this workflow)
+   - Shapes exceed tile size and `allow_tiled_launch` is true → tiled iterations (see Workflow 4)
+   - Shapes exceed tile size and `allow_tiled_launch` is false → raises exception
+5. FlexStream inspects the Operation's internal structure:
+   - Identifies the PreProcessCompute (program correction) and Compute (matmul)
    - Prepares correction offset inputs (tensor device addresses that the correction program needs)
-5. SpyreStream enqueues onto FlexStream in order:
-   - `CopyToDevice(correction_offsets_host, correction_input_device_hdl, size)` — upload offset inputs
-   - `Launch(program_correction_device_hdl)` — run program correction
-   - `Launch(matmul_compute_device_hdl)` — run the corrected matmul
-6. FlexStream constructs a FlexOperation (containing a control block) for each primitive and forwards it to `Scheduler.QueueOperation(stream_index, flex_op)`
-7. Scheduler drains FlexOperations onto hardware in FIFO order
+6. FlexStream decomposes the Operation into low-level steps and forwards each as a control block to the Scheduler:
+   - CopyToDevice(correction_offsets_host, correction_input_vaddr, size) — upload offset inputs
+   - Launch(program_correction_vaddr) — run program correction
+   - Launch(matmul_compute_vaddr) — run the corrected matmul
+7. Scheduler drains control blocks onto hardware in FIFO order
 8. Host returns immediately; call `SpyreStream.Synchronize()` when results are needed
 
 #### Workflow 4: Tiled Execution
@@ -421,32 +401,40 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
  torch-spyre                                    flex
 ┌──────────────────────────────────┐  ┌──────────────────────────────────────────────┐
 │                                  │  │                                              │
-│  LaunchKernel detects tile       │  │                                              │
-│  mismatch → SpyreStream         │  │                                              │
-│     .LaunchTiled(spyre_op,       │  │                                              │
-│       tensor_handles)            │  │                                              │
+│  LaunchKernel(spyre_stream,      │  │                                              │
+│    exec_plan, tensors)           │  │                                              │
 │         │                        │  │                                              │
-│  Infer: 4 iterations (4096/1024) │  │                                              │
+│  SpyreStream.Launch(op, tensors, │  │                                              │
+│    allow_tiled_launch=true)      │  │                                              │
 │         │                        │  │                                              │
-│    ┌────┴────┐                   │  │          FlexStream Queue                    │
-│    │ iter 0  │ ──────────────────┼──┼─▶ CopyToDevice(offsets_0) → Launch(corr)    │
-│    │         │                   │  │   → Launch(matmul)                           │
-│    ├─────────┤                   │  │                                              │
-│    │ iter 1  │ ──────────────────┼──┼─▶ CopyToDevice(offsets_1) → Launch(corr)    │
-│    │         │                   │  │   → Launch(matmul)                           │
-│    ├─────────┤                   │  │                                              │
-│    │ iter 2  │ ──────────────────┼──┼─▶ CopyToDevice(offsets_2) → Launch(corr)    │
-│    │         │                   │  │   → Launch(matmul)                           │
-│    ├─────────┤                   │  │                                              │
-│    │ iter 3  │ ──────────────────┼──┼─▶ CopyToDevice(offsets_3) → Launch(corr)    │
-│    │         │                   │  │   → Launch(matmul)                           │
-│    └─────────┘                   │  │                                              │
-│                                  │  │   (12 ops total, all async, FIFO in stream)  │
-└──────────────────────────────────┘  │                     │                        │
+│  (translate tensors → vaddrs)    │  │                                              │
+│         │                        │  │                                              │
+│         └────────────────────────┼──┼─▶ FlexStream.Launch(op, vaddrs,             │
+│                                  │  │     allow_tiled_launch=true)                 │
+│                                  │  │         │                                    │
+└──────────────────────────────────┘  │  Detects shapes exceed tile size             │
+                                      │  allow_tiled_launch=true → proceed           │
+                                      │  Infer: 4 iterations (4096/1024)             │
+                                      │         │                                    │
+                                      │    ┌────┴────┐                               │
+                                      │    │ iter 0  │─▶ Copy(offsets_0)→Launch(corr)│
+                                      │    │         │   →Launch(matmul)             │
+                                      │    ├─────────┤                               │
+                                      │    │ iter 1  │─▶ Copy(offsets_1)→Launch(corr)│
+                                      │    │         │   →Launch(matmul)             │
+                                      │    ├─────────┤                               │
+                                      │    │ iter 2  │─▶ Copy(offsets_2)→Launch(corr)│
+                                      │    │         │   →Launch(matmul)             │
+                                      │    ├─────────┤                               │
+                                      │    │ iter 3  │─▶ Copy(offsets_3)→Launch(corr)│
+                                      │    │         │   →Launch(matmul)             │
+                                      │    └─────────┘                               │
+                                      │   (12 CBs total, all async, FIFO in stream)  │
+                                      │                     │                        │
                                       │                     ▼                        │
                                       │  ┌──────────────────────────────────────┐    │
                                       │  │            Scheduler                 │    │
-                                      │  │  Serializes all 12 ops onto HW:     │    │
+                                      │  │  Drains all 12 CBs onto HW:         │    │
                                       │  │  Copy₀→Corr₀→Mat₀→Copy₁→Corr₁→Mat₁│    │
                                       │  │  →Copy₂→Corr₂→Mat₂→Copy₃→Corr₃→Mat₃│   │
                                       │  └──────────────────────────────────────┘    │
@@ -454,18 +442,20 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 ```
 
 1. `LaunchKernel(spyre_stream, exec_plan, tensors)` is called from torch-spyre
-2. Tensor shapes are compared against the ExecutionPlan's expected input shapes
-3. Mismatch detected → delegates to `SpyreStream.LaunchTiled(spyre_op, tensor_device_handles)`
-4. SpyreStream infers tiling dimension and `num_iterations = 4096 / 1024 = 4`
-5. For each iteration `i`:
+2. For each Operation, delegates to `SpyreStream.Launch(op, tensors, allow_tiled_launch=true)`
+3. SpyreStream translates SpyreTensors → VirtualAddresses and calls `FlexStream.Launch(op, virtual_addresses, allow_tiled_launch=true)`
+4. FlexStream compares tensor shapes against the Compute's expected input shapes — detects shapes exceed tile size
+5. `allow_tiled_launch` is true → FlexStream proceeds with tiled execution
+6. FlexStream infers tiling dimension and `num_iterations = 4096 / 1024 = 4`
+7. For each iteration `i`, FlexStream:
    - Computes updated tensor offsets for iteration `i`
-   - Decomposes the SpyreOperation into FlexOperations with updated addresses:
+   - Decomposes the Operation into low-level steps with updated addresses:
      - `CopyToDevice(correction_offsets_i)` — upload corrected offset inputs for this iteration
      - `Launch(program_correction)` — patch the program with this iteration's addresses
      - `Launch(matmul_compute)` — execute the matmul for this tile slice
-6. All 12 operations (3 per iteration × 4 iterations) are enqueued asynchronously on FlexStream
-7. Scheduler drains all operations onto hardware in FIFO order
-8. Host returns immediately; call `SpyreStream.Synchronize()` to block until all iterations complete
+8. All 12 control blocks (3 per iteration × 4 iterations) are forwarded to the Scheduler
+9. Scheduler drains all control blocks onto hardware in FIFO order
+10. Host returns immediately; call `SpyreStream.Synchronize()` to block until all iterations complete
 
 #### Workflow 5: End-to-End
 
@@ -473,8 +463,8 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
                                                     # Default SpyreStream created at runtime start
 
 1. tensor_a = torch.randn(4096, 1024)             # Create on CPU
-2. spyre_a = tensor_a.to("spyre")                 # SpyreOperation([CopyToDevice]) → FlexStream.CopyToDevice
-3. spyre_b = torch.randn(1024, 1024).to("spyre")  # Same — async, all through default SpyreStream
+2. spyre_a = tensor_a.to("spyre")                 # Operation([CopyToDevice]) → FlexStream decomposes → Scheduler
+3. spyre_b = torch.randn(1024, 1024).to("spyre")  # Same — async, all through default SpyreStream → FlexStream
 
 4. compiled_fn = torch.compile(matmul_fn)          # Lazy — no compilation yet
 
@@ -483,11 +473,12 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
                                                     # Cached via PyTorch compile caching
                                                     # Then: LaunchKernel(exec_plan, tensors)
                                                     # Uses default stream (or creates a new one)
-                                                    # Detects tensor_a [4096,1024] > tile [1024,1024]
-                                                    # SpyreStream.LaunchTiled enqueues 4 iterations
-                                                    # (12 FlexStream ops: 3 per iteration)
+                                                    # SpyreStream.Launch → FlexStream.Launch
+                                                    # FlexStream detects tensor_a [4096,1024] > tile [1024,1024]
+                                                    # allow_tiled_launch=true → enqueues 4 iterations
+                                                    # (12 CBs: 3 per iteration)
 
-6. result_cpu = result.to("cpu")                   # SpyreOperation([CopyFromDevice]) → FlexStream.CopyFromDevice
+6. result_cpu = result.to("cpu")                   # Operation([CopyFromDevice]) → FlexStream decomposes → Scheduler
 ```
 
 #### Workflow 6: Multi-Stream (Future Hardware)
@@ -497,10 +488,10 @@ stream_a = SpyreStream()                           # Stream for layer 1
 stream_b = SpyreStream()                           # Stream for layer 2
 
 # Enqueue independent work on separate streams
-LaunchKernel(stream_a, exec_plan_1, tensors_1)     # Async — SpyreStream decomposes into FlexStream ops
+LaunchKernel(stream_a, exec_plan_1, tensors_1)     # Async — SpyreStream passes through to FlexStream
 LaunchKernel(stream_b, exec_plan_2, tensors_2)     # Async — no ordering w.r.t. stream_a
 
-# With current hardware: Scheduler serializes both streams' FlexStream ops
+# With current hardware: Scheduler serializes both streams' operations
 # With future hardware: Both streams may execute concurrently
 
 stream_a.Synchronize()
@@ -525,14 +516,15 @@ TBD
 
 FlexStream is modeled after CUDA streams and shares the two fundamental guarantees: **async enqueue** (all methods return control to the host immediately) and **intra-stream FIFO ordering** (operations within a stream execute sequentially, with no ordering guarantees across streams).
 
-The key difference is where work submission lives. A CUDA stream is a **passive handle** — you pass it as a parameter to external API calls like `cudaMemcpyAsync(dst, src, size, kind, stream)` or kernel launches via `<<<grid, block, sharedMem, stream>>>`. FlexStream is an **active object** — copy and launch are methods on the stream itself (`stream.CopyToDevice(...)`, `stream.Launch(...)`).
+The key difference is where work submission lives. A CUDA stream is a **passive handle** — you pass it as a parameter to external API calls like `cudaMemcpyAsync(dst, src, size, kind, stream)` or kernel launches via `<<<grid, block, sharedMem, stream>>>`. FlexStream is an **active object** — operations are submitted as methods on the stream itself (`stream.Launch(op, ...)`, `stream.Synchronize()`).
 
 The following table maps CUDA stream capabilities to their FlexStream equivalents:
 
 | Capability | CUDA Stream | FlexStream |
 |------------|-------------|------------|
-| Copy | `cudaMemcpyAsync(dst, src, size, kind, stream)` — direction via enum | Separate `CopyToDevice` / `CopyFromDevice` — direction explicit in method name |
-| Launch | `kernel<<<grid, block, sharedMem, stream>>>()` — takes grid/block dims, function pointer, args | `Launch(device_handle)` — just a handle to a pre-loaded binary (no grid/block dims since Spyre is not SIMT) |
+| Copy | `cudaMemcpyAsync(dst, src, size, kind, stream)` — standalone primitive call | Data transfers are expressed as PreProcessCompute steps within an Operation; FlexStream decomposes them into low-level copy steps internally |
+| Launch | `kernel<<<grid, block, sharedMem, stream>>>()` — takes grid/block dims, function pointer, args | `Launch(Operation, virtual_addresses, allow_tiled_launch=true)` — accepts a compound Operation and decomposes it into the correct sequence of low-level steps (no grid/block dims since Spyre is not SIMT). Automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently when `allow_tiled_launch` is true. |
+| Tiled launch | User changes grid dims to cover larger tensors | Handled automatically by `Launch` — no separate API. FlexStream iterates over tiles, enqueuing multiple decompositions with updated offsets. |
 | Synchronize | `cudaStreamSynchronize(stream)` | `Synchronize()` — identical semantics |
 | Events | `cudaEventRecord` / `cudaStreamWaitEvent` for inter-stream dependencies | Not present (see unresolved question #4) |
 | Query | `cudaStreamQuery()` — non-blocking completion poll | Not present (see unresolved question #9) |
@@ -540,18 +532,20 @@ The following table maps CUDA stream capabilities to their FlexStream equivalent
 | Host callbacks | `cudaLaunchHostFunc()` — enqueue a host-side function on the stream | Not present (see unresolved question #11) |
 | Default stream | NULL stream with legacy blocking semantics | Not yet specified (see unresolved question #7) |
 
-FlexStream is a deliberately minimal subset — 4 methods vs. CUDA's dozens. The omitted features (events, query, priorities, host callbacks) are captured as unresolved questions for future consideration as hardware and runtime requirements evolve.
+FlexStream is a deliberately minimal subset — 2 methods vs. CUDA's dozens. The omitted features (events, query, priorities, host callbacks) are captured as unresolved questions for future consideration as hardware and runtime requirements evolve.
 
-### SpyreStream — No Direct CUDA Equivalent
+### SpyreStream and FlexStream — Compound Operations
 
-CUDA has no built-in runtime layer analogous to SpyreStream. In CUDA, a kernel launch is self-contained — the user or library (cuBLAS, cuDNN) manually issues the correct sequence of memcpy and launch calls on a stream. SpyreStream exists because Spyre operations have inherent **compound structure**:
+In CUDA, a kernel launch is self-contained — the user or library (cuBLAS, cuDNN) manually issues the correct sequence of memcpy and launch calls on a stream. Spyre operations have inherent **compound structure** that requires the runtime to decompose a single logical operation into multiple low-level steps:
 
 - **A CUDA matmul**: 1 kernel launch
-- **A Spyre matmul**: DMA correction metadata → run correction binary → run compute binary (3 FlexOperations)
+- **A Spyre matmul**: DMA correction metadata → run correction binary → run compute binary (3 low-level steps)
 
-SpyreStream encapsulates this decomposition so callers never touch FlexStream directly. The closest CUDA analogs are vendor libraries like cuBLAS and cuDNN, which internally issue multi-step sequences on a user-provided stream — but those are external libraries, not a core runtime layer. SpyreStream makes this pattern a first-class part of the runtime because every Spyre compute requires it, not just optimized library calls.
+FlexStream owns this decomposition as a first-class part of the runtime. The closest CUDA analogs are vendor libraries like cuBLAS and cuDNN, which internally issue multi-step sequences on a user-provided stream — but those are external libraries, not a core stream layer. In the Spyre stack, compound decomposition is built into FlexStream because every Spyre compute requires it, not just optimized library calls.
 
-The other unique SpyreStream capability — `LaunchTiled` — also has no CUDA equivalent. CUDA kernels accept arbitrary dimensions as launch parameters (`<<<grid, block>>>`), so the user simply changes grid dims to cover larger tensors. Spyre kernels are compiled for fixed tile shapes, so the runtime must iterate over tiles, enqueuing multiple rounds of FlexOperations with updated tensor offsets.
+SpyreStream, by contrast, is a thin PyTorch Stream wrapper with no CUDA analog needed — it simply bridges PyTorch runtime conventions (torch tensors, device metadata) with FlexStream's types (Operations, VirtualAddresses).
+
+FlexStream's automatic tiling within `Launch` also has no CUDA equivalent. CUDA kernels accept arbitrary dimensions as launch parameters (`<<<grid, block>>>`), so the user simply changes grid dims to cover larger tensors. Spyre kernels are compiled for fixed tile shapes, so FlexStream's `Launch` must detect this and iterate over tiles, enqueuing multiple rounds of low-level steps with updated tensor offsets — all transparently within the same `Launch` call.
 
 ## **How we teach this**
 
@@ -569,11 +563,11 @@ TBD
 
 5. **Remainder handling**: What happens when the tensor dimension is not evenly divisible by the tile size (e.g., tensor is 4000 with tile 1024)? Options: fail, pad, or compile a separate remainder kernel.
 
-6. **Scheduler policies**: When draining multiple streams onto serialized hardware, what scheduling policy should be used? Options: round-robin, priority-based, drain-one-first, etc.
+6. **Scheduler policies**: Deferred to the Scheduler RFC — covers scheduling policy, hardware serialization strategy, and multi-stream interleaving.
 
 7. **Default stream**: Should there be a default FlexStream (like CUDA's default stream) that is used when the user does not explicitly create one?
 
-8. **Program correction across PF/VF modes**: The correction input buffer contains tensor locations — offsets in VF mode, addresses in PF mode. How should SpyreStream assemble this buffer uniformly from DeviceHandles when the correction program expects mode-specific values?
+8. **Program correction across PF/VF modes**: The correction input buffer contains tensor locations derived from VirtualAddresses. Since VirtualAddress is now a single type (`region_id` + `offset`) in both modes, FlexStream can assemble the buffer uniformly — but the correction program on device may still need to interpret `region_id` differently (firmware lookup index vs. physical address). How should this mode distinction be communicated to the correction program?
 
 9. **Non-blocking completion query**: Should FlexStream support a `Query()` method (analogous to `cudaStreamQuery()`) that returns whether all enqueued operations have completed without blocking? This would allow polling-based patterns and avoid unnecessary synchronization.
 
