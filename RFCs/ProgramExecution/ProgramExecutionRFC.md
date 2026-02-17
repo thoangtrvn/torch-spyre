@@ -526,10 +526,11 @@ The following table maps CUDA stream capabilities to their FlexStream equivalent
 | Launch | `kernel<<<grid, block, sharedMem, stream>>>()` — takes grid/block dims, function pointer, args | `Launch(Operation, virtual_addresses, allow_tiled_launch=true)` — accepts a compound Operation and decomposes it into the correct sequence of low-level steps (no grid/block dims since Spyre is not SIMT). Automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently when `allow_tiled_launch` is true. |
 | Tiled launch | User changes grid dims to cover larger tensors | Handled automatically by `Launch` — no separate API. FlexStream iterates over tiles, enqueuing multiple decompositions with updated offsets. |
 | Synchronize | `cudaStreamSynchronize(stream)` | `Synchronize()` — identical semantics |
-| Events | `cudaEventRecord` / `cudaStreamWaitEvent` for inter-stream dependencies | Not present (see unresolved question #4) |
+| Events | `cudaEventRecord` / `cudaStreamWaitEvent` for inter-stream dependencies | Not present (see unresolved question #1) |
 | Query | `cudaStreamQuery()` — non-blocking completion poll | Not present (see unresolved question #9) |
 | Priorities | `cudaStreamCreateWithPriority()` | Not present (see unresolved question #10) |
 | Host callbacks | `cudaLaunchHostFunc()` — enqueue a host-side function on the stream | Not present (see unresolved question #11) |
+
 | Default stream | NULL stream with legacy blocking semantics | Not yet specified (see unresolved question #7) |
 
 FlexStream is a deliberately minimal subset — 2 methods vs. CUDA's dozens. The omitted features (events, query, priorities, host callbacks) are captured as unresolved questions for future consideration as hardware and runtime requirements evolve.
@@ -553,13 +554,13 @@ TBD
 
 ## **Unresolved questions**
 
-1. **Reduction tiling**: When tiling along the reduction dimension (K in matmul), partial results must be accumulated. Should the runtime handle accumulation internally, or should this be expressed as a separate operation in the ExecutionPlan?
+1. **Stream events / synchronization primitives**: FlexStream will need inter-stream synchronization (e.g., CUDA-style events) to express dependencies between streams without full synchronization. The requirement is clear, but the implementation approach is still open.
 
-2. **Multi-dimensional tiling**: If both M and N exceed the tile size, the runtime needs a nested loop. Should tiled execution support arbitrary nesting, or should this be constrained to single-dimension tiling with multi-dim handled by the compiler?
+2. **Reduction tiling**: When tiling along the reduction dimension (K in matmul), partial results must be accumulated. Should the runtime handle accumulation internally, or should this be expressed as a separate operation in the ExecutionPlan?
 
-3. **Async iteration overlap**: Currently each tiled iteration within a stream is sequential. Could we use separate streams or double-buffering to overlap iteration N+1's data movement with iteration N's compute?
+3. **Multi-dimensional tiling**: If both M and N exceed the tile size, the runtime needs a nested loop. Should tiled execution support arbitrary nesting, or should this be constrained to single-dimension tiling with multi-dim handled by the compiler?
 
-4. **Stream events / synchronization primitives**: Should FlexStream support inter-stream synchronization (e.g., CUDA-style events) to express dependencies between streams without full synchronization?
+4. **Async iteration overlap**: Currently each tiled iteration within a stream is sequential. Could we use separate streams or double-buffering to overlap iteration N+1's data movement with iteration N's compute?
 
 5. **Remainder handling**: What happens when the tensor dimension is not evenly divisible by the tile size (e.g., tensor is 4000 with tile 1024)? Options: fail, pad, or compile a separate remainder kernel.
 
