@@ -580,7 +580,12 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 else:
                     di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[2]]
             elif len(di_x) == 3 and len(di_y) == 2:
-                di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+                if di_x[:2] == di_y:
+                    di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+                elif di_x[2] == di_y[0]:
+                    di = [di_x[0], di_x[1], di_x[2], di_y[1]]
+                else:
+                    raise Unsupported(f"malformed bmm {di_x} {di_y}")
             elif len(di_x) == 2 and len(di_y) == 2:
                 if di_x == di_y:
                     di = [
