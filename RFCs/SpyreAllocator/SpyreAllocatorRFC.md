@@ -2,6 +2,8 @@
 
 **Authors:**
 * @JRosenkranz
+* @andrea-fasoli
+* @wangchen615
 
 ## **Summary**
 
