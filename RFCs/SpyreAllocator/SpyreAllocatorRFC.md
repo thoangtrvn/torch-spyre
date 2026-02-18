@@ -509,6 +509,31 @@ The SpyreAllocator / FlexAllocator pair should be taught as the "memory layer" o
 
 4. **Coalescing prevents fragmentation**: When blocks are freed, adjacent free blocks are automatically merged. This is the allocator's primary defense against fragmentation and requires no user intervention.
 
+## **Testing**
+
+Testing spans both layers of the allocator architecture:
+
+### FlexAllocator Unit Tests (flex)
+
+FlexAllocator should have a dedicated set of unit tests in flex that exercise the core memory management logic in isolation, without requiring a device or PyTorch. These tests should cover:
+
+- **Block allocation and splitting**: Verify that allocations carve correctly-sized occupied blocks from free blocks, with proper 128-byte alignment and correct remainder splitting.
+- **Deallocation and coalescing**: Verify that freeing a block merges it with adjacent free predecessors and successors, maintaining the invariant that no two adjacent blocks are both free.
+- **Region acquisition and fallback**: Verify the fallback size sequence (`{12GB, 8GB, 4GB}`), `regions_locked` transitions, and `max_regions` enforcement.
+- **Strategy behavior**: Verify that `RegionAcquisitionStrategy` (`LoadBalancingStrategy`, `FillFirstStrategy`) and `BlockAcquisitionStrategy` (`FirstFitStrategy`, `BestFitStrategy`) produce the expected region ordering and block selection for given inputs.
+- **Fragmentation scenarios**: Allocate and free blocks in patterns that produce fragmentation, then verify that coalescing recovers contiguous free space and that subsequent allocations succeed.
+- **Thread safety**: Concurrent allocation and deallocation from multiple threads to verify correctness under contention.
+
+### SpyreAllocator Integration Tests (torch-spyre)
+
+SpyreAllocator should be validated through upstream PyTorch tests that exercise the `at::Allocator` interface end-to-end. These tests run against the full stack (SpyreAllocator + FlexAllocator + device) and verify that tensor allocation, computation, and deallocation work correctly through PyTorch's standard APIs.
+
+Additionally, torch-spyre should include tests that cover edge cases specific to Spyre's allocation model:
+
+- **Allocation edge cases**: Large allocations that span most of a region, many small allocations that stress block management, and allocation patterns that exhaust all regions (`regions_locked` = `true`).
+- **Program loading**: Verify that ExecutionPlan binary loading allocates device memory correctly alongside tensor allocations, and that the segment table is populated from the acquired MemoryRegions.
+- **OOM behavior**: Verify graceful failure when all regions are locked and no region can satisfy a request.
+
 ## **Unresolved questions**
 
 1. **Region release policy**: Should the allocator ever return regions to the `DeviceMemoryAllocator`? Currently regions are held for the allocator's lifetime. If the workload's memory footprint shrinks significantly, those regions represent wasted device memory. A release policy could reclaim underused regions, but live blocks within a region prevent release without migration.
