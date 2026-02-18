@@ -2,7 +2,7 @@
 
 ## Introduction
 
-The torch-spyre compiler frontend transforms PyTorch operations into a form (SDSC - Spyre Device Specification Code) that the backend compiler can consume and execute on Spyre hardware. This transformation requires careful tracking of multiple representations of tensor dimensions and layouts as data flows from the high-level PyTorch abstraction through the compiler to the physical device execution.
+The torch-spyre compiler frontend transforms PyTorch operations into an intermediate form (SDSC) that the backend compiler can consume and execute on Spyre hardware. This transformation requires careful tracking of multiple representations of tensor dimensions and layouts as data flows from the high-level PyTorch abstraction through the compiler to the physical device execution.
 
 This document describes five fundamental concepts that are central to understanding how torch-spyre represents and transforms tensor operations:
 
