@@ -290,13 +290,17 @@ Block `start` offsets are always 128-byte aligned because:
 
 ### Debugging
 
-When the `TORCH_SPYRE_ALLOC_DEBUG=1` environment variable is set, SpyreAllocator and FlexAllocator emit verbose logging for every allocation and deallocation, including:
+Allocator logging is enabled via PyTorch's `TORCH_LOGS` environment variable using the `spyre_allocator` keyword:
+
+```
+TORCH_LOGS=spyre_allocator
+```
+
+When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every allocation and deallocation, including:
 - Region acquisition (size, fallback level)
 - Block assignment (region id, offset, size)
 - Block freeing and coalescing details
 - Region free space summaries
-
-This can also be enabled alongside `TORCH_SPYRE_DEBUG=1` for broader runtime debug output.
 
 ### Workflows
 
@@ -457,7 +461,7 @@ TBD
 
 1. **Regions are never returned**: Once a region is acquired, it is held for the lifetime of FlexAllocator. If the workload's memory footprint shrinks significantly after a peak, the device memory remains reserved. A region release policy could reclaim underused regions, but this adds complexity around live block migration.
 
-2. **First-fit fragmentation**: First-fit allocation can leave small free fragments scattered across regions. Over time, this may lead to situations where the total free memory is sufficient but no single contiguous block can satisfy a request. More sophisticated strategies (best-fit, buddy system) could reduce fragmentation at the cost of allocation latency or implementation complexity.
+2. **First-fit fragmentation**: First-fit allocation can leave small free fragments scattered across regions. Over time, this may lead to situations where the total free memory is sufficient but no single contiguous block can satisfy a request. Best-fit allocation (already supported via `BestFitStrategy`) reduces this but cannot eliminate it. A compaction / defragmentation mechanism that relocates live blocks could recover contiguous free space — see unresolved question #4.
 
 3. **Fixed fallback sizes**: The `{12GB, 8GB, 4GB}` fallback sequence is hardcoded. Different workloads or hardware configurations may benefit from different region sizes. Making this configurable adds flexibility but requires careful default selection.
 
