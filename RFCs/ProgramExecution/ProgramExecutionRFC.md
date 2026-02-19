@@ -13,7 +13,7 @@ The current connection between torch-spyre and the flex runtime relies on graph 
 
 This RFC replaces that approach with a layered stream architecture:
 
-- **SpyreStream** (torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough layer. It translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, VirtualAddresses) and delegates all execution logic to FlexStream.
+- **SpyreStream** (torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough layer. It translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, AllocationIndices) and delegates all execution logic to FlexStream.
 
 - **FlexStream** (flex) is the core execution engine, modeled after CUDA streams. It accepts Jobs — each containing a JobPlan of ordered steps (HostOperation, DMA, DeviceCompute) — and walks the plan to produce the correct sequence of low-level control blocks forwarded to the Scheduler. FlexStream understands that a single logical job like a matmul may require multiple steps (a host operation to convert tensor virtual address metadata, a DMA of the correction tensor to device, and the device compute launch) and owns this decomposition. FlexStream's `Launch` method automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — reusing compilation artifacts by enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call. All methods are asynchronous — jobs enqueued on a stream return immediately. Within a single stream, jobs execute in FIFO order; across streams, no ordering is guaranteed.
 
@@ -23,35 +23,36 @@ ExecutionPlans remain lightweight containers of Jobs built from compiler output.
 
 As a secondary benefit, FlexStream's `Launch` automatically detects when tensors exceed the compiled tile size and transparently reuses the kernel by enqueuing multiple rounds of low-level steps with updated offsets — no recompilation or separate API call required.
 
-The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated memory regions with block-level offsets rather than independently allocated, and the execution pipeline accounts for this addressing model natively.
+The introduction of the SpyreAllocator's VF mode also shapes this design: tensors are now carved from pre-allocated memory regions with block-level offsets rather than independently allocated. torch-spyre receives only opaque `AllocationIndex` handles from FlexAllocator; the execution pipeline resolves these to `VirtualAddress` values internally within flex.
 
 ## **Proposed Implementation**
 
 ### Core Components
 
+#### AllocationIndex
+
+An opaque integer handle returned by `FlexAllocator.allocate()` to identify an allocation. This is the only allocator type that crosses the flex → torch-spyre boundary — torch-spyre stores it in the `at::DataPtr` and passes it back to flex for deallocation and execution. torch-spyre never inspects or interprets its value. FlexStream resolves `AllocationIndex` values to `VirtualAddress` values internally.
+
 #### VirtualAddress
 
-A reference to a location in device memory, produced by SpyreAllocator. A VirtualAddress identifies only a location — size is stored separately alongside it.
+A flex-internal reference to a location in device memory. VirtualAddress is used within flex by FlexStream, the Scheduler, and the ControlBlock segment table — it never crosses the flex → torch-spyre boundary. A VirtualAddress identifies only a location — size is stored separately alongside it.
 
 Properties:
 
 | Property | Description |
 |----------|-------------|
 | `region_id` | Identifies the memory region. In VF mode, this is an index into a firmware lookup table that maps to the physical address of the region. In PF mode, this is the physical address of the region itself. |
-| `offset` | Byte offset of the allocation within the region. |
+| `offset` | Byte offset of the allocation within the region. Always 128-byte aligned. |
 
-The same structure is used in both PF and VF modes — only the interpretation of `region_id` differs. All downstream components (SpyreTensor, Job, FlexStream) work uniformly with VirtualAddress regardless of mode.
+The same structure is used in both PF and VF modes — only the interpretation of `region_id` differs. All flex-internal components (FlexStream, Scheduler) work uniformly with VirtualAddress regardless of mode.
 
-#### SpyreAllocator
+#### SpyreAllocator / FlexAllocator
 
-Manages device memory and produces `VirtualAddress` values in one of two modes:
+Manages device memory in two layers: `SpyreAllocator` (torch-spyre) is a thin wrapper implementing PyTorch's `at::Allocator` interface; `FlexAllocator` (flex) is the core memory manager. FlexAllocator manages a pool of up to 8 memory regions in both PF and VF modes, carving individual allocations from them as 128-byte-aligned blocks.
 
-- **PF Mode**: Manages a pool of up to 8 memory regions. Returns a `VirtualAddress` where `region_id` is the physical address of the region itself.
-- **VF Mode**: Manages a pool of up to 8 memory regions. Returns a `VirtualAddress` where `region_id` is an index into a firmware lookup table that maps to the physical address of the region.
+`FlexAllocator.allocate()` returns an opaque `AllocationIndex` to torch-spyre. Internally, FlexAllocator maintains the mapping from each `AllocationIndex` to its `VirtualAddress` (`region_id` + `offset`). `FlexAllocator.resolve()` returns the `VirtualAddress` for a given `AllocationIndex` — used by FlexStream when assembling correction buffers, computing tiled offsets, or dispatching to hardware.
 
-In both modes, individual allocations carve blocks from these regions with 128-byte alignment, and the `offset` field of the returned VirtualAddress is the byte offset of the block within the region.
-
-See the SpyreAllocator RFC (TBD) for full details on allocation strategies, memory region management, and memory lifecycle.
+See the SpyreAllocator RFC for full details on allocation strategies, memory region management, and memory lifecycle.
 
 #### SpyreTensor
 
@@ -60,7 +61,7 @@ A tensor residing on-device. Carries metadata required for execution:
 - **shape**: Logical dimensions (e.g., `[4096, 1024]`)
 - **stride**: Memory stride per dimension (bytes between consecutive elements along each axis)
 - **data_type**: Element type (e.g., float32, uint32)
-- **virtual_address**: A `VirtualAddress` referencing the tensor's location on device (from SpyreAllocator)
+- **allocation_index**: An `AllocationIndex` identifying the tensor's allocation on device (from FlexAllocator)
 - **size_bytes**: Total byte size of the tensor data
 - **layout**: A `SpyreTensorLayout` describing the tensor's tiled layout on device — includes `device_size` (tiled dimensions on device), `device_dtype` (on-device data type), and `dim_map` (mapping between logical shape and device dimensions)
 
@@ -72,8 +73,8 @@ Properties:
 
 | Property | Description |
 |----------|-------------|
-| `binary_path` | Path to the compiled binary produced by the backend compiler (deeptools). This single binary may internally contain both a program correction program and the compute program. Loaded to device during ExecutionPlan loading, at which point `virtual_address` is set. |
-| `virtual_address` | `VirtualAddress` referencing the binary's location on device (set during ExecutionPlan loading) |
+| `binary_path` | Path to the compiled binary produced by the backend compiler (deeptools). This single binary may internally contain both a program correction program and the compute program. Loaded to device during ExecutionPlan loading, at which point `allocation_index` is set. |
+| `allocation_index` | `AllocationIndex` identifying the binary's allocation on device (set during ExecutionPlan loading). FlexStream resolves this to a `VirtualAddress` internally when constructing ControlBlocks. |
 | `program_correction_metadata` | Metadata used alongside the HostOperation step to produce the correction tensor (e.g., the vdci.json equivalent). May be empty if the kernel has no symbolic inputs. |
 | `job_plan` | A `JobPlan` — the ordered sequence of steps to execute this job |
 
@@ -95,15 +96,15 @@ Steps:
 | Step | Properties | Description |
 |------|------------|-------------|
 | `HostOperation` | `function` | A host-side computation that runs on the CPU. Used for conversion of tensor virtual address metadata — a function that takes resolved symbol values (tensor virtual addresses, shape values) and the Job's `program_correction_metadata`, and produces a correction tensor to be DMA'd to device. |
-| `DMA` | `host_address`, `virtual_address`, `size`, `direction` | Data transfer between host and device. `direction` is either `ToDevice` or `FromDevice`. Used for copying tensor data, program binaries, or correction tensors to device, and for reading results back. Maps to a DMA control block. `size` is the byte count to transfer. |
-| `DeviceCompute` | `virtual_address`, `expected_input_shapes` | Launch a compute binary on device. The binary — which may internally contain both a program correction program and the actual compute program — is executed as a single compute control block (CB). `virtual_address` references the binary's location on device (set during ExecutionPlan loading). `expected_input_shapes` are the compiled tensor shapes, used by FlexStream to detect tiling requirements. |
+| `DMA` | `host_address`, `allocation_index`, `size`, `direction` | Data transfer between host and device. `direction` is either `ToDevice` or `FromDevice`. Used for copying tensor data, program binaries, or correction tensors to device, and for reading results back. Maps to a DMA control block. `size` is the byte count to transfer. FlexStream resolves `allocation_index` to a `VirtualAddress` when constructing the DMA control block. |
+| `DeviceCompute` | `allocation_index`, `expected_input_shapes` | Launch a compute binary on device. The binary — which may internally contain both a program correction program and the actual compute program — is executed as a single compute control block (CB). `allocation_index` identifies the binary's allocation on device (set during ExecutionPlan loading). FlexStream resolves it to a `VirtualAddress` when constructing the compute control block. `expected_input_shapes` are the compiled tensor shapes, used by FlexStream to detect tiling requirements. |
 
 **Program correction flow**: When a kernel uses symbolic addresses or shapes, the backend compiler produces a unified binary containing both a correction program and the compute program, along with correction metadata. At runtime, the HostOperation step takes the resolved symbol values and the Job's `program_correction_metadata` as input and produces a correction tensor. The DMA step transfers this tensor to a reserved location on device (segment 7, address 0). The DeviceCompute step then launches the unified binary as a single compute CB — internally, the correction program reads the correction tensor to patch the compute program, then the compute program executes. The runtime does not distinguish between the correction program and the compute program; they are opaque within the single CB.
 
 
 #### ExecutionPlan
 
-Produced by the backend compiler (deeptools). An ExecutionPlan starts as compiler output describing the ordered sequence of Jobs required, then becomes the runtime artifact once each Job's binary is loaded to device. Loading an ExecutionPlan means loading each Job's binary via DMA and storing the resulting `virtual_address` on the Job. Each backend compiler input (sdsc) produced by inductor maps to a single Job. A single `torch.compile` call may produce multiple sdscs, which is why an ExecutionPlan contains an ordered list of Jobs. In many cases, however, the ExecutionPlan will contain only a single Job (one SDSC per compile).
+Produced by the backend compiler (deeptools). An ExecutionPlan starts as compiler output describing the ordered sequence of Jobs required, then becomes the runtime artifact once each Job's binary is loaded to device. Loading an ExecutionPlan means loading each Job's binary via DMA and storing the resulting `allocation_index` on the Job. Each backend compiler input (sdsc) produced by inductor maps to a single Job. A single `torch.compile` call may produce multiple sdscs, which is why an ExecutionPlan contains an ordered list of Jobs. In many cases, however, the ExecutionPlan will contain only a single Job (one SDSC per compile).
 
 Constructors:
 
@@ -116,13 +117,13 @@ Properties:
 
 | Property | Description |
 |----------|-------------|
-| `jobs` | Ordered list of Jobs — each Job carries its own virtual addresses after loading |
+| `jobs` | Ordered list of Jobs — each Job carries its own `allocation_index` after loading |
 
 ExecutionPlans do not own execution logic. They are passive data structures whose Jobs each have their binary loaded to device memory (one DMA per Job) and are then submitted through SpyreStream → FlexStream for execution.
 
 #### SpyreStream
 
-A thin wrapper around `FlexStream` that implements the PyTorch Stream interface. SpyreStream is the torch-spyre-facing API — it translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, VirtualAddresses) and delegates all execution logic to the underlying FlexStream.
+A thin wrapper around `FlexStream` that implements the PyTorch Stream interface. SpyreStream is the torch-spyre-facing API — it translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, AllocationIndices) and delegates all execution logic to the underlying FlexStream.
 
 SpyreStream contains no decomposition logic, tiling logic, or understanding of Job internals. It is a passthrough layer whose purpose is to bridge the PyTorch runtime conventions with the flex execution engine.
 
@@ -135,7 +136,7 @@ Methods:
 
 | Method | Description |
 |--------|-------------|
-| `Launch(Job, List<SpyreTensor>, allow_tiled_launch=true)` | Translate SpyreTensors to VirtualAddresses and delegate to `FlexStream.Launch(job, virtual_addresses, allow_tiled_launch)` |
+| `Launch(Job, List<SpyreTensor>, allow_tiled_launch=true)` | Extract AllocationIndices from SpyreTensors and delegate to `FlexStream.Launch(job, allocation_indices, allow_tiled_launch)` |
 | `Synchronize()` | Delegate to `FlexStream.Synchronize()` |
 
 #### FlexStream
@@ -154,12 +155,12 @@ Methods:
 
 | Method | Description |
 |--------|-------------|
-| `Launch(Job, List<virtual_address>, allow_tiled_launch=true)` | Walk the Job's JobPlan, execute HostOperations on the host, and enqueue DMA/DeviceCompute steps as control blocks. If tensor shapes exceed the compiled tile size and `allow_tiled_launch` is true, automatically enqueues multiple tiled iterations. If shapes exceed the tile size and `allow_tiled_launch` is false, raises an exception. |
+| `Launch(Job, List<AllocationIndex>, allow_tiled_launch=true)` | Resolve AllocationIndices to VirtualAddresses via `FlexAllocator.resolve()`, then walk the Job's JobPlan, execute HostOperations on the host, and enqueue DMA/DeviceCompute steps as control blocks. If tensor shapes exceed the compiled tile size and `allow_tiled_launch` is true, automatically enqueues multiple tiled iterations. If shapes exceed the tile size and `allow_tiled_launch` is false, raises an exception. |
 | `Synchronize()` | Block the host until all previously enqueued jobs on this stream have completed |
 
-**Launch(Job, List\<virtual_address\>, allow_tiled_launch=true)**
+**Launch(Job, List\<AllocationIndex\>, allow_tiled_launch=true)**
 
-Takes a Job, the virtual addresses for resident input/output tensors, and an optional `allow_tiled_launch` flag (defaults to true).
+Takes a Job, the AllocationIndices for resident input/output tensors, and an optional `allow_tiled_launch` flag (defaults to true). FlexStream resolves each `AllocationIndex` to a `VirtualAddress` via `FlexAllocator.resolve()` before processing the Job's plan.
 
 FlexStream first compares each tensor's shape against the kernel's expected input shapes (from the DeviceCompute step in the Job's JobPlan). There are three cases:
 
@@ -234,7 +235,7 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 
 ### Front-End Interface
 
-**LaunchKernel(SpyreStream, ExecutionPlan, List\<SpyreTensor\>)** — The entry point in torch-spyre. For each Job in the ExecutionPlan, delegates to `SpyreStream.Launch(job, tensors, allow_tiled_launch)`. The `allow_tiled_launch` value can be controlled by a user environment setting (e.g., `SPYRE_ALLOW_TILED_LAUNCH`), allowing users to disable automatic tiling for debugging or to enforce that tensor shapes exactly match the compiled tile size. SpyreStream translates the SpyreTensors to VirtualAddresses and passes through to `FlexStream.Launch`, which automatically detects whether tensor shapes match the compiled tile size or require tiled execution. Control returns to the host immediately; use `SpyreStream.Synchronize()` to wait for completion.
+**LaunchKernel(SpyreStream, ExecutionPlan, List\<SpyreTensor\>)** — The entry point in torch-spyre. For each Job in the ExecutionPlan, delegates to `SpyreStream.Launch(job, tensors, allow_tiled_launch)`. The `allow_tiled_launch` value can be controlled by a user environment setting (e.g., `SPYRE_ALLOW_TILED_LAUNCH`), allowing users to disable automatic tiling for debugging or to enforce that tensor shapes exactly match the compiled tile size. SpyreStream extracts AllocationIndices from the SpyreTensors and passes through to `FlexStream.Launch`, which resolves them to VirtualAddresses internally and automatically detects whether tensor shapes match the compiled tile size or require tiled execution. Control returns to the host immediately; use `SpyreStream.Synchronize()` to wait for completion.
 
 ### Workflows
 
@@ -243,16 +244,16 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 ```
 ┌─────────────┐     ┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │  CPUTensor   │────▶│ SpyreAllocator  │────▶│   SpyreStream    │────▶│    FlexStream    │
-│  (host)      │     │ allocate block  │     │ (translate data, │     │ Launch(Job       │
-│              │     │ → VirtualAddress│     │  passthrough)    │     │  [DMA ToDevice]) │
+│  (host)      │     │ allocate block  │     │ (extract indices,│     │ Launch(Job       │
+│              │     │ →AllocationIndex│     │  passthrough)    │     │  [DMA ToDevice]) │
 │              │     │                 │     │                  │     │ walk plan→sched  │
 └─────────────┘     └─────────────────┘     └──────────────────┘     └──────────────────┘
 ```
 
 1. User creates a `CPUTensor` and calls `.to(device)`
-2. SpyreAllocator allocates a block, producing a `VirtualAddress` (`region_id` + `offset`; interpretation of `region_id` depends on PF vs VF mode)
-3. A Job is created with a single DMA (ToDevice) step in its JobPlan (host_address, virtual_address, size)
-4. `SpyreStream.Launch(job, tensors)` translates SpyreTensors → VirtualAddresses, then delegates to `FlexStream.Launch(job, virtual_addresses)`
+2. FlexAllocator allocates a block, producing an `AllocationIndex` (opaque handle)
+3. A Job is created with a single DMA (ToDevice) step in its JobPlan (host_address, allocation_index, size)
+4. `SpyreStream.Launch(job, tensors)` extracts AllocationIndices from SpyreTensors, then delegates to `FlexStream.Launch(job, allocation_indices)`. FlexStream resolves each AllocationIndex to a VirtualAddress internally.
 5. FlexStream walks the Job's JobPlan, produces a DMA control block, and forwards it to the Scheduler — returns immediately
 6. Result is a `SpyreTensor` carrying the device address metadata
 7. Host may continue work; data transfer proceeds asynchronously on the stream
@@ -271,10 +272,10 @@ Tensors whose shapes already match the tile (e.g., `B` above) have stride 1 — 
 1. `torch.compile` triggers the inductor frontend, producing sdsc inputs for deeptools
 2. Deeptools (backend compiler) produces an `ExecutionPlan` — an ordered list of Jobs, each containing a `binary_path`, `program_correction_metadata`, and a `JobPlan`
 3. For each Job in the ExecutionPlan:
-   a. SpyreAllocator allocates space for the Job's binary → `virtual_address`
+   a. FlexAllocator allocates space for the Job's binary → `allocation_index`
    b. A loading Job is created with a single DMA (ToDevice) step in its JobPlan
-   c. `SpyreStream.Launch(job, [])` passes through to `FlexStream.Launch(job, [])`, which produces a DMA control block — `virtual_address` is stored on the Job
-4. ExecutionPlan (with all Job virtual addresses populated) is cached for reuse
+   c. `SpyreStream.Launch(job, [])` passes through to `FlexStream.Launch(job, [])`, which resolves the `allocation_index` to a `VirtualAddress` and produces a DMA control block — `allocation_index` is stored on the Job
+4. ExecutionPlan (with all Job allocation indices populated) is cached for reuse
 
 #### Workflow 3: Detailed Execution — LaunchKernel to Hardware
 
@@ -288,13 +289,13 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 │        exec_plan, tensors)      │  │                                                  │
 │         │                       │  │                                                  │
 │         ▼                       │  │                                                  │
-│  SpyreStream.Launch(op, tensors,│  │                                                  │
+│  SpyreStream.Launch(job, tensors│  │                                                  │
 │    allow_tiled_launch)          │  │                                                  │
 │         │                       │  │                                                  │
-│  (translate tensors →           │  │                                                  │
-│   virtual_addresses, delegate)  │  │                                                  │
+│  (extract AllocationIndices,    │  │                                                  │
+│   delegate)                     │  │                                                  │
 │         │                       │  │                                                  │
-│         └───────────────────────┼──┼─▶ FlexStream.Launch(op, vaddrs,                 │
+│         └───────────────────────┼──┼─▶ FlexStream.Launch(job, alloc_indices,          │
 │                                 │  │     allow_tiled_launch)                          │
 │                                 │  │         │                                        │
 └─────────────────────────────────┘  │         │                                        │
@@ -369,9 +370,9 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 **Step-by-step:**
 
 1. `LaunchKernel(spyre_stream, exec_plan, tensors)` is called from torch-spyre
-2. For each Job, delegates to `SpyreStream.Launch(op, tensors, allow_tiled_launch)`
-3. SpyreStream translates SpyreTensors → VirtualAddresses and calls `FlexStream.Launch(op, virtual_addresses, allow_tiled_launch)`
-4. FlexStream compares tensor shapes against the DeviceCompute's expected input shapes:
+2. For each Job, delegates to `SpyreStream.Launch(job, tensors, allow_tiled_launch)`
+3. SpyreStream extracts AllocationIndices from SpyreTensors and calls `FlexStream.Launch(job, allocation_indices, allow_tiled_launch)`
+4. FlexStream resolves AllocationIndices to VirtualAddresses via `FlexAllocator.resolve()`, then compares tensor shapes against the DeviceCompute's expected input shapes:
    - Shapes match exactly → proceeds with single-iteration walk (this workflow)
    - Shapes exceed tile size and `allow_tiled_launch` is true → tiled iterations (see Workflow 4)
    - Shapes exceed tile size and `allow_tiled_launch` is false → raises exception
@@ -391,12 +392,12 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 │  LaunchKernel(spyre_stream,      │  │                                              │
 │    exec_plan, tensors)           │  │                                              │
 │         │                        │  │                                              │
-│  SpyreStream.Launch(op, tensors, │  │                                              │
+│  SpyreStream.Launch(job, tensors,│  │                                              │
 │    allow_tiled_launch=true)      │  │                                              │
 │         │                        │  │                                              │
-│  (translate tensors → vaddrs)    │  │                                              │
+│  (extract AllocationIndices)     │  │                                              │
 │         │                        │  │                                              │
-│         └────────────────────────┼──┼─▶ FlexStream.Launch(op, vaddrs,             │
+│         └────────────────────────┼──┼─▶ FlexStream.Launch(job, alloc_indices,      │
 │                                  │  │     allow_tiled_launch=true)                 │
 │                                  │  │         │                                    │
 └──────────────────────────────────┘  │  Detects shapes exceed tile size             │
@@ -426,8 +427,8 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 ```
 
 1. `LaunchKernel(spyre_stream, exec_plan, tensors)` is called from torch-spyre
-2. For each Job, delegates to `SpyreStream.Launch(op, tensors, allow_tiled_launch=true)`
-3. SpyreStream translates SpyreTensors → VirtualAddresses and calls `FlexStream.Launch(op, virtual_addresses, allow_tiled_launch=true)`
+2. For each Job, delegates to `SpyreStream.Launch(job, tensors, allow_tiled_launch=true)`
+3. SpyreStream extracts AllocationIndices from SpyreTensors and calls `FlexStream.Launch(job, allocation_indices, allow_tiled_launch=true)`
 4. FlexStream compares tensor shapes against the DeviceCompute's expected input shapes — detects shapes exceed tile size
 5. `allow_tiled_launch` is true → FlexStream proceeds with tiled execution
 6. FlexStream infers tiling dimension and `num_iterations = 4096 / 1024 = 4`
@@ -506,7 +507,7 @@ The following table maps CUDA stream capabilities to their FlexStream equivalent
 | Capability | CUDA Stream | FlexStream |
 |------------|-------------|------------|
 | Copy | `cudaMemcpyAsync(dst, src, size, kind, stream)` — standalone primitive call | Data transfers are expressed as DMA steps within a Job's JobPlan; FlexStream maps them to DMA control blocks internally |
-| Launch | `kernel<<<grid, block, sharedMem, stream>>>()` — takes grid/block dims, function pointer, args | `Launch(Job, virtual_addresses, allow_tiled_launch=true)` — accepts a compound Job and decomposes it into the correct sequence of low-level steps (no grid/block dims since Spyre is not SIMT). Automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently when `allow_tiled_launch` is true. |
+| Launch | `kernel<<<grid, block, sharedMem, stream>>>()` — takes grid/block dims, function pointer, args | `Launch(Job, allocation_indices, allow_tiled_launch=true)` — accepts a compound Job and decomposes it into the correct sequence of low-level steps (no grid/block dims since Spyre is not SIMT). Automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently when `allow_tiled_launch` is true. |
 | Tiled launch | User changes grid dims to cover larger tensors | Handled automatically by `Launch` — no separate API. FlexStream iterates over tiles, enqueuing multiple decompositions with updated offsets. |
 | Synchronize | `cudaStreamSynchronize(stream)` | `Synchronize()` — identical semantics |
 | Events | `cudaEventRecord` / `cudaStreamWaitEvent` for inter-stream dependencies | Not present (see unresolved question #1) |
@@ -527,7 +528,7 @@ In CUDA, a kernel launch is self-contained — the user or library (cuBLAS, cuDN
 
 FlexStream owns this decomposition as a first-class part of the runtime. The closest CUDA analogs are vendor libraries like cuBLAS and cuDNN, which internally issue multi-step sequences on a user-provided stream — but those are external libraries, not a core stream layer. In the Spyre stack, compound decomposition is built into FlexStream because every Spyre compute requires it, not just optimized library calls.
 
-SpyreStream, by contrast, is a thin PyTorch Stream wrapper with no CUDA analog needed — it simply bridges PyTorch runtime conventions (torch tensors, device metadata) with FlexStream's types (Jobs, VirtualAddresses).
+SpyreStream, by contrast, is a thin PyTorch Stream wrapper with no CUDA analog needed — it simply bridges PyTorch runtime conventions (torch tensors, device metadata) with FlexStream's types (Jobs, AllocationIndices).
 
 FlexStream's automatic tiling within `Launch` also has no CUDA equivalent. CUDA kernels accept arbitrary dimensions as launch parameters (`<<<grid, block>>>`), so the user simply changes grid dims to cover larger tensors. Spyre kernels are compiled for fixed tile shapes, so FlexStream's `Launch` must detect this and iterate over tiles, enqueuing multiple rounds of low-level steps with updated tensor offsets — all transparently within the same `Launch` call.
 
@@ -545,7 +546,7 @@ TBD
 
 4. **Async iteration overlap**: Currently each tiled iteration within a stream is sequential. Could we use separate streams or double-buffering to overlap iteration N+1's data movement with iteration N's compute?
 
-5. **Program correction across PF/VF modes**: The HostOperation (conversion of tensor virtual address metadata) takes VirtualAddresses as input. Since VirtualAddress is a single type (`region_id` + `offset`) in both modes, the HostOperation can process them uniformly — but the correction program on device may still need to interpret `region_id` differently (firmware lookup index vs. physical address). How should this mode distinction be communicated to the correction program?
+5. **Program correction across PF/VF modes**: The HostOperation (conversion of tensor virtual address metadata) takes VirtualAddresses as input — these are resolved from the tensor AllocationIndices by FlexStream calling `FlexAllocator.resolve()`. Since VirtualAddress is a single type (`region_id` + `offset`) in both modes, the HostOperation can process them uniformly — but the correction program on device may still need to interpret `region_id` differently (firmware lookup index vs. physical address). How should this mode distinction be communicated to the correction program?
 
 6. **Non-blocking completion query**: Should FlexStream support a `Query()` method (analogous to `cudaStreamQuery()`) that returns whether all enqueued jobs have completed without blocking? This would allow polling-based patterns and avoid unnecessary synchronization.
 
