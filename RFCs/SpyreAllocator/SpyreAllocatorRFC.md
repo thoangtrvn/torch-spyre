@@ -259,7 +259,9 @@ When a block is freed (via the `at::DataPtr` custom deleter):
 
 4. **Coalesce with successor**: Check the block immediately after. If free, merge similarly.
 
-5. **Update bookkeeping**: Update `free_size`, `free_sizes`, remove entries from `ctx_to_block` and `block_to_region`, delete the `SharedOwnerCtx`.
+5. **Coalesce with both**: If both the predecessor and successor are free, all three blocks — predecessor, the freed block, and successor — are merged into a single free block spanning the combined range. The three originals are removed and replaced with one merged block.
+
+6. **Update bookkeeping**: Update `free_size`, `free_sizes`, remove entries from `ctx_to_block` and `block_to_region`, delete the `SharedOwnerCtx`.
 
 This ensures the invariant that no two adjacent free blocks exist — free space is always maximally coalesced.
 
@@ -453,13 +455,11 @@ TBD
 
 ## **Drawbacks**
 
-1. **Single mutex bottleneck**: The coarse-grained `allocator_mutex` serializes all allocation and deallocation operations. Under high concurrency (many tensors being created/destroyed simultaneously), this could become a bottleneck. A per-region lock would reduce contention but adds complexity.
+1. **Regions are never returned**: Once a region is acquired, it is held for the lifetime of FlexAllocator. If the workload's memory footprint shrinks significantly after a peak, the device memory remains reserved. A region release policy could reclaim underused regions, but this adds complexity around live block migration.
 
-2. **Regions are never returned**: Once a region is acquired, it is held for the lifetime of FlexAllocator. If the workload's memory footprint shrinks significantly after a peak, the device memory remains reserved. A region release policy could reclaim underused regions, but this adds complexity around live block migration.
+2. **First-fit fragmentation**: First-fit allocation can leave small free fragments scattered across regions. Over time, this may lead to situations where the total free memory is sufficient but no single contiguous block can satisfy a request. More sophisticated strategies (best-fit, buddy system) could reduce fragmentation at the cost of allocation latency or implementation complexity.
 
-3. **First-fit fragmentation**: First-fit allocation can leave small free fragments scattered across regions. Over time, this may lead to situations where the total free memory is sufficient but no single contiguous block can satisfy a request. More sophisticated strategies (best-fit, buddy system) could reduce fragmentation at the cost of allocation latency or implementation complexity.
-
-4. **Fixed fallback sizes**: The `{12GB, 8GB, 4GB}` fallback sequence is hardcoded. Different workloads or hardware configurations may benefit from different region sizes. Making this configurable adds flexibility but requires careful default selection.
+3. **Fixed fallback sizes**: The `{12GB, 8GB, 4GB}` fallback sequence is hardcoded. Different workloads or hardware configurations may benefit from different region sizes. Making this configurable adds flexibility but requires careful default selection.
 
 ## **Alternatives**
 
@@ -540,23 +540,21 @@ Additionally, torch-spyre should include tests that cover edge cases specific to
 
 1. **Region release policy**: Should FlexAllocator ever return regions to the `DeviceMemoryAllocator`? Currently regions are held for FlexAllocator's lifetime. If the workload's memory footprint shrinks significantly, those regions represent wasted device memory. A release policy could reclaim underused regions, but live blocks within a region prevent release without migration.
 
-2. **Per-region locking**: The current single-mutex design serializes all operations. Would per-region locks (with a global lock only for region acquisition) meaningfully reduce contention? This depends on allocation/deallocation frequency and concurrency patterns.
+2. **Fallback size tuning**: The `{12GB, 8GB, 4GB}` fallback sequence and `MAX_REGIONS = 8` are initial values. How should these be tuned for different hardware configurations and workload profiles?
 
-3. **Fallback size tuning**: The `{12GB, 8GB, 4GB}` fallback sequence and `MAX_REGIONS = 8` are initial values. How should these be tuned for different hardware configurations and workload profiles?
+3. **Memory pressure callbacks**: Should SpyreAllocator support registering callbacks that fire when device memory is under pressure (e.g., when all regions are locked and fragmentation is high)? This could enable higher-level components to evict cached data or trigger garbage collection.
 
-4. **Memory pressure callbacks**: Should SpyreAllocator support registering callbacks that fire when device memory is under pressure (e.g., when all regions are locked and fragmentation is high)? This could enable higher-level components to evict cached data or trigger garbage collection.
+4. **Compaction / defragmentation**: Should FlexAllocator support a `compact()` operation that relocates live blocks to eliminate fragmentation? This would require cooperation with all components holding `VirtualAddress` references to the moved blocks.
 
-5. **Compaction / defragmentation**: Should FlexAllocator support a `compact()` operation that relocates live blocks to eliminate fragmentation? This would require cooperation with all components holding `VirtualAddress` references to the moved blocks.
+5. **Multi-device allocation**: The current design assumes a single device. How should SpyreAllocator extend to multi-device scenarios? Should there be one allocator per device, or a single allocator managing multiple devices?
 
-6. **Multi-device allocation**: The current design assumes a single device. How should SpyreAllocator extend to multi-device scenarios? Should there be one allocator per device, or a single allocator managing multiple devices?
+6. **Interaction with ExecutionPlan binary loading**: When ExecutionPlan binaries are loaded to device, they consume FlexAllocator blocks. Should these allocations be treated differently from tensor allocations (e.g., pinned to prevent eviction, allocated in a separate pool)?
 
-7. **Interaction with ExecutionPlan binary loading**: When ExecutionPlan binaries are loaded to device, they consume FlexAllocator blocks. Should these allocations be treated differently from tensor allocations (e.g., pinned to prevent eviction, allocated in a separate pool)?
+7. **Eliminating try-catch for allocation attempts**: The current implementation uses try-catch around `DeviceMemoryAllocator` calls to handle allocation failures during region acquisition. Should this be replaced with a non-throwing API (e.g., `tryAllocate` returning `std::optional`)?
 
-8. **Eliminating try-catch for allocation attempts**: The current implementation uses try-catch around `DeviceMemoryAllocator` calls to handle allocation failures during region acquisition. Should this be replaced with a non-throwing API (e.g., `tryAllocate` returning `std::optional`)?
+8. **`VirtualAddress.region_id` as `DeviceMemoryAllocationPtr`**: `DeviceMemoryAllocationPtr` already encapsulates the PF/VF distinction — it carries either the VF firmware table index or the PF physical address. Should `region_id` be a `DeviceMemoryAllocationPtr` rather than a derived integer? This would eliminate the separate extraction step and remove the need for `data` as a separate field on `MemoryRegion` (since the handle would be embedded in every `VirtualAddress`). The tradeoff is that `VirtualAddress` becomes a shared-ownership type rather than a lightweight value type — every live `VirtualAddress` would keep the entire region's device allocation alive via refcount, which could complicate future region release policies.
 
-9. **`VirtualAddress.region_id` as `DeviceMemoryAllocationPtr`**: `DeviceMemoryAllocationPtr` already encapsulates the PF/VF distinction — it carries either the VF firmware table index or the PF physical address. Should `region_id` be a `DeviceMemoryAllocationPtr` rather than a derived integer? This would eliminate the separate extraction step and remove the need for `data` as a separate field on `MemoryRegion` (since the handle would be embedded in every `VirtualAddress`). The tradeoff is that `VirtualAddress` becomes a shared-ownership type rather than a lightweight value type — every live `VirtualAddress` would keep the entire region's device allocation alive via refcount, which could complicate future region release policies.
-
-10. **Pre-allocated fixed region pool**: Should FlexAllocator support allocating all regions up front at startup rather than on demand? This would eliminate allocation-time region acquisition latency and simplify the state machine (no `regions_locked` transition), but wastes device memory if the workload doesn't need all regions. The optimal number and size of regions depends on the workload, which isn't known at startup.
+9. **Pre-allocated fixed region pool**: Should FlexAllocator support allocating all regions up front at startup rather than on demand? This would eliminate allocation-time region acquisition latency and simplify the state machine (no `regions_locked` transition), but wastes device memory if the workload doesn't need all regions. The optimal number and size of regions depends on the workload, which isn't known at startup.
 
 ## Resolution
 
