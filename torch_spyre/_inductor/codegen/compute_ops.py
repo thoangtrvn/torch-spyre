@@ -121,25 +121,29 @@ class DimInfos:
     # with the order of a subset of the indices adjusted to match
     # the tile layout of the tensor on the device.  This
     # function computes that reordering
-    def get_tensor_op_index_order(self, tensor):
+    def get_tensor_op_index_order(self, tensor, op):
         dim_indices = self.dim_indices  # op dimension order
 
-        # FIXME: Need to do this properly
-        # dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
-        # missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        # if len(missing_dims) > 0 and len(dim_indices) >= 3 and tensor["scale"][0] == -1:
-        #     if missing_dims[0] == 0:
-        #         # Add missing dimensions to end of device dimension order
-        #         # Compute the number of leading missing dims (-1)
-        #         tensor_dim_indices = dev_dim_order + list(
-        #             set(dim_indices) - set(dev_dim_order)
-        #         )
-        #     else:  # keepdim=0 case
-        #         tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
-        # else:
-        #     # Indices and order unchanged
-
-        tensor_dim_indices = dim_indices
+        dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
+        missing_dims = list(set(dim_indices) - set(dev_dim_order))
+        # HACK: avoid special case handling for batchmatmul
+        if (
+            len(missing_dims) > 0
+            and len(dim_indices) >= 3
+            and tensor["scale"][0] == -1
+            and op != "batchmatmul"
+        ):
+            if missing_dims[0] == 0:
+                # Add missing dimensions to end of device dimension order
+                # Compute the number of leading missing dims (-1)
+                tensor_dim_indices = dev_dim_order + list(
+                    set(dim_indices) - set(dev_dim_order)
+                )
+            else:  # keepdim=0 case
+                tensor_dim_indices = [idx + 1 for idx in dev_dim_order] + [0]
+        else:
+            # Indices and order unchanged
+            tensor_dim_indices = dim_indices
         return tensor_dim_indices
 
     def get_labels_host_order(self):
@@ -164,7 +168,7 @@ class DimInfos:
     def get_tensor_op_infos(self, tensor, op):
         result = self.make_dim_infos(
             additional_rows={"scale": get_scales_sdsc_format(tensor, op)},
-            index_order=self.get_tensor_op_index_order(tensor),
+            index_order=self.get_tensor_op_index_order(tensor, op),
         )
         return result
 
