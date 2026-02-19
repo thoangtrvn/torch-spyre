@@ -7,7 +7,7 @@
 
 ## **Summary**
 
-This RFC introduces the Spyre memory allocation architecture, composed of two layers: `SpyreAllocator` (in torch-spyre) and `FlexAllocator` (in flex). `SpyreAllocator` is a thin wrapper that implements PyTorch's `at::Allocator` interface and delegates all memory management to `FlexAllocator`. `FlexAllocator` is the core memory manager — it manages a pool of dynamically-acquired memory regions on device and carves individual allocations from them as contiguous, 128-byte-aligned blocks. It returns a `VirtualAddress` (`region_id` + `offset`) for every allocation, providing a uniform addressing model that the rest of the stack — SpyreTensor, Operation, FlexStream — consumes without needing to know whether the system is running in PF or VF mode.
+This RFC introduces the Spyre memory allocation architecture, composed of two layers: `SpyreAllocator` (in torch-spyre) and `FlexAllocator` (in flex). `SpyreAllocator` is a thin wrapper that implements PyTorch's `at::Allocator` interface and delegates all memory management to `FlexAllocator`. `FlexAllocator` is the core memory manager — it manages a pool of dynamically-acquired memory regions on device and carves individual allocations from them as contiguous, 128-byte-aligned blocks. It returns an opaque `AllocationIndex` for every allocation, which torch-spyre stores in the `at::DataPtr` and passes back to flex for deallocation and execution. Internally, FlexAllocator maintains a `VirtualAddress` (`region_id` + `offset`) for each allocation — this is the device-side addressing type used within flex by FlexStream and the Scheduler, but it never crosses the flex → torch-spyre boundary.
 
 FlexAllocator operates in two modes, selected by the `FLEX_DEVICE` environment variable. Both modes use the same allocation logic — dynamically acquiring memory regions and carving individual allocations from them as blocks, returning a `VirtualAddress` (`region_id` + `offset`). The only difference between modes is the interpretation of `region_id`:
 
@@ -26,17 +26,25 @@ This constraint motivates SpyreAllocator's core design:
 
 1. **Sub-allocation within regions**: Rather than one device region per tensor, SpyreAllocator acquires a small number of large regions (bounded by the hardware handle limit) and sub-allocates blocks within them. Each block is an offset within a region, not a separate device handle. This allows hundreds or thousands of live tensors while consuming only a handful of firmware table entries.
 
-2. **Uniform addressing via VirtualAddress**: The `VirtualAddress` type (`region_id` + `offset`) provides a single addressing abstraction that works in both modes (see Summary for `region_id` interpretation). All downstream components — SpyreTensor, Operation, FlexStream — consume VirtualAddress identically, with no mode-aware branching.
+2. **Uniform addressing via VirtualAddress**: The `VirtualAddress` type (`region_id` + `offset`) provides a single addressing abstraction that works in both modes (see Summary for `region_id` interpretation). All flex-internal components — FlexStream, Scheduler — consume VirtualAddress identically, with no mode-aware branching.
 
-3. **Encapsulated memory management**: The region pool, block allocation, coalescing, and thread safety are all encapsulated within `FlexAllocator` in flex. torch-spyre only ever receives a `VirtualAddress` from `FlexAllocator`, which it stores as part of the `at::DataPtr`. torch-spyre never interacts with regions, blocks, `DeviceMemoryAllocationPtr`, or raw byte offsets. This decouples torch-spyre from flex's internal memory representation and isolates future allocator changes (new search strategies, compaction, memory pressure callbacks) from the rest of the stack.
+3. **Encapsulated memory management**: The region pool, block allocation, coalescing, and thread safety are all encapsulated within `FlexAllocator` in flex. torch-spyre only ever receives an opaque `AllocationIndex` from `FlexAllocator`, which it stores as part of the `at::DataPtr`. torch-spyre never interacts with regions, blocks, `VirtualAddress`, `DeviceMemoryAllocationPtr`, or raw byte offsets. This decouples torch-spyre from flex's internal memory representation and isolates future allocator changes (new search strategies, compaction, memory pressure callbacks) from the rest of the stack.
 
 ## **Proposed Implementation**
 
 ### Core Components
 
+#### AllocationIndex
+
+An opaque integer handle returned by `FlexAllocator.allocate()` to identify an allocation. This is the only type that crosses the flex → torch-spyre boundary — torch-spyre stores it in `SharedOwnerCtx` and passes it back to flex for deallocation and execution. torch-spyre never inspects or interprets its value.
+
+FlexAllocator maintains an internal mapping from `AllocationIndex` to the allocation's `VirtualAddress` and `MemoryBlock`. FlexStream resolves `AllocationIndex` values to `VirtualAddress` values internally when assembling correction buffers, computing tiled offsets, or dispatching to hardware.
+
+**Relationship to `at::DataPtr`**: `SpyreAllocator.allocate()` delegates to `FlexAllocator.allocate()`, which returns an `AllocationIndex`. SpyreAllocator wraps this in an `at::DataPtr` with a `SharedOwnerCtx` as its opaque context. The `AllocationIndex` is stored directly — it is all torch-spyre needs to later free the allocation or pass it to FlexStream for execution.
+
 #### VirtualAddress
 
-A reference to a location in device memory, produced by FlexAllocator. A VirtualAddress identifies only a location — size is stored separately alongside it.
+A flex-internal reference to a location in device memory. VirtualAddress is used within flex by FlexStream, the Scheduler, and the ControlBlock segment table — it never crosses the flex → torch-spyre boundary. A VirtualAddress identifies only a location — size is stored separately alongside it.
 
 Properties:
 
@@ -44,8 +52,6 @@ Properties:
 |----------|-------------|
 | `region_id` | Identifies the memory region. In VF mode, this is an index into a firmware lookup table that maps to the physical address of the region. In PF mode, this is the physical address of the region itself. |
 | `offset` | Byte offset of the allocation within the region. Always 128-byte aligned. |
-
-**Relationship to `at::DataPtr`**: `SpyreAllocator.allocate()` delegates to `FlexAllocator.allocate()`, which returns a `VirtualAddress`. SpyreAllocator wraps this in an `at::DataPtr` with a `SharedOwnerCtx` as its opaque context. The `VirtualAddress` is stored directly — `region_id` identifies the region and `offset` is the block's byte position within it.
 
 #### MemoryBlock
 
@@ -85,7 +91,7 @@ Properties:
 | `total_size` | Total byte size of this region. |
 | `free_size` | Sum of all free block sizes in this region. Updated on every allocation and deallocation. Used for load-balancing region selection. |
 | `blocks` | `std::set<MemoryBlock>` — ordered set of all blocks (free and occupied) in this region, sorted by `start` offset. |
-| `ctx_to_block` | `std::unordered_map<SharedOwnerCtx*, MemoryBlock*>` — maps each active allocation's context to its occupied block, enabling O(1) lookup during deallocation. |
+| `index_to_block` | `std::unordered_map<AllocationIndex, MemoryBlock*>` — maps each active allocation's index to its occupied block, enabling O(1) lookup during deallocation. |
 | `free_sizes` | `std::multiset<size_t>` — multiset of free block sizes. Enables O(log R) lookup to determine whether a region can satisfy a request of a given size without scanning all blocks (where R = number of free ranges in the region). |
 
 **Relationship to the ControlBlock segment table:** When a ControlBlock is constructed to dispatch compute to the device, it contains a segment table whose entries map to the `region_id` of each MemoryRegion. The segment table is static — it is populated once from the set of acquired MemoryRegions and does not change across dispatches. The device firmware uses the segment table to resolve `region_id` values in `VirtualAddress` operands to physical memory locations during execution.
@@ -106,7 +112,7 @@ Properties:
 
 | Property | Description |
 |----------|-------------|
-| `owner` | `VirtualAddress` — the allocation's location on device, as returned by `FlexAllocator.allocate()`. Contains the `region_id` and `offset` needed to identify and later free this block. |
+| `owner` | `AllocationIndex` — the opaque handle returned by `FlexAllocator.allocate()`. Used to identify this allocation when deallocating or passing to FlexStream for execution. |
 | `device_id` | Identifies which Spyre device this allocation belongs to. |
 
 When PyTorch drops the last reference to a tensor, the `at::DataPtr`'s custom deleter is invoked, which receives the `SharedOwnerCtx` and calls back into SpyreAllocator to free the corresponding block via `FlexAllocator.deallocate(owner)`.
@@ -119,7 +125,7 @@ Methods:
 
 | Method | Description |
 |--------|-------------|
-| `allocate(size_t nbytes) -> at::DataPtr` | Implements `at::Allocator::allocate`. Delegates to `FlexAllocator.allocate(nbytes)`, which returns a `VirtualAddress`. Wraps the result in an `at::DataPtr` with a `SharedOwnerCtx` and custom deleter. |
+| `allocate(size_t nbytes) -> at::DataPtr` | Implements `at::Allocator::allocate`. Delegates to `FlexAllocator.allocate(nbytes)`, which returns an `AllocationIndex`. Wraps the result in an `at::DataPtr` with a `SharedOwnerCtx` and custom deleter. |
 | `static instance() -> SpyreAllocator&` | Returns the singleton allocator. |
 | `static ReportAndDelete(void* ctx)` | Custom deleter for `at::DataPtr`. Delegates to `FlexAllocator.deallocate()` to free the corresponding block, then deletes the `SharedOwnerCtx`. |
 
@@ -191,7 +197,8 @@ State:
 | Field | Type | Description |
 |-------|------|-------------|
 | `regions` | `std::vector<MemoryRegion>` | Dynamic list of acquired regions. |
-| `block_to_region` | `std::unordered_map<SharedOwnerCtx*, MemoryRegion*>` | Maps each active allocation to its containing region for O(1) deallocation lookup. |
+| `index_to_allocation` | `std::unordered_map<AllocationIndex, {VirtualAddress, MemoryRegion*, MemoryBlock*}>` | Maps each active `AllocationIndex` to its `VirtualAddress`, containing `MemoryRegion`, and `MemoryBlock`. Enables O(1) lookup for deallocation and VirtualAddress resolution. |
+| `next_index` | `AllocationIndex` | Monotonically increasing counter used to generate unique `AllocationIndex` values. |
 | `regions_locked` | `bool` | When `true`, no new regions will be acquired — all allocations must be satisfied from existing regions. Transitions to `true` when `MAX_REGIONS` is reached or when all fallback sizes fail. |
 | `fallback_sizes` | `std::vector<size_t>` | Ordered list of region sizes to attempt: `{12GB, 8GB, 4GB}`. |
 | `max_regions` | `size_t` | Maximum number of regions (default: 8). |
@@ -203,10 +210,11 @@ Methods:
 
 | Method | Description |
 |--------|-------------|
-| `allocate(size_t nbytes) -> VirtualAddress` | Main entry point. Acquires the mutex, aligns `nbytes` to 128 bytes, finds or creates a suitable block, and returns a `VirtualAddress` identifying the allocation's location on device. |
-| `deallocate(VirtualAddress)` | Frees the block corresponding to the given `VirtualAddress`. Coalesces with adjacent free blocks (predecessor and successor by offset). Updates `free_size`, `free_sizes`, and removes mappings. |
+| `allocate(size_t nbytes) -> AllocationIndex` | Main entry point. Acquires the mutex, aligns `nbytes` to 128 bytes, finds or creates a suitable block, assigns a unique `AllocationIndex`, registers it in `index_to_allocation`, and returns the index. |
+| `deallocate(AllocationIndex)` | Frees the block corresponding to the given `AllocationIndex`. Looks up the allocation via `index_to_allocation`, coalesces with adjacent free blocks (predecessor and successor by offset), updates `free_size`, `free_sizes`, and removes the mapping. |
+| `resolve(AllocationIndex) -> VirtualAddress` | Returns the `VirtualAddress` for the given `AllocationIndex`. Used internally by FlexStream to resolve allocation handles to device addresses for correction, tiling, and dispatch. |
 | `allocateNewRegion(DeviceMemoryAllocatorPtr) -> bool` | Attempts to acquire a new region from the device, trying each size in `fallback_sizes` in order. Returns `true` on success. On failure (all sizes exhausted or `max_regions` reached), sets `regions_locked = true`. |
-| `findFreeBlock(size_t nbytes, DeviceMemoryAllocatorPtr) -> AllocationInfo` | Locates a suitable free block. Uses `region_acquisition_strategy.selectRegions(regions, nbytes)` to produce an ordered list of candidate regions, then tries each by calling `allocateInRegion()`. If no existing region can satisfy the request and `regions_locked` is `false`, attempts `allocateNewRegion()`. |
+| `findFreeBlock(size_t nbytes, DeviceMemoryAllocatorPtr) -> {MemoryRegion*, MemoryBlock*}` | Locates a suitable free block. Uses `region_acquisition_strategy.selectRegions(regions, nbytes)` to produce an ordered list of candidate regions, then tries each by calling `allocateInRegion()`. If no existing region can satisfy the request and `regions_locked` is `false`, attempts `allocateNewRegion()`. |
 | `allocateInRegion(MemoryRegion*, size_t nbytes) -> MemoryBlock*` | Selects a free block within the given region using the `block_acquisition_strategy`, then marks it as occupied. If the selected block is larger than needed, splits it into an occupied block of size `nbytes` and a free remainder block. Returns `nullptr` if the strategy finds no suitable block. Updates `free_size` and `free_sizes`. |
 | `setMinSpyreAllocation(size_t nbytes) -> size_t` | Rounds `nbytes` up to the nearest multiple of `MIN_ALLOC_BYTES` (128). |
 
@@ -241,17 +249,17 @@ Once a region is selected, `allocateInRegion()` handles block assignment:
    - An occupied block of exactly `nbytes` (starting at the original block's `start`)
    - A free remainder block (starting at `start + nbytes`, ending at the original `end`)
 
-3. **Registration**: The new occupied block is registered in `ctx_to_block` and `block_to_region` for O(1) deallocation lookup.
+3. **Registration**: The new occupied block is assigned a unique `AllocationIndex` and registered in `index_to_allocation` (on FlexAllocator) and `index_to_block` (on MemoryRegion) for O(1) deallocation lookup.
 
 **Complexity:**
 - Allocation: O(S x R + log R) where S = regions, R = free ranges per region
-- Deallocation: O(S + log R) — O(1) region lookup via `block_to_region`, O(log R) for coalescing via `blocks` set operations
+- Deallocation: O(S + log R) — O(1) lookup via `index_to_allocation`, O(log R) for coalescing via `blocks` set operations
 
 ### Deallocation and Coalescing
 
 When a block is freed (via the `at::DataPtr` custom deleter):
 
-1. **Lookup**: Find the region via `block_to_region[ctx]` and the block via `region.ctx_to_block[ctx]`.
+1. **Lookup**: Find the allocation's region, block, and VirtualAddress via `index_to_allocation[alloc_index]`.
 
 2. **Mark free**: Set `is_free = true` on the block.
 
@@ -261,7 +269,7 @@ When a block is freed (via the `at::DataPtr` custom deleter):
 
 5. **Coalesce with both**: If both the predecessor and successor are free, all three blocks — predecessor, the freed block, and successor — are merged into a single free block spanning the combined range. The three originals are removed and replaced with one merged block.
 
-6. **Update bookkeeping**: Update `free_size`, `free_sizes`, remove entries from `ctx_to_block` and `block_to_region`, delete the `SharedOwnerCtx`.
+6. **Update bookkeeping**: Update `free_size`, `free_sizes`, remove the entry from `index_to_allocation` and `index_to_block`, delete the `SharedOwnerCtx`.
 
 This ensures the invariant that no two adjacent free blocks exist — free space is always maximally coalesced.
 
@@ -272,7 +280,7 @@ All allocation and deallocation operations acquire `allocator_mutex` before modi
 - Region acquisition (`allocateNewRegion`)
 - Block search and splitting (`findFreeBlock`, `allocateInRegion`)
 - Block freeing and coalescing (`deallocateBlock`)
-- All map updates (`block_to_region`, `ctx_to_block`)
+- All map updates (`index_to_allocation`, `index_to_block`)
 
 The `ReportAndDelete` static deleter also acquires the mutex, since it is called from arbitrary threads when PyTorch drops tensor references.
 
@@ -325,8 +333,7 @@ When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every al
                                                                             ┌──────────────────┐
                                                                             │  at::DataPtr     │
                                                                             │  SharedOwnerCtx  │
-                                                                            │  owner = VAddr   │
-                                                                            │  (region+offset) │
+                                                                            │  owner = AllocIdx│
                                                                             └──────────────────┘
 ```
 
@@ -335,8 +342,8 @@ When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every al
 3. `allocateNewRegion()` attempts to acquire a 12 GB region from the `DeviceMemoryAllocator`. If that fails, it tries 8 GB, then 4 GB.
 4. On success, a new `MemoryRegion` is created with a single free `MemoryBlock` spanning the full region.
 5. `allocateInRegion()` splits that free block: the first `nbytes` become an occupied block; the remainder stays free.
-6. FlexAllocator returns a `VirtualAddress` with `region_id` = the MemoryRegion's `region_id` and `offset` = the occupied block's `start` offset.
-7. A `SharedOwnerCtx` is created with `owner` = the returned `VirtualAddress`.
+6. FlexAllocator computes a `VirtualAddress` (`region_id` + `offset`) for the block, assigns a unique `AllocationIndex`, and registers the mapping in `index_to_allocation`.
+7. A `SharedOwnerCtx` is created with `owner` = the returned `AllocationIndex`.
 8. An `at::DataPtr` wrapping the `SharedOwnerCtx` is returned to the caller.
 
 #### Workflow 2: Subsequent Allocation (Existing Region)
@@ -372,14 +379,14 @@ When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every al
 2. `findFreeBlock()` evaluates existing regions. The `region_acquisition_strategy` produces an ordered list of candidate regions.
 3. For each candidate region, `allocateInRegion()` is called. Inside `allocateInRegion`, the `block_acquisition_strategy` calls `selectBlock(blocks, free_sizes, nbytes)` to find a suitable free block within the region. If the strategy returns `nullptr`, the next candidate region is tried.
 4. `allocateInRegion()` splits the selected block and returns the occupied portion.
-5. The new allocation's `SharedOwnerCtx` holds a `VirtualAddress` with the same `region_id` as other blocks in that region — only `offset` differs.
+5. The new allocation is assigned a unique `AllocationIndex`, registered in `index_to_allocation`, and the `SharedOwnerCtx` stores this index. FlexAllocator internally maps it to a `VirtualAddress` with the same `region_id` as other blocks in that region — only `offset` differs.
 
 #### Workflow 3: Deallocation with Coalescing
 
 ```
 ┌───────────────────┐     ┌──────────────────┐     ┌────────────────────────────────┐
-│  ReportAndDelete  │────▶│  block_to_region │────▶│  deallocate(VirtualAddress)     │
-│  (PyTorch drops   │     │  [ctx → region]  │     │                                │
+│  ReportAndDelete  │────▶│index_to_allocation────▶│  deallocate(AllocationIndex)    │
+│  (PyTorch drops   │     │  [idx → alloc]   │     │                                │
 │   last reference) │     │  O(1) lookup     │     │  Before: [██ ░░ ██₂ ░░ ██]    │
 └───────────────────┘     └──────────────────┘     │  Free block ██₂               │
                                                     │  Check predecessor ░░ → free  │
@@ -391,7 +398,7 @@ When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every al
 ```
 
 1. PyTorch drops the last reference to a tensor — `ReportAndDelete` is invoked with the `SharedOwnerCtx`.
-2. FlexAllocator acquires the mutex and looks up the region via `block_to_region`.
+2. FlexAllocator acquires the mutex and looks up the allocation's region, block, and VirtualAddress via `index_to_allocation`.
 3. `deallocate()` marks the block as free, then checks adjacent blocks:
    - If the predecessor (by offset) is free, the two are merged into a single larger free block.
    - If the successor (by offset) is free, it is merged as well.
@@ -422,22 +429,23 @@ Once `regions_locked` becomes `true`, no new regions are acquired — all alloca
 
 ### Integration with the Execution Pipeline
 
-FlexAllocator produces the `VirtualAddress` values that flow through the entire execution pipeline described in the Program Execution RFC:
+FlexAllocator produces `AllocationIndex` handles that flow through the torch-spyre layer and are resolved to `VirtualAddress` values within flex for execution:
 
 ```
 SpyreAllocator.allocate(N)
         │ delegates to FlexAllocator.allocate(N)
         ▼
-  at::DataPtr (SharedOwnerCtx with owner + offset)
+  at::DataPtr (SharedOwnerCtx with AllocationIndex)
         │
         ▼
-  SpyreTensor (carries VirtualAddress derived from SharedOwnerCtx)
+  SpyreTensor (carries AllocationIndex derived from SharedOwnerCtx)
         │
         ▼
   SpyreStream.Launch(job, tensors)
-        │ translate SpyreTensors → VirtualAddresses
+        │ extract AllocationIndex from each SpyreTensor
         ▼
-  FlexStream.Launch(job, virtual_addresses)
+  FlexStream.Launch(job, allocation_indices)
+        │ resolve AllocationIndex → VirtualAddress via FlexAllocator
         │ decompose Job → low-level steps using VirtualAddresses
         ▼
   Scheduler → Hardware
@@ -445,13 +453,13 @@ SpyreAllocator.allocate(N)
 
 Key integration points:
 
-1. **Tensor allocation** (`tensor.to("spyre")`): SpyreAllocator delegates to FlexAllocator, which produces a `VirtualAddress`. SpyreAllocator wraps it in an `at::DataPtr`. A `SpyreTensor` is constructed carrying that `VirtualAddress`.
+1. **Tensor allocation** (`tensor.to("spyre")`): SpyreAllocator delegates to FlexAllocator, which produces an `AllocationIndex`. SpyreAllocator wraps it in an `at::DataPtr`. A `SpyreTensor` is constructed carrying that `AllocationIndex`.
 
-2. **Binary loading** (ExecutionPlan loading): FlexAllocator allocates device memory for program binaries, returning a `VirtualAddress` for each. Each binary's `VirtualAddress` is stored on its Job.
+2. **Binary loading** (ExecutionPlan loading): FlexAllocator allocates device memory for program binaries, returning an `AllocationIndex` for each. Each binary's `AllocationIndex` is stored on its Job. FlexStream resolves these to `VirtualAddress` values internally when constructing ControlBlocks.
 
-3. **Program correction**: The correction tensor's device location is a fixed `VirtualAddress` (`region_id` 7, `offset` 0), reserved at allocator initialization from the first acquired MemoryRegion. Every Job's DMA step transfers the correction tensor to this address. FlexStream assembles correction input buffers containing the `VirtualAddress` values of resident tensors — these addresses originate from FlexAllocator.
+3. **Program correction**: The correction tensor's device location is a fixed `VirtualAddress` (`region_id` 7, `offset` 0), reserved at allocator initialization from the first acquired MemoryRegion. Every Job's DMA step transfers the correction tensor to this address. FlexStream resolves tensor `AllocationIndex` values to `VirtualAddress` values via `FlexAllocator.resolve()` when assembling correction input buffers.
 
-4. **Tiled execution**: FlexStream computes per-iteration offsets by adjusting the `offset` field of tensor `VirtualAddress` values. The `region_id` stays the same — tiling moves within a region, not across regions.
+4. **Tiled execution**: FlexStream resolves tensor `AllocationIndex` values to `VirtualAddress` values and computes per-iteration offsets by adjusting the `offset` field. The `region_id` stays the same — tiling moves within a region, not across regions.
 
 ## **Metrics**
 
@@ -507,9 +515,9 @@ The key difference is that slab allocators use fixed-size objects within each sl
 
 The SpyreAllocator / FlexAllocator pair should be taught as the "memory layer" of the Spyre stack — SpyreAllocator bridges PyTorch's `at::Allocator` interface, while FlexAllocator is the core engine that produces the `VirtualAddress` values the execution pipeline consumes. Key teaching points:
 
-1. **VirtualAddress is the universal currency**: Every component below FlexAllocator speaks VirtualAddress. FlexAllocator is the only component that knows how to produce one.
+1. **AllocationIndex is torch-spyre's handle, VirtualAddress is flex's internal currency**: torch-spyre only ever sees an opaque `AllocationIndex` — it stores it and passes it back. Within flex, every component speaks `VirtualAddress`. FlexAllocator is the bridge between the two: it produces `AllocationIndex` for torch-spyre and resolves it to `VirtualAddress` for FlexStream and the Scheduler.
 
-2. **PF vs. VF is hidden**: Users and most developers never need to know which mode is active. FlexAllocator produces VirtualAddresses that look the same in both modes — only `region_id` interpretation differs, and that's handled by firmware.
+2. **PF vs. VF is hidden**: Users and most developers never need to know which mode is active. FlexAllocator produces VirtualAddresses that look the same in both modes — only `region_id` interpretation differs, and that's handled by firmware. torch-spyre is entirely unaware of the distinction since it never sees a VirtualAddress.
 
 3. **Regions are acquired lazily, blocks are carved eagerly**: FlexAllocator doesn't pre-reserve all device memory. It acquires regions on demand (with fallback sizes) and carves blocks from them. This adaptive approach balances memory efficiency with allocation speed.
 
@@ -556,7 +564,7 @@ Additionally, torch-spyre should include tests that cover edge cases specific to
 
 7. **Eliminating try-catch for allocation attempts**: The current implementation uses try-catch around `DeviceMemoryAllocator` calls to handle allocation failures during region acquisition. Should this be replaced with a non-throwing API (e.g., `tryAllocate` returning `std::optional`)?
 
-8. **`VirtualAddress.region_id` as `DeviceMemoryAllocationPtr`**: `DeviceMemoryAllocationPtr` already encapsulates the PF/VF distinction — it carries either the VF firmware table index or the PF physical address. Should `region_id` be a `DeviceMemoryAllocationPtr` rather than a derived integer? This would eliminate the separate extraction step and remove the need for `data` as a separate field on `MemoryRegion` (since the handle would be embedded in every `VirtualAddress`). The tradeoff is that `VirtualAddress` becomes a shared-ownership type rather than a lightweight value type — every live `VirtualAddress` would keep the entire region's device allocation alive via refcount, which could complicate future region release policies.
+8. **`VirtualAddress.region_id` as `DeviceMemoryAllocationPtr`**: `DeviceMemoryAllocationPtr` already encapsulates the PF/VF distinction — it carries either the VF firmware table index or the PF physical address. Should `region_id` be a `DeviceMemoryAllocationPtr` rather than a derived integer? This would eliminate the separate extraction step and remove the need for `data` as a separate field on `MemoryRegion` (since the handle would be embedded in every `VirtualAddress`). Since `VirtualAddress` is now flex-internal (never exposed to torch-spyre), this is purely an internal design choice. The tradeoff is that `VirtualAddress` becomes a shared-ownership type rather than a lightweight value type — every live `VirtualAddress` would keep the entire region's device allocation alive via refcount, which could complicate future region release policies.
 
 9. **Pre-allocated fixed region pool**: Should FlexAllocator support allocating all regions up front at startup rather than on demand? This would eliminate allocation-time region acquisition latency and simplify the state machine (no `regions_locked` transition), but wastes device memory if the workload doesn't need all regions. The optimal number and size of regions depends on the workload, which isn't known at startup.
 
