@@ -232,8 +232,8 @@ auto get_device_stride_infos(c10::IntArrayRef sizes, c10::IntArrayRef strides,
  * @param tensor: tensor to convert
  * @return data conversion information in string
  */
-auto generate_dci_(const at::Tensor* tensor, bool host2device)
-    -> DataConversionInfo {
+auto generate_dci_(const at::Tensor* tensor, SpyreTensorLayout stl,
+                   bool host2device) -> DataConversionInfo {
   /*   host2device = true : then 'tensor' is CPU-tensor
    *   host2device = false: then 'tensor' is Spyre-tensor
    */
@@ -258,9 +258,11 @@ auto generate_dci_(const at::Tensor* tensor, bool host2device)
   return dci;
 }
 
-auto generate_dci(const at::Tensor* tensor, bool host2device) -> std::string {
+auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
+                  bool host2device) -> std::string {
   std::stringstream s;
-  generate_dci_(tensor, host2device).exportJson(s);
+  generate_dci_(tensor, stl, host2device).exportJson(s);
+  DEBUGINFO("DataConversionInfo: ", s.str());
   return s.str();
 }
 
@@ -273,33 +275,33 @@ auto dma_direct(const at::Tensor& self, const at::Tensor& dst,
   if (host2device) {
     cpu_tensor = &self;
     dev_tensor = &dst;
-    dci = generate_dci_(cpu_tensor, host2device);
+    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+    dci = generate_dci_(cpu_tensor, stl, host2device);
   } else {
     cpu_tensor = &dst;
     dev_tensor = &self;
-    dci = generate_dci_(dev_tensor, host2device);
+    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+    dci = generate_dci_(dev_tensor, stl, host2device);
   }
-
-  auto str_type = torchScalarToString[cpu_tensor->scalar_type()];
-  const auto [sen_dtype_cpu, sen_dtype_dev] = stringToSenDatatypePair(str_type);
-  auto layout = sendnn::TensorLayout::NHWC;
-
-  sendnn::TensorShape dev_tensor_shape(get_device_shape(cpu_tensor));
   auto runtime = GlobalRuntime::get();
-  uint64_t alignment = runtime->DeviceAlignment();
-  flex::RaiiBuffer buf(dev_tensor->storage().nbytes(), alignment);
-  void* buffer = buf.Pointer();
+
+  void* cpu_ptr = cpu_tensor->data_ptr();
+  void* dev_ptr = dev_tensor->data_ptr();
+  auto* ctx = static_cast<SharedOwnerCtx*>(
+      dev_tensor->storage().data_ptr().get_context());
   if (host2device) {
-    deeptools::ConvertData(cpu_tensor->data_ptr(), buffer, dci);
-    auto* ctx = static_cast<SharedOwnerCtx*>(
-        dev_tensor->storage().data_ptr().get_context());
-    runtime->dma_copy(buffer, ctx->owner, ctx->device_id);
+    runtime->dma_copy(cpu_ptr, ctx->owner, ctx->device_id, dci);
   } else {
-    auto* ctx = static_cast<SharedOwnerCtx*>(
-        dev_tensor->storage().data_ptr().get_context());
-    runtime->dma_copy(ctx->owner, buffer, ctx->device_id);
-    deeptools::ConvertData(buffer, cpu_tensor->data_ptr(), dci);
+    runtime->dma_copy(cpu_ptr, ctx->owner, ctx->device_id, dci);
   }
+}
+
+auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
+  dma_direct(self, dst, true);
+}
+
+auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
+  dma_direct(self, dst, false);
 }
 
 // A custom allocator for our custom device, what returns is a handle to the
@@ -526,14 +528,14 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   if (self.is_cpu() && dst.is_privateuseone()) {
     if (self.dim() == 0) {
       at::Tensor tmp_tensor = self.reshape({1});
-      dma_direct(tmp_tensor, dst, true);
+      copy_host_to_device(tmp_tensor, dst);
     } else {
-      dma_direct(self, dst, true);
+      copy_host_to_device(self, dst);
     }
     return dst;
 
   } else if (self.is_privateuseone() && dst.is_cpu()) {
-    dma_direct(self, dst, false);
+    copy_device_to_host(self, dst);
     return dst;
 
   } else if (self.is_privateuseone() && dst.is_privateuseone()) {
