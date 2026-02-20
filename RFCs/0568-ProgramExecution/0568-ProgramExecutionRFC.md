@@ -13,11 +13,11 @@ The current connection between torch-spyre and the flex runtime relies on graph 
 
 This RFC replaces that approach with a layered stream architecture:
 
-- **SpyreStream** (torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough layer. It translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, AllocationIndices) and delegates all execution logic to FlexStream.
+* **SpyreStream** (torch-spyre) implements the PyTorch Stream interface and serves as a thin passthrough layer. It translates PyTorch-native data (torch tensors, device metadata) into the types FlexStream understands (Jobs, AllocationIndices) and delegates all execution logic to FlexStream.
 
-- **FlexStream** (flex) is the core execution engine, modeled after CUDA streams. It accepts Jobs — each containing a JobPlan of ordered steps (HostOperation, DMA, DeviceCompute) — and walks the plan to produce the correct sequence of low-level control blocks forwarded to the Scheduler. FlexStream understands that a single logical job like a matmul may require multiple steps (a host operation to convert tensor virtual address metadata, a DMA of the correction tensor to device, and the device compute launch) and owns this decomposition. FlexStream's `Launch` method automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — reusing compilation artifacts by enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call. All methods are asynchronous — jobs enqueued on a stream return immediately. Within a single stream, jobs execute in FIFO order; across streams, no ordering is guaranteed.
+* **FlexStream** (flex) is the core execution engine, modeled after CUDA streams. It accepts Jobs — each containing a JobPlan of ordered steps (HostOperation, DMA, DeviceCompute) — and walks the plan to produce the correct sequence of low-level control blocks forwarded to the Scheduler. FlexStream understands that a single logical job like a matmul may require multiple steps (a host operation to convert tensor virtual address metadata, a DMA of the correction tensor to device, and the device compute launch) and owns this decomposition. FlexStream's `Launch` method automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — reusing compilation artifacts by enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call. All methods are asynchronous — jobs enqueued on a stream return immediately. Within a single stream, jobs execute in FIFO order; across streams, no ordering is guaranteed.
 
-- **Scheduler** (flex) sits underneath FlexStream and dispatches low-level steps onto hardware, respecting the intra-stream FIFO ordering guarantee. The Scheduler's internal design is covered in a separate Scheduler RFC.
+* **Scheduler** (flex) sits underneath FlexStream and dispatches low-level steps onto hardware, respecting the intra-stream FIFO ordering guarantee. The Scheduler's internal design is covered in a separate Scheduler RFC.
 
 ExecutionPlans remain lightweight containers of Jobs built from compiler output. They do not own execution logic — instead, each Job's binary is loaded to device (via a DMA), and then the Jobs are submitted through SpyreStream → FlexStream, which walks each Job's plan to produce low-level control blocks for the Scheduler.
 
@@ -58,12 +58,12 @@ See the SpyreAllocator RFC for full details on allocation strategies, memory reg
 
 A tensor residing on-device. Carries metadata required for execution:
 
-- **shape**: Logical dimensions (e.g., `[4096, 1024]`)
-- **stride**: Memory stride per dimension (bytes between consecutive elements along each axis)
-- **data_type**: Element type (e.g., float32, uint32)
-- **allocation_index**: An `AllocationIndex` identifying the tensor's allocation on device (from FlexAllocator)
-- **size_bytes**: Total byte size of the tensor data
-- **layout**: A `SpyreTensorLayout` describing the tensor's tiled layout on device — includes `device_size` (tiled dimensions on device), `device_dtype` (on-device data type), and `dim_map` (mapping between logical shape and device dimensions)
+* **shape**: Logical dimensions (e.g., `[4096, 1024]`)
+* **stride**: Memory stride per dimension (bytes between consecutive elements along each axis)
+* **data_type**: Element type (e.g., float32, uint32)
+* **allocation_index**: An `AllocationIndex` identifying the tensor's allocation on device (from FlexAllocator)
+* **size_bytes**: Total byte size of the tensor data
+* **layout**: A `SpyreTensorLayout` describing the tensor's tiled layout on device — includes `device_size` (tiled dimensions on device), `device_dtype` (on-device data type), and `dim_map` (mapping between logical shape and device dimensions)
 
 #### Job
 
@@ -101,7 +101,6 @@ Steps:
 
 **Program correction flow**: When a kernel uses symbolic addresses or shapes, the backend compiler produces a unified binary containing both a correction program and the compute program, along with correction metadata. At runtime, the HostOperation step takes the resolved symbol values and the Job's `program_correction_metadata` as input and produces a correction tensor. The DMA step transfers this tensor to a reserved location on device (segment 7, address 0). The DeviceCompute step then launches the unified binary as a single compute CB — internally, the correction program reads the correction tensor to patch the compute program, then the compute program executes. The runtime does not distinguish between the correction program and the compute program; they are opaque within the single CB.
 
-
 #### ExecutionPlan
 
 Produced by the backend compiler (deeptools). An ExecutionPlan starts as compiler output describing the ordered sequence of Jobs required, then becomes the runtime artifact once each Job's binary is loaded to device. Loading an ExecutionPlan means loading each Job's binary via DMA and storing the resulting `allocation_index` on the Job. Each backend compiler input (sdsc) produced by inductor maps to a single Job. A single `torch.compile` call may produce multiple sdscs, which is why an ExecutionPlan contains an ordered list of Jobs. In many cases, however, the ExecutionPlan will contain only a single Job (one SDSC per compile).
@@ -128,9 +127,9 @@ A thin wrapper around `FlexStream` that implements the PyTorch Stream interface.
 SpyreStream contains no decomposition logic, tiling logic, or understanding of Job internals. It is a passthrough layer whose purpose is to bridge the PyTorch runtime conventions with the flex execution engine.
 
 **Semantics:**
-- Implements the PyTorch Stream interface so that torch-spyre integrates with PyTorch's stream management (e.g., `torch.spyre.Stream`, `torch.spyre.current_stream()`)
-- All methods are **asynchronous** — control returns to the host immediately (inherited from FlexStream)
-- Within a SpyreStream, jobs execute **sequentially** (inherited from FlexStream's FIFO ordering)
+* Implements the PyTorch Stream interface so that torch-spyre integrates with PyTorch's stream management (e.g., `torch.spyre.Stream`, `torch.spyre.current_stream()`)
+* All methods are **asynchronous** — control returns to the host immediately (inherited from FlexStream)
+* Within a SpyreStream, jobs execute **sequentially** (inherited from FlexStream's FIFO ordering)
 
 Methods:
 
@@ -146,10 +145,10 @@ The core execution engine in flex, modeled after CUDA streams. A FlexStream acce
 FlexStream understands the internal structure of Jobs: it knows that a matmul may require a host operation (conversion of tensor virtual address metadata), a DMA of the correction tensor to device, and a device compute launch, and it generates the correct sequence of control blocks for each. FlexStream's `Launch` method also automatically detects when tensor shapes exceed the compiled tile size and handles tiled execution transparently — enqueuing multiple rounds of low-level steps with updated tensor offsets — without requiring a separate API call.
 
 **Semantics:**
-- All methods are **asynchronous** — control returns to the host immediately after enqueuing
-- Within a single FlexStream, jobs execute **sequentially** in FIFO order
-- Across different FlexStreams, jobs have **no ordering guarantees**
-- Each FlexStream is identified by a `stream_index`
+* All methods are **asynchronous** — control returns to the host immediately after enqueuing
+* Within a single FlexStream, jobs execute **sequentially** in FIFO order
+* Across different FlexStreams, jobs have **no ordering guarantees**
+* Each FlexStream is identified by a `stream_index`
 
 Methods:
 
@@ -201,9 +200,9 @@ The Scheduler sits underneath FlexStream and is responsible for dispatching low-
 Tiled execution is handled automatically by `FlexStream.Launch` when `allow_tiled_launch` is true (the default). When a tensor is larger than the compiled tile size, FlexStream reuses the compiled kernel across the full tensor by enqueuing multiple rounds of low-level steps — one full Job decomposition per iteration, each with updated tensor offsets. If `allow_tiled_launch` is false and shapes exceed the tile size, Launch raises an exception.
 
 **Preconditions:**
-- Each tensor dimension is greater than or equal to the corresponding compiled tile dimension
-- Each tensor dimension is evenly divisible by the corresponding tile dimension
-- Tensor strides are consistent with the tiling dimension
+* Each tensor dimension is greater than or equal to the corresponding compiled tile dimension
+* Each tensor dimension is evenly divisible by the corresponding tile dimension
+* Tensor strides are consistent with the tiling dimension
 
 **Behavior:**
 1. Compare each tensor's shape against the kernel's expected input shapes (from the DeviceCompute step in the Job's JobPlan)
@@ -227,6 +226,7 @@ Iteration 3: A[3072:4096, :] * B → C[3072:4096, :]
 ```
 
 Each iteration enqueues onto the FlexStream:
+
 ```
 HostOp(tensor_vaddr_metadata_i, correction_metadata) → DMA(correction_tensor_i) → DeviceCompute(binary)
 ```
@@ -373,13 +373,13 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 2. For each Job, delegates to `SpyreStream.Launch(job, tensors, allow_tiled_launch)`
 3. SpyreStream extracts AllocationIndices from SpyreTensors and calls `FlexStream.Launch(job, allocation_indices, allow_tiled_launch)`
 4. FlexStream resolves AllocationIndices to VirtualAddresses via `FlexAllocator.resolve()`, then compares tensor shapes against the DeviceCompute's expected input shapes:
-   - Shapes match exactly → proceeds with single-iteration walk (this workflow)
-   - Shapes exceed tile size and `allow_tiled_launch` is true → tiled iterations (see Workflow 4)
-   - Shapes exceed tile size and `allow_tiled_launch` is false → raises exception
+   * Shapes match exactly → proceeds with single-iteration walk (this workflow)
+   * Shapes exceed tile size and `allow_tiled_launch` is true → tiled iterations (see Workflow 4)
+   * Shapes exceed tile size and `allow_tiled_launch` is false → raises exception
 5. FlexStream walks the Job's JobPlan:
-   - **HostOperation** (on CPU): converts tensor virtual address metadata using the Job's `program_correction_metadata`, producing a correction tensor
-   - **DMA** (ToDevice): enqueues a DMA control block to transfer the correction tensor to device (segment 7, address 0)
-   - **DeviceCompute**: enqueues a compute control block to launch the unified binary (correction + matmul)
+   * **HostOperation** (on CPU): converts tensor virtual address metadata using the Job's `program_correction_metadata`, producing a correction tensor
+   * **DMA** (ToDevice): enqueues a DMA control block to transfer the correction tensor to device (segment 7, address 0)
+   * **DeviceCompute**: enqueues a compute control block to launch the unified binary (correction + matmul)
 6. Scheduler receives 2 control blocks (DMA CB, then compute CB) and drains them onto hardware in FIFO order
 7. Host returns immediately; call `SpyreStream.Synchronize()` when results are needed
 
@@ -433,10 +433,10 @@ This diagram shows the full path from `LaunchKernel` through every layer for a m
 5. `allow_tiled_launch` is true → FlexStream proceeds with tiled execution
 6. FlexStream infers tiling dimension and `num_iterations = 4096 / 1024 = 4`
 7. For each iteration `i`, FlexStream walks the Job's JobPlan with updated addresses:
-   - Computes updated tensor offsets for iteration `i`
-   - **HostOperation** (on CPU): converts tensor virtual address metadata for this iteration using correction metadata → correction tensor
-   - **DMA** (ToDevice): enqueues DMA CB — correction tensor → device (segment 7, address 0)
-   - **DeviceCompute**: enqueues compute CB — launch unified binary for this tile slice
+   * Computes updated tensor offsets for iteration `i`
+   * **HostOperation** (on CPU): converts tensor virtual address metadata for this iteration using correction metadata → correction tensor
+   * **DMA** (ToDevice): enqueues DMA CB — correction tensor → device (segment 7, address 0)
+   * **DeviceCompute**: enqueues compute CB — launch unified binary for this tile slice
 8. All 8 control blocks (2 per iteration × 4 iterations) are forwarded to the Scheduler. 4 HostOperations ran on the CPU.
 9. Scheduler drains all control blocks onto hardware in FIFO order
 10. Host returns immediately; call `SpyreStream.Synchronize()` to block until all iterations complete
@@ -523,8 +523,8 @@ FlexStream is a deliberately minimal subset — 2 methods vs. CUDA's dozens. The
 
 In CUDA, a kernel launch is self-contained — the user or library (cuBLAS, cuDNN) manually issues the correct sequence of memcpy and launch calls on a stream. Spyre jobs have inherent **compound structure** that requires the runtime to decompose a single logical job into multiple low-level steps:
 
-- **A CUDA matmul**: 1 kernel launch
-- **A Spyre matmul**: host operation (convert tensor vaddr metadata) → DMA correction tensor → device compute (3 steps, 2 device CBs)
+* **A CUDA matmul**: 1 kernel launch
+* **A Spyre matmul**: host operation (convert tensor vaddr metadata) → DMA correction tensor → device compute (3 steps, 2 device CBs)
 
 FlexStream owns this decomposition as a first-class part of the runtime. The closest CUDA analogs are vendor libraries like cuBLAS and cuDNN, which internally issue multi-step sequences on a user-provided stream — but those are external libraries, not a core stream layer. In the Spyre stack, compound decomposition is built into FlexStream because every Spyre compute requires it, not just optimized library calls.
 
