@@ -11,8 +11,8 @@ This RFC introduces the Spyre memory allocation architecture, composed of two la
 
 FlexAllocator operates in two modes, selected by the `FLEX_DEVICE` environment variable. Both modes use the same allocation logic — dynamically acquiring memory regions and carving individual allocations from them as blocks, returning a `VirtualAddress` (`region_id` + `offset`). The only difference between modes is the interpretation of `region_id`:
 
-- **PF Mode (Physical Function)**: `region_id` is the physical address of the start of the memory region.
-- **VF Mode (Virtual Function)**: `region_id` is an index into a firmware lookup table that maps to the physical address of the start of the memory region.
+* **PF Mode (Physical Function)**: `region_id` is the physical address of the start of the memory region.
+* **VF Mode (Virtual Function)**: `region_id` is an index into a firmware lookup table that maps to the physical address of the start of the memory region.
 
 FlexAllocator is the sole owner of the mapping between host-visible allocation metadata and device-side addressing.
 
@@ -74,9 +74,9 @@ Derived:
 Ordering: Blocks are ordered by `start` offset within a region. This ordering is critical for the coalescing algorithm — when a block is freed, FlexAllocator checks the immediately preceding and following blocks (by offset order) and merges any that are also free into a single larger free block.
 
 **Invariants:**
-- Blocks within a region are non-overlapping and contiguous — the `end` of one block equals the `start` of the next.
-- No two adjacent blocks are both free — FlexAllocator always coalesces on deallocation.
-- `start` is always 128-byte aligned.
+* Blocks within a region are non-overlapping and contiguous — the `end` of one block equals the `start` of the next.
+* No two adjacent blocks are both free — FlexAllocator always coalesces on deallocation.
+* `start` is always 128-byte aligned.
 
 #### MemoryRegion
 
@@ -226,9 +226,9 @@ FlexAllocator uses a two-phase strategy: **region acquisition** followed by **bl
 
 Region acquisition determines which region to allocate from. The behavior depends on the `region_acquisition_strategy`:
 
-- **`LoadBalancingStrategy`**: If `regions_locked` is `false`, a new region is acquired first — FlexAllocator tries each size in `fallback_sizes` (`{12GB, 8GB, 4GB}`) until one succeeds. The newly acquired region (fully free) is added to the pool. The strategy then orders all regions by descending `free_size`, so the new region (with the most free space) is tried first. This distributes allocations across regions.
+* **`LoadBalancingStrategy`**: If `regions_locked` is `false`, a new region is acquired first — FlexAllocator tries each size in `fallback_sizes` (`{12GB, 8GB, 4GB}`) until one succeeds. The newly acquired region (fully free) is added to the pool. The strategy then orders all regions by descending `free_size`, so the new region (with the most free space) is tried first. This distributes allocations across regions.
 
-- **`FillFirstStrategy`**: Existing regions are tried first. The strategy orders regions by ascending `free_size` (most-filled first, among those that can satisfy the request), packing allocations tightly. A new region is only acquired when no existing region can satisfy the request and `regions_locked` is `false`.
+* **`FillFirstStrategy`**: Existing regions are tried first. The strategy orders regions by ascending `free_size` (most-filled first, among those that can satisfy the request), packing allocations tightly. A new region is only acquired when no existing region can satisfy the request and `regions_locked` is `false`.
 
 New region acquisition follows a fallback sequence:
 
@@ -246,14 +246,14 @@ Once a region is selected, `allocateInRegion()` handles block assignment:
 1. **Block search**: The `block_acquisition_strategy` selects a free block via `selectBlock(blocks, free_sizes, nbytes)`. The strategy receives the region's ordered block set and free-size multiset, and returns the block to allocate from (or `nullptr` if no suitable block exists). With `FirstFitStrategy` (default), this scans blocks in offset order and returns the first free block whose `size() >= nbytes`. With `BestFitStrategy`, this scans all free blocks and returns the smallest one that fits. Both strategies use the `free_sizes` multiset for an O(log R) pre-check — if the largest value in `free_sizes` is less than `nbytes`, the strategy returns `nullptr` immediately without scanning blocks.
 
 2. **Block splitting**: If the found free block is larger than `nbytes`, it is split into:
-   - An occupied block of exactly `nbytes` (starting at the original block's `start`)
-   - A free remainder block (starting at `start + nbytes`, ending at the original `end`)
+   * An occupied block of exactly `nbytes` (starting at the original block's `start`)
+   * A free remainder block (starting at `start + nbytes`, ending at the original `end`)
 
 3. **Registration**: The new occupied block is assigned a unique `AllocationIndex` and registered in `index_to_allocation` (on FlexAllocator) and `index_to_block` (on MemoryRegion) for O(1) deallocation lookup.
 
 **Complexity:**
-- Allocation: O(S x R + log R) where S = regions, R = free ranges per region
-- Deallocation: O(S + log R) — O(1) lookup via `index_to_allocation`, O(log R) for coalescing via `blocks` set operations
+* Allocation: O(S x R + log R) where S = regions, R = free ranges per region
+* Deallocation: O(S + log R) — O(1) lookup via `index_to_allocation`, O(log R) for coalescing via `blocks` set operations
 
 ### Deallocation and Coalescing
 
@@ -277,10 +277,10 @@ This ensures the invariant that no two adjacent free blocks exist — free space
 
 All allocation and deallocation operations acquire `allocator_mutex` before modifying any state. This is a single coarse-grained mutex covering the entire FlexAllocator. The lock scope includes:
 
-- Region acquisition (`allocateNewRegion`)
-- Block search and splitting (`findFreeBlock`, `allocateInRegion`)
-- Block freeing and coalescing (`deallocateBlock`)
-- All map updates (`index_to_allocation`, `index_to_block`)
+* Region acquisition (`allocateNewRegion`)
+* Block search and splitting (`findFreeBlock`, `allocateInRegion`)
+* Block freeing and coalescing (`deallocateBlock`)
+* All map updates (`index_to_allocation`, `index_to_block`)
 
 The `ReportAndDelete` static deleter also acquires the mutex, since it is called from arbitrary threads when PyTorch drops tensor references.
 
@@ -293,8 +293,8 @@ aligned = ((nbytes + MIN_ALLOC_BYTES - 1) / MIN_ALLOC_BYTES) * MIN_ALLOC_BYTES
 ```
 
 Block `start` offsets are always 128-byte aligned because:
-- The first block in a region starts at offset 0 (aligned).
-- When a block is split, the occupied portion is a multiple of 128 bytes (due to alignment rounding), so the remainder's `start` is also aligned.
+* The first block in a region starts at offset 0 (aligned).
+* When a block is split, the occupied portion is a multiple of 128 bytes (due to alignment rounding), so the remainder's `start` is also aligned.
 
 ### Debugging
 
@@ -305,10 +305,10 @@ TORCH_LOGS=spyre_allocator
 ```
 
 When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every allocation and deallocation, including:
-- Region acquisition (size, fallback level)
-- Block assignment (region id, offset, size)
-- Block freeing and coalescing details
-- Region free space summaries
+* Region acquisition (size, fallback level)
+* Block assignment (region id, offset, size)
+* Block freeing and coalescing details
+* Region free space summaries
 
 ### Workflows
 
@@ -400,8 +400,8 @@ When enabled, SpyreAllocator and FlexAllocator emit verbose logging for every al
 1. PyTorch drops the last reference to a tensor — `ReportAndDelete` is invoked with the `SharedOwnerCtx`.
 2. FlexAllocator acquires the mutex and looks up the allocation's region, block, and VirtualAddress via `index_to_allocation`.
 3. `deallocate()` marks the block as free, then checks adjacent blocks:
-   - If the predecessor (by offset) is free, the two are merged into a single larger free block.
-   - If the successor (by offset) is free, it is merged as well.
+   * If the predecessor (by offset) is free, the two are merged into a single larger free block.
+   * If the successor (by offset) is free, it is merged as well.
 4. `free_size` and `free_sizes` are updated. Mappings are removed. The `SharedOwnerCtx` is deleted.
 
 #### Workflow 4: Region Exhaustion and Locking
@@ -506,8 +506,8 @@ The key difference is the addressing model: CUDA allocations return raw GPU poin
 The Linux kernel's virtual memory allocator (`vmalloc`) acquires pages from the physical page allocator and maps them into a contiguous virtual address range. The slab allocator (`kmem_cache_create`) builds on top of this, pre-allocating pages and carving objects of a fixed size from them.
 
 FlexAllocator's region/block model is structurally similar to slab allocation:
-- **Regions** are analogous to slabs (contiguous memory acquired from a lower-level allocator)
-- **Blocks** are analogous to objects within a slab (carved from the slab's memory)
+* **Regions** are analogous to slabs (contiguous memory acquired from a lower-level allocator)
+* **Blocks** are analogous to objects within a slab (carved from the slab's memory)
 
 The key difference is that slab allocators use fixed-size objects within each slab, while FlexAllocator supports variable-size blocks with first-fit search and coalescing — more like a general-purpose heap allocator than a true slab allocator.
 
@@ -531,12 +531,12 @@ Testing spans both layers of the allocator architecture:
 
 FlexAllocator should have a dedicated set of unit tests in flex that exercise the core memory management logic in isolation, without requiring a device or PyTorch. These tests should cover:
 
-- **Block allocation and splitting**: Verify that allocations carve correctly-sized occupied blocks from free blocks, with proper 128-byte alignment and correct remainder splitting.
-- **Deallocation and coalescing**: Verify that freeing a block merges it with adjacent free predecessors and successors, maintaining the invariant that no two adjacent blocks are both free.
-- **Region acquisition and fallback**: Verify the fallback size sequence (`{12GB, 8GB, 4GB}`), `regions_locked` transitions, and `max_regions` enforcement.
-- **Strategy behavior**: Verify that `RegionAcquisitionStrategy` (`LoadBalancingStrategy`, `FillFirstStrategy`) and `BlockAcquisitionStrategy` (`FirstFitStrategy`, `BestFitStrategy`) produce the expected region ordering and block selection for given inputs.
-- **Fragmentation scenarios**: Allocate and free blocks in patterns that produce fragmentation, then verify that coalescing recovers contiguous free space and that subsequent allocations succeed.
-- **Thread safety**: Concurrent allocation and deallocation from multiple threads to verify correctness under contention.
+* **Block allocation and splitting**: Verify that allocations carve correctly-sized occupied blocks from free blocks, with proper 128-byte alignment and correct remainder splitting.
+* **Deallocation and coalescing**: Verify that freeing a block merges it with adjacent free predecessors and successors, maintaining the invariant that no two adjacent blocks are both free.
+* **Region acquisition and fallback**: Verify the fallback size sequence (`{12GB, 8GB, 4GB}`), `regions_locked` transitions, and `max_regions` enforcement.
+* **Strategy behavior**: Verify that `RegionAcquisitionStrategy` (`LoadBalancingStrategy`, `FillFirstStrategy`) and `BlockAcquisitionStrategy` (`FirstFitStrategy`, `BestFitStrategy`) produce the expected region ordering and block selection for given inputs.
+* **Fragmentation scenarios**: Allocate and free blocks in patterns that produce fragmentation, then verify that coalescing recovers contiguous free space and that subsequent allocations succeed.
+* **Thread safety**: Concurrent allocation and deallocation from multiple threads to verify correctness under contention.
 
 ### SpyreAllocator Integration Tests (torch-spyre)
 
@@ -544,9 +544,9 @@ SpyreAllocator should be validated through upstream PyTorch tests that exercise 
 
 Additionally, torch-spyre should include tests that cover edge cases specific to Spyre's allocation model:
 
-- **Allocation edge cases**: Large allocations that span most of a region, many small allocations that stress block management, and allocation patterns that exhaust all regions (`regions_locked` = `true`).
-- **Program loading**: Verify that ExecutionPlan binary loading allocates device memory correctly alongside tensor allocations, and that the segment table is populated from the acquired MemoryRegions.
-- **OOM behavior**: Verify graceful failure when all regions are locked and no region can satisfy a request.
+* **Allocation edge cases**: Large allocations that span most of a region, many small allocations that stress block management, and allocation patterns that exhaust all regions (`regions_locked` = `true`).
+* **Program loading**: Verify that ExecutionPlan binary loading allocates device memory correctly alongside tensor allocations, and that the segment table is populated from the acquired MemoryRegions.
+* **OOM behavior**: Verify graceful failure when all regions are locked and no region can satisfy a request.
 
 ## **Unresolved questions**
 
