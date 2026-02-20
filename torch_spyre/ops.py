@@ -37,6 +37,24 @@ def spyre__mm_out(
     return compiled_mm(self, mat2, out=out)
 
 
+@torch.library.register_kernel("aten::linear", ["spyre"])
+def spyre__linear(
+    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    def _linear(input, weight, bias):
+        weight = weight.transpose(-1, -2).contiguous()
+        while weight.dim() < input.dim():
+            weight = torch.unsqueeze(weight, 0)
+
+        out = input @ weight
+        if bias:
+            out += bias
+        return out
+
+    compiled_linear = torch.compile(_linear)
+    return compiled_linear(input, weight, bias)
+
+
 @torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])
 def spyre__fill_scalar(
     self: torch.Tensor, other: Union[int, float, bool, complex]
