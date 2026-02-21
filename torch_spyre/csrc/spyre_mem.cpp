@@ -493,7 +493,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   } else {
     stream = getCurrentStream(self.device());
   }
-  stream.dma_copy_async(self, dst);
+  stream.copy_async(self, dst);
   if (!non_blocking) {
     stream.synchronize();
   }
