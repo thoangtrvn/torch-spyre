@@ -18,7 +18,6 @@
 
 #include <c10/core/ScalarType.h>
 #include <c10/util/Exception.h>  // TORCH_WARN_ONCE
-#include <module.h>
 #include <util/sendefs.h>
 
 #include <sendnn/tensor/sendatatype.hpp>
@@ -26,6 +25,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "module.h"
 
 namespace spyre {
 

@@ -44,6 +44,7 @@
 #include "module.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_storage_impl.h"
+#include "spyre_stream.hpp"
 #include "spyre_tensor_impl.h"
 #include "types_mapping.h"
 
@@ -266,44 +267,6 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   return s.str();
 }
 
-auto dma_direct(const at::Tensor& self, const at::Tensor& dst,
-                bool host2device) {
-  /* no graph */
-  const at::Tensor* dev_tensor;
-  const at::Tensor* cpu_tensor;
-  data_conversion_info dci;
-  if (host2device) {
-    cpu_tensor = &self;
-    dev_tensor = &dst;
-    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
-    dci = generate_dci_(cpu_tensor, stl, host2device);
-  } else {
-    cpu_tensor = &dst;
-    dev_tensor = &self;
-    SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
-    dci = generate_dci_(dev_tensor, stl, host2device);
-  }
-  auto runtime = GlobalRuntime::get();
-
-  void* cpu_ptr = cpu_tensor->data_ptr();
-  void* dev_ptr = dev_tensor->data_ptr();
-  auto* ctx = static_cast<SharedOwnerCtx*>(
-      dev_tensor->storage().data_ptr().get_context());
-  if (host2device) {
-    runtime->dma_copy(cpu_ptr, ctx->owner, ctx->device_id, dci);
-  } else {
-    runtime->dma_copy(cpu_ptr, ctx->owner, ctx->device_id, dci);
-  }
-}
-
-auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
-  dma_direct(self, dst, true);
-}
-
-auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
-  dma_direct(self, dst, false);
-}
-
 // A custom allocator for our custom device, what returns is a handle to the
 // allocated memory not the actual pointer
 struct SpyreAllocator final : public at::Allocator {
@@ -524,37 +487,17 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   TORCH_CHECK(
       self.scalar_type() == dst.scalar_type(),
       "Spyre backend does not support type conversion yet during copy.");
-
-  if (self.is_cpu() && dst.is_privateuseone()) {
-    if (self.dim() == 0) {
-      at::Tensor tmp_tensor = self.reshape({1});
-      copy_host_to_device(tmp_tensor, dst);
-    } else {
-      copy_host_to_device(self, dst);
-    }
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_cpu()) {
-    copy_device_to_host(self, dst);
-    return dst;
-
-  } else if (self.is_privateuseone() && dst.is_privateuseone()) {
-    // Copy from Spyre to Spyre
-    // FIXME: This will need to be addressed for proper spyre to spyre copy
-    source_storage =
-        (static_cast<SpyreTensorImpl*>(self.unsafeGetTensorImpl()))->storage();
-    dest_storage =
-        (static_cast<SpyreTensorImpl*>(dst.unsafeGetTensorImpl()))->storage();
-    DEBUGINFO("Copying", source_storage.nbytes(), "bytes from",
-              source_storage.device(), "to", dest_storage.device());
-    std::memcpy(dest_storage.data_ptr().get(), source_storage.data_ptr().get(),
-                source_storage.nbytes());
-    DEBUGINFO("Finished Copying ");
-    return dst;
+  SpyreStream stream;
+  if (dst.is_privateuseone()) {
+    stream = getCurrentStream(dst.device());
   } else {
-    // For all other cases fallback to the upstream implementation
-    return at::_copy_from(self, dst, non_blocking);
+    stream = getCurrentStream(self.device());
   }
+  stream.dma_copy_async(self, dst);
+  if (!non_blocking) {
+    stream.synchronize();
+  }
+  return dst;
 }
 
 at::Tensor to_with_layout(const at::Tensor& self,
