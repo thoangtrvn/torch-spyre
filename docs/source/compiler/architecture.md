@@ -23,7 +23,7 @@ executable programs binaries.
 :width: 35%
 :align: center
 
-The full Spyre software stack. PyTorch programs pass through Dynamo/Autograd to produce an FX graph, which Torch Inductor lowers to Loop-Level IR. The Torch-Spyre front-end (green) generates SuperDSCs and host code; the DeepTools back-end (blue) compiles these into Spyre program binaries. *Source: Torch-Spyre contributor presentation.*
+The full Spyre software stack. PyTorch programs pass through Dynamo/Autograd to produce an FX graph, which Torch Inductor lowers to Loop-Level IR. The Torch-Spyre front-end (green) generates SuperDSCs and host code; the DeepTools back-end (blue) compiles these into Spyre program binaries.
 :::
 
 # Background
@@ -46,7 +46,7 @@ to a `spyre` device to be routed to the front-end compiler.
 :width: 90%
 :align: center
 
-The `torch.compile` pipeline. Dynamo and AOTAutograd trace PyTorch programs into an FX graph of ATen operations. Inductor lowers this to Loop-Level IR and dispatches to the registered backend — either Triton (GPU) or the Torch-Spyre back-end (Spyre). *Source: Torch-Spyre contributor presentation.*
+The `torch.compile` pipeline. Dynamo and AOTAutograd trace PyTorch programs into an FX graph of ATen operations. Inductor lowers this to Loop-Level IR and dispatches to the registered backend — either Triton (GPU) or the Torch-Spyre back-end (Spyre).
 :::
 
 Compilation then proceeds per the normal Dynamo/Inductor compilation flow through the following stages:
@@ -64,7 +64,7 @@ orchestrate their execution.
 :width: 100%
 :align: center
 
-Decision flowchart for the Torch-Spyre front-end code generation pipeline. Each operation in the FX Graph is evaluated against compatibility checks, schema lookup, dtype mapping, and output shape inference before a SuperDSC template is rendered. *Source: torch-spyre repository.*
+Decision flowchart for the Torch-Spyre front-end code generation pipeline. Each operation in the FX Graph is evaluated against compatibility checks, schema lookup, dtype mapping, and output shape inference before a SuperDSC template is rendered.
 :::
 
 Some key entry points to the front-end compiler are:

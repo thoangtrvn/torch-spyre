@@ -18,7 +18,7 @@ allocation, and kernel execution at inference time.
 :width: 45%
 :align: center
 
-The PyTorch Dispatcher routes each operation to the correct device implementation. When a `torch.add` call carries Spyre tensors, the Dispatcher looks up `SPYRE` in its dispatch table and calls the registered `spyre__add_Tensor` kernel. Torch-Spyre registers all its eager runtime kernels in this table via `TORCH_LIBRARY_IMPL`. *Source: Torch-Spyre contributor presentation.*
+The PyTorch Dispatcher routes each operation to the correct device implementation. When a `torch.add` call carries Spyre tensors, the Dispatcher looks up `SPYRE` in its dispatch table and calls the registered `spyre__add_Tensor` kernel. Torch-Spyre registers all its eager runtime kernels in this table via `TORCH_LIBRARY_IMPL`.
 :::
 
 ## Device Registration
@@ -57,7 +57,7 @@ device and backend registration without requiring an explicit import.
 :width: 40%
 :align: center
 
-The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which delegates to the underlying `Flex::TryAllocate` for physical device memory. *Source: Torch-Spyre contributor presentation.*
+The Spyre device allocator call chain. A `torch.empty(..., device="spyre")` call flows through `spyre_empty_strided` into `SpyreAllocator::allocate`, which delegates to the underlying `Flex::TryAllocate` for physical device memory.
 :::
 
 ## Memory Model
