@@ -580,7 +580,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 else:
                     di = [DimensionInfo(self.wildcard, 1), di_x[0], di_x[1], di_y[2]]
             elif len(di_x) == 3 and len(di_y) == 2:
-                di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+                di = [di_x[0], di_x[1], di_x[2], di_y[1]]
             elif len(di_x) == 2 and len(di_y) == 2:
                 if di_x == di_y:
                     di = [

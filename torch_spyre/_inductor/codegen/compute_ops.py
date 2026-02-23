@@ -121,11 +121,16 @@ class DimInfos:
     # with the order of a subset of the indices adjusted to match
     # the tile layout of the tensor on the device.  This
     # function computes that reordering
-    def get_tensor_op_index_order(self, tensor):
+    def get_tensor_op_index_order(self, tensor, op):
         dim_indices = self.dim_indices  # op dimension order
         dev_dim_order = tensor["device_layout"].dim_map[::-1][1:]
         missing_dims = list(set(dim_indices) - set(dev_dim_order))
-        if len(missing_dims) > 0 and len(dim_indices) >= 3 and tensor["scale"][0] == -1:
+        if (
+            len(missing_dims) > 0
+            and len(dim_indices) >= 3
+            and tensor["scale"][0] == -1
+            and op != "batchmatmul"
+        ):
             if missing_dims[0] == 0:
                 # Add missing dimensions to end of device dimension order
                 # Compute the number of leading missing dims (-1)
@@ -161,7 +166,7 @@ class DimInfos:
     def get_tensor_op_infos(self, tensor, op):
         result = self.make_dim_infos(
             additional_rows={"scale": get_scales_sdsc_format(tensor, op)},
-            index_order=self.get_tensor_op_index_order(tensor),
+            index_order=self.get_tensor_op_index_order(tensor, op),
         )
         return result
 

@@ -28,7 +28,7 @@ from torch_spyre._C import get_elem_in_stick
 from torch_spyre.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
-
+from .errors import Unsupported
 import threading
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
@@ -232,7 +232,9 @@ def lower_bmm(x, y):
     y = V.graph.get_buffer(y.realize())
     x_loader = x.make_loader()
     y_loader = y.make_loader()
-    d3 = len(x.get_size()) == 3
+
+    d3 = len(x.get_size()) == 3 and len(y.get_size()) == 3
+    d4 = len(x.get_size()) == 4 and len(y.get_size()) == 4
     if d3:
 
         def inner_fn(index, reduction_index):
@@ -249,10 +251,10 @@ def lower_bmm(x, y):
             dst_dtype=x.get_dtype(),
             src_dtype=x.get_dtype(),
             inner_fn=inner_fn,
-            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[2]],  # B, M, N
+            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[-1]],  # B, M, N
             reduction_ranges=[x.get_size()[2]],  # K
         )
-    else:  # 4d
+    elif d4:
 
         def inner_fn(index, reduction_index):
             i0, i1, i2, i3 = index
@@ -276,6 +278,27 @@ def lower_bmm(x, y):
             ],
             reduction_ranges=[x.get_size()[-1]],
         )
+    elif len(x.get_size()) == 3 and len(y.get_size()) == 2:
+
+        def inner_fn(index, reduction_index):
+            i0, i1, i2 = index
+            (r0,) = reduction_index
+            tmp1 = x_loader([i0, i1, r0])
+            tmp2 = y_loader([r0, i2])
+            return (tmp1, tmp2)
+
+        result = Reduction.create(
+            reduction_type=BATCH_MATMUL_OP,
+            input_node=[x, y],
+            device=x.get_device(),
+            dst_dtype=x.get_dtype(),
+            src_dtype=x.get_dtype(),
+            inner_fn=inner_fn,
+            ranges=[x.get_size()[0], x.get_size()[1], y.get_size()[-1]],  # B, M, N
+            reduction_ranges=[x.get_size()[2]],  # K
+        )
+    else:
+        raise Unsupported(f"BMM with inputs of shape {x.get_size()} and {y.get_size()}")
 
     result.realize()
     return result
