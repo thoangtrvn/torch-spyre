@@ -382,6 +382,9 @@ android/pytorch_android_torchvision/.cxx
 .stable_pyre_client
 .pyre_client
 
+# Claude Code
+.claude/
+
 # codegen outputs
 codegen/outputs
 torch_spyre/csrc/external
