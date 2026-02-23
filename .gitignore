@@ -384,6 +384,7 @@ android/pytorch_android_torchvision/.cxx
 
 # Claude Code
 .claude/
+.bobmodes
 
 # codegen outputs
 codegen/outputs
