@@ -41,6 +41,7 @@
 #include "logging.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
+#include "spyre_stream.h"
 #include "spyre_views.h"
 #include "types_mapping.h"
 
@@ -234,8 +235,14 @@ DataFormats get_device_dtype(c10::ScalarType torch_dtype) {
   return sen_dtype_dev;
 }
 
+// TODO(tmhoangt): add real code
+int device_count() {
+  return 1;
+}
+
 }  // namespace spyre
 
+namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
@@ -301,4 +308,37 @@ PYBIND11_MODULE(_C, m) {
         "Enable/disable downcast warnings for this process.");
   m.def("get_elem_in_stick", &spyre::get_elem_in_stick);
   m.def("get_device_dtype", &spyre::get_device_dtype);
+
+  // Stream management functions
+  m.def("_spyre_getStreamFromPool", &spyre::getStreamFromPool,
+        py::arg("device"), py::arg("priority") = 0,
+        "Get a stream from the pool with specified device and priority");
+
+  m.def("_spyre_getCurrentStream", &spyre::getCurrentStream, py::arg("device"),
+        "Get the current stream for a device");
+
+  m.def("_spyre_setCurrentStream", &spyre::setCurrentStream, py::arg("stream"),
+        "Set the current stream and return the previous one");
+
+  m.def("_spyre_getDefaultStream", &spyre::getDefaultStream, py::arg("device"),
+        "Get the default stream for a device");
+
+  m.def("_spyre_synchronize", &spyre::synchronizeDevice,
+        py::arg("device") = py::none(), "Synchronize a device or all devices");
+
+  // Expose SpyreStream class to Python
+  py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
+      .def("synchronize", &spyre::SpyreStream::synchronize,
+           "Wait for all operations on this stream to complete")
+      .def("query", &spyre::SpyreStream::query,
+           "Check if all operations on this stream have completed")
+      .def("device", &spyre::SpyreStream::device,
+           "Get the device associated with this stream")
+      .def("id", &spyre::SpyreStream::id, "Get the stream ID")
+      .def("priority", &spyre::SpyreStream::priority, "Get the stream priority")
+      .def("__repr__", [](const spyre::SpyreStream &stream) {
+        return "<torch_spyre.Stream device=" +
+               std::to_string(stream.device().index()) +
+               " id=" + std::to_string(stream.id()) + ">";
+      });
 }

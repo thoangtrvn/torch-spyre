@@ -21,14 +21,16 @@
 
 #include <flex/stream_handle.hpp>
 
+#include "module.h"
+
 namespace spyre {
-struct data_conversion_info;
 class SpyreStream {
  private:
   c10::Stream stream_;
 
  public:
   explicit SpyreStream(c10::Stream stream);
+  SpyreStream();
 
   c10::StreamId id() const;
   c10::Device device() const;
@@ -45,8 +47,10 @@ class SpyreStream {
 
  private:
   flex::StreamHandle get_flex_handle() const;
-  void copy_async_impl(void* cpu_ptr, void* device_owner, int device_id,
-                       const data_conversion_info& dci, bool host2device) const;
+  void copy_async_impl(void* cpu_ptr,
+                       flex::DeviceMemoryAllocationPtr& device_allocation,
+                       int device_id, const DataConversionInfo& dci,
+                       bool host2device) const;
 };
 
 /**
@@ -88,5 +92,7 @@ SpyreStream getCurrentStream(
  * @return The previous current stream
  */
 SpyreStream setCurrentStream(SpyreStream stream);
+
+void synchronizeDevice(c10::optional<c10::Device> device);
 
 }  // namespace spyre

@@ -18,9 +18,13 @@
 
 #include <pybind11/pybind11.h>
 #include <torch/csrc/utils/pybind.h>
+#include <util/sen_host_ops.h>
 
 #include <flex/runtime.hpp>
 #include <memory>
+
+using DataConversionStrideInfo = data_conversion_stride_info;
+using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
@@ -52,5 +56,6 @@ class GlobalRuntime {
   }
 };
 bool get_downcast_warn_enabled();
+int device_count();
 
 }  // namespace spyre

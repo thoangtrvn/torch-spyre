@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include "module.h"
+
 namespace spyre {
 
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
@@ -51,4 +53,6 @@ at::Tensor as_strided_with_layout(const at::Tensor& self, c10::IntArrayRef size,
                                   std::optional<int64_t> storage_offset_,
                                   SpyreTensorLayout device_layout);
 
+auto generate_dci_(const at::Tensor* tensor, SpyreTensorLayout stl,
+                   bool host2device) -> DataConversionInfo;
 }  // namespace spyre

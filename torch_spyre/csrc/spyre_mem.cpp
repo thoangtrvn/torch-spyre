@@ -42,16 +42,14 @@
 
 #include "logging.h"
 #include "module.h"
+#include "spyre_allocator.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_storage_impl.h"
-#include "spyre_stream.hpp"
+#include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 #include "types_mapping.h"
 
 namespace spyre {
-
-using DataConversionStrideInfo = data_conversion_stride_info;
-using DataConversionInfo = data_conversion_info;
 
 /*
  * CPU stride for a dimension.
@@ -267,78 +265,6 @@ auto generate_dci(const at::Tensor* tensor, SpyreTensorLayout stl,
   return s.str();
 }
 
-// A custom allocator for our custom device, what returns is a handle to the
-// allocated memory not the actual pointer
-struct SpyreAllocator final : public at::Allocator {
- private:
-  SpyreAllocator() = default;
-  flex::DeviceMemoryAllocatorPtr getAllocator(unsigned int dev_id) {
-    return GlobalRuntime::get()
-        ->GetDeviceHandle(dev_id)
-        ->GetDeviceMemoryAllocator();
-  }
-
- public:
-  static SpyreAllocator& instance() {
-    static SpyreAllocator allocator;
-    return allocator;
-  }
-
-  at::DataPtr allocate(size_t nbytes) override {
-    c10::Device curr_device =
-        c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
-            ->getDevice();
-
-    auto device_id = curr_device.index();
-    DEBUGINFO("allocating ", nbytes, " (bytes) on Spyre", curr_device);
-    if (nbytes <= 0) {
-      return {nullptr, nullptr, &ReportAndDelete, curr_device};
-    }
-    auto allocator = getAllocator(device_id);
-    flex::DeviceMemoryAllocationPtr data;  // a smart-pointer object
-    // NOTE: last argument should be set to 0
-    allocator->TryAllocate(&data, nbytes, 0);
-    TORCH_CHECK(data, "Failed to allocate ", nbytes, " bytes on Spyre device.");
-    auto* ctx = new SharedOwnerCtx{std::move(data), device_id};
-    void* ctx_void = static_cast<void*>(ctx);
-
-    void* data_void = static_cast<void*>(ctx->owner.get());
-
-    auto data_ptr_result =
-        at::DataPtr(data_void, ctx_void, &ReportAndDelete, curr_device);
-
-    return data_ptr_result;
-  }
-
-  static void ReportAndDelete(void* ctx_void) {
-    if (!ctx_void) {
-      return;
-    }
-    auto* ctx = static_cast<SharedOwnerCtx*>(ctx_void);
-    delete ctx;
-  }
-
-  // The raw deleter only gets passed the data ptr, no context, so
-  // it would not work right now. To implement this, we first need to
-  // create a runtime interface that can correctly free an allocation
-  // only based on the data ptr, without the allocation idx from the
-  // context
-  at::DeleterFnPtr raw_deleter() const override {
-    return nullptr;
-  }
-
-  void copy_data(void* dest, const void* src, std::size_t count) const final {
-    py::gil_scoped_acquire acquire;
-    DEBUGINFO("entering allocator->copy_data method");
-    // do nothing -- look into when this is called
-    // spyre_copy_from(reinterpret_cast<spyre_ptr_t>(dest),
-    // reinterpret_cast<spyre_ptr_t>(src));
-  }
-};
-
-// Register our custom allocator
-REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &SpyreAllocator::instance());
-
 // Empty op needs C++ code and cannot be handled by python side fallback
 at::Tensor spyre_empty(c10::IntArrayRef size,
                        std::optional<c10::ScalarType> dtype_opt,
@@ -478,15 +404,6 @@ at::Tensor& spyre_set_storage(at::Tensor& result, at::Storage storage,
  */
 at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking) {
-  DEBUGINFO("self (", self.scalar_type(), ") is on:", self.device());
-  DEBUGINFO("dst (", dst.scalar_type(), ") on:", dst.device());
-  at::Storage source_storage;
-  at::Storage dest_storage;
-
-  // TODO(tmhoangt): add type conversion node
-  TORCH_CHECK(
-      self.scalar_type() == dst.scalar_type(),
-      "Spyre backend does not support type conversion yet during copy.");
   SpyreStream stream;
   if (dst.is_privateuseone()) {
     stream = getCurrentStream(dst.device());
