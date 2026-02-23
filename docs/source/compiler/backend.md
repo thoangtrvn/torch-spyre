@@ -39,5 +39,5 @@ Inductor's standard compilation cache.
 
 - [Inductor Front-End](inductor_frontend.md) — how the front-end
   generates SuperDSC
-- [Dataflow Architecture](../overview/dataflow_architecture.md) — the
+- [Dataflow Architecture](../architecture/dataflow_architecture.md) — the
   hardware model that DeepTools targets

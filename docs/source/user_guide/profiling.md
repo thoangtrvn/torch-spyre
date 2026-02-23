@@ -37,5 +37,5 @@ print(prof.key_averages().table(sort_by="cpu_time_total"))
 
 ## See Also
 
-- [Running Models](../user_guide/running_models.md)
+- [Running Models](running_models.md)
 - [Compiler Architecture](../compiler/architecture.md)

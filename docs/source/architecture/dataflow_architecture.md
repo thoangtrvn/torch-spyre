@@ -75,10 +75,10 @@ their core ID.
 
 :::{figure} ../_static/images/spyre-core-microarchitecture.png
 :alt: Spyre core microarchitecture showing PT units, PE, SFP, LX Scratchpad, and HBM
-:width: 85%
+:width: 50%
 :align: center
 
-Spyre core microarchitecture. An array of Processing Threads (PT) feeds through a Processing Element (PE) and Special Function Processor (SFP). Computed data is staged in fast on-core **LX Scratchpad** memory; the **HBM** (High-Bandwidth Memory) sits below and is the primary bandwidth bottleneck. Custom kernels can optimize tiling, fusion, and LX usage to reduce HBM pressure. *Source: Torch-Spyre contributor presentation.*
+Spyre core microarchitecture. An array of Processing Threads (PT) feeds through a Processing Element (PE) and Special Function Processor (SFP). Computed data is staged in fast on-core **LX Scratchpad** memory; the **HBM** (High-Bandwidth Memory) sits below and is the primary bandwidth bottleneck. Custom kernels can optimize tiling, fusion, and LX usage to reduce HBM pressure. 
 :::
 
 ## Comparison with GPU Execution

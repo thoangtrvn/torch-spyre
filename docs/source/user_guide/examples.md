@@ -42,4 +42,4 @@ print(output.cpu())
 ## See Also
 
 - [Quickstart](../getting_started/quickstart.md)
-- [Running Models](../user_guide/running_models.md)
+- [Running Models](running_models.md)

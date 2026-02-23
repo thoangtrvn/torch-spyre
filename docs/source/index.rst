@@ -9,57 +9,20 @@ It enables standard PyTorch models to run on the Spyre device with full
 ``torch.compile`` support via a custom Inductor backend.
 
 .. toctree::
-   :maxdepth: 1
-   :caption: Spyre Accelerator Overview
-
-   overview/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Getting Started
+   :caption: For Users
+   :maxdepth: 3
 
    getting_started/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: User Guide
-
    user_guide/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Compiler Stack
-
-   compiler/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Runtime
-
-   runtime/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Profiling
-
-   profiling/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Examples
-
-   examples/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: API Reference
-
    api/index
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Contributing
+   :caption: For Developers
+   :maxdepth: 3
 
+   architecture/index
+   compiler/index
+   runtime/index
    contributing/index
 
 Indices and tables

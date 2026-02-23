@@ -20,7 +20,7 @@ executable programs binaries.
 
 :::{figure} ../_static/images/spyre-sw-stack.png
 :alt: Full Spyre software stack from PyTorch to Spyre binary
-:width: 100%
+:width: 35%
 :align: center
 
 The full Spyre software stack. PyTorch programs pass through Dynamo/Autograd to produce an FX graph, which Torch Inductor lowers to Loop-Level IR. The Torch-Spyre front-end (green) generates SuperDSCs and host code; the DeepTools back-end (blue) compiles these into Spyre program binaries. *Source: Torch-Spyre contributor presentation.*
