@@ -2,7 +2,7 @@
 
 In this document we discuss the rationale for Spyre tensor layouts, the
 specifics, and their relationship with PyTorch tensor layouts. This document
-complements the [Tiled Tensor RFC](../RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md)
+complements the [Tiled Tensor RFC](https://github.com/torch-spyre/torch-spyre/blob/main/RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md)
 by describing the specific device memory layouts and related APIs used for Tensors in Torch-Spyre.
 
 ## PyTorch Tensor Layouts
@@ -22,6 +22,14 @@ offset, hence to order the tensor elements in a 1d contiguous memory space.
 ```
 offset = lambda coordinates : np.dot(coordinates, stride)
 ```
+
+:::{figure} ../_static/images/tensor-host-layout.png
+:alt: PyTorch tensor host memory layout
+:width: 680px
+:align: center
+
+Host (CPU) memory layout of a 2D PyTorch tensor: elements are stored in row-major order, with rows of each colour placed consecutively in a flat 1D address space. *Source: [Tiled Tensor RFC](https://github.com/torch-spyre/torch-spyre/blob/main/RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md).*
+:::
 
 ## Motivation for Spyre Tensor Layouts
 
@@ -59,6 +67,14 @@ the sparse tensor has a single element of the corresponding PyTorch tensor per
 stick.
 
 ## Spyre Tensor Layouts
+
+:::{figure} ../_static/images/tensor-logical-view.png
+:alt: Spyre tiled tensor logical view
+:width: 680px
+:align: center
+
+Logical (2D) view of a Spyre tiled tensor. Each row is a distinct colour; each cell represents a stick-sized chunk of 64 elements. The device layout breaks the flat PyTorch tensor into a 2D grid of tiles. *Source: [Tiled Tensor RFC](https://github.com/torch-spyre/torch-spyre/blob/main/RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md).*
+:::
 
 A Spyre tensor has a Spyre tensor layout in addition to a PyTorch tensor layout.
 While the PyTorch layout of a tensor may or may not be described in canonical
@@ -110,15 +126,68 @@ The stride of the PyTorch layout does not play a role when mapping Spyre
 coordinates to PyTorch coordinates but of course it matters to mapping the
 PyTorch coordinates to an offset from the base address of the PyTorch tensor.
 
+:::{figure} ../_static/images/tensor-device-layout.png
+:alt: Spyre tensor device memory layout
+:width: 680px
+:align: center
+
+Device (DDR) memory layout of the same tiled tensor. Sticks are stored in device-rank row-major order: all sticks from the first tile row appear before sticks from the second, enabling efficient DMA transfers of contiguous tile slices. *Source: [Tiled Tensor RFC](https://github.com/torch-spyre/torch-spyre/blob/main/RFCs/0047-TiledTensors/0047-TiledTensorsRFC.md).*
+:::
+
 Dimensions in device_size may be padded. For example the previous Spyre tensor
 layout with dim_map `[1, 2, 0, 2]` and device_size `[256, 8, 128, 64]` may also
 be used for a PyTorch tensor of size `[100, 200, 500]` in which case coordinates
 in the Spyre tensor layout that do not map to valid coordinates in the PyTorch
 tensor layout represent padding.
 
-## Access patterns
+## DMA Encoding
 
-- Dividing tensor access across cores
+To transfer a tensor between host (CPU) memory and device (DDR) memory,
+the runtime needs a precise mapping between the two layouts. This mapping
+is encoded as three tuples of `N+k` integers, where `N` is the PyTorch
+rank and `k` is the number of tiling dimensions:
+
+| Tuple | Description |
+|-------|-------------|
+| **loop ranges** | The size of each loop in the DMA nest |
+| **host strides** | Stride in host memory for each loop index |
+| **device strides** | Stride in device memory for each loop index |
+
+By convention, tuples are ordered in decreasing device-stride order.
+
+As a concrete example, a 2D row-major `float16` tensor of size `(1024, 256)`:
+- Each stick holds 64 `float16` values (128 bytes)
+- The 256-element rows tile into 4 sticks
+- Host strides: `(256, 1)`; device strides: `(64, 1)` within tiles
+
+The DMA specification for this tensor is:
+`((4, 1024, 64), (65536, 64, 1), (64, 256, 1))`, corresponding to:
+
+```
+for i in range(4):       # 4 tiles per row
+  for j in range(1024):  # 1024 rows
+    for k in range(64):  # 64 elements per stick
+      device[i*65536 + j*64 + k] = host[j*256 + i*64 + k]
+```
+
+These DCI (Data Copy Instruction) specs are generated automatically by
+the compiler from the `SpyreTensorLayout` stored in `SpyreTensorImpl`.
+
+## Access Patterns
+
+Each Spyre core processes a **tile** — a contiguous slice of device
+memory. The compiler divides tensor access across cores in SPMD
+(Single Program, Multiple Data) fashion: all cores run the same program
+but on different tile ranges identified by their core ID.
+
+Key access pattern properties:
+- Sticks belonging to the same tile are **stored contiguously** in
+  device memory, enabling efficient bulk DMA loads
+- Memory access requests are limited in Spyre, so contiguous stick
+  layout is required for full bandwidth utilization
+- The work division pass (see
+  [Work Division Planning](../compiler/work_division_planning.md))
+  determines the tile-to-core assignment
 
 ## Default Layouts and Controlling Layouts
 
@@ -139,7 +208,7 @@ along the first dimension, and (c) pads the size of the stick dimension
 to make it evenly divisible into sticks.
 
 ### Default Layout Example
-The layout metadata is encoded by the runtime C++ class `SpyreTensorLayout` (see [spyre_tensor_impl.h](../torch_spyre/csrc/spyre_tensor_impl.h)).
+The layout metadata is encoded by the runtime C++ class `SpyreTensorLayout` (see [spyre_tensor_impl.h](https://github.com/torch-spyre/torch-spyre/blob/main/torch_spyre/csrc/spyre_tensor_impl.h)).
 An instance of this class is embedded as a field in the `SpyreTensorImpl` class.
 It can be accessed in Python via an added Tensor method `device_tensor_layout()`.
 The key elements of metadata are:
@@ -209,11 +278,46 @@ SpyreTensorLayout(device_size=[5, 3, 100, 64], dim_map =[0, 2, 1, 2], device_dty
 
 ## Layout Compatibility
 
-- Operation validation and layouts for computed tensors
+Spyre operations impose **hard constraints** on the memory layout of
+their inputs and outputs. The compiler enforces these during the
+stickification pass:
+
+- Operations such as dot product require both inputs to have **identical
+  memory layouts**.
+- Reduction operations along the stick dimension produce **sparse
+  tensors** — outputs containing a single element per stick.
+- The compiler performs a topological traversal of the scheduler graph,
+  propagating layout constraints from inputs outward and raising a
+  compile-time error if an infeasible layout is detected.
+
+Layouts for computed tensors (`ComputedBuffers`) are derived via
+`FixedTiledLayout` — a Torch-Spyre extension to Inductor's
+`FixedLayout` that adds a `device_layout` field containing the
+`SpyreTensorLayout`. This allows Inductor's memory planner and code
+generator to use accurate on-device sizes when allocating intermediate
+buffers and generating host code.
+
+The stickification pass inserts `restickify` operations where needed to
+reconcile incompatible layouts between adjacent operations.
 
 ## Generating DCIs and SuperDSCs
 
-TODO
+For each `torch.compile`d function, the front-end compiler generates:
+
+1. **DCI (Data Copy Instructions)** — host code for DMA transfers that
+   move tensor tiles between host memory and device DDR. These are
+   derived directly from the `SpyreTensorLayout` of each graph input
+   and output.
+
+2. **SuperDSC JSON** — the per-kernel specification passed to the
+   DeepTools back-end compiler. Each SuperDSC encodes the op name,
+   input/output tensor layouts (device sizes, dim maps, dtypes), work
+   division, and scratchpad allocations.
+
+The code generator uses `FixedTiledLayout` to determine accurate device
+tensor sizes for memory allocation calls in the host code, and to
+generate optimized kernel loop nests that match the device's tiled
+access pattern.
 
 ## Future Extensions
 

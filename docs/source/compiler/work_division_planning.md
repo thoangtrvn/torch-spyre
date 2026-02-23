@@ -118,4 +118,4 @@ Potential enhancements to work division planning include:
 ## See Also
 
 - [Work Division Code Generation](work_division_codegen.md) - How division plans are translated to executable code
-- [Tensor Layouts](tensor_layouts.md) - Understanding device layouts and dimensions
+- [Tensor Layouts](../user_guide/tensors_and_layouts.md) - Understanding device layouts and dimensions
