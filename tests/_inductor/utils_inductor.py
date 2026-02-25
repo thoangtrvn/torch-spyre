@@ -202,25 +202,38 @@ def _assert_results_close(actual, expected, atol, rtol, comparison_name):
     )
 
 
+# Compare functions
+# The compare functions would compile the function with torch-spyre and
+# assign the result of excuting the compiled function to `target` for comparison
+# if `target` is not set by the caller. Otherwise, the target tensor is used
+# in the comparisons.
+
+
 def compare_with_cpu(
-    fn, *args, atol=0.1, rtol=0.1, needs_device=False, cpu_compile=True
+    fn,
+    *args,
+    atol=0.1,
+    rtol=0.1,
+    needs_device=False,
+    cpu_compile=True,
+    target=None,
 ):
     """Compare compiled Spyre execution against uncompiled (and optionally compiled) CPU execution."""
     cpu_result = fn(*args)
-    spyre_compiled_result = _compile_and_run(
-        fn, args, DEVICE, needs_device=needs_device
-    )
 
-    _assert_results_close(
-        spyre_compiled_result, cpu_result, atol, rtol, "compiled spyre <-> cpu"
-    )
+    # compiled spyre execution
+    if target is None:
+        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
 
+    _assert_results_close(target, cpu_result, atol, rtol, "compiled spyre <-> cpu")
+
+    # compiled cpu execution
     if cpu_compile:
         cpu_compiled_result = _compile_and_run(
             fn, args, "cpu", needs_device=needs_device
         )
         _assert_results_close(
-            spyre_compiled_result,
+            target,
             cpu_compiled_result,
             atol,
             rtol,
@@ -228,28 +241,42 @@ def compare_with_cpu(
         )
 
 
-def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
+def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1, target=None):
     """Compare compiled Spyre function against uncompiled PyTorch reference function."""
-    result = _compile_and_run(fn, args, DEVICE)
+    if target is None:
+        target = _compile_and_run(fn, args, DEVICE)
     pytorch_result = fn_pytorch(*args)
-    _assert_results_close(result, pytorch_result, atol, rtol, "pytorch")
+    _assert_results_close(target, pytorch_result, atol, rtol, "pytorch")
 
 
-def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False):
+def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0, needs_device=False, target=None):
     """Compare compiled Spyre execution against sendnn backend execution."""
-    result = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
+    if target is None:
+        target = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
     sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(result, sendnn_result, atol, rtol, "sendnn")
+    _assert_results_close(target, sendnn_result, atol, rtol, "sendnn")
 
 
 def compare(
     fn, *args, atol=0.0, rtol=0.0, cpu_atol=0.1, cpu_rtol=0.1, needs_device=False
 ):
     """3-way comparison: compiled Spyre vs uncompiled CPU vs sendnn backend."""
-    result = _compile_and_run(fn, args, DEVICE, needs_device=needs_device)
-
-    cpu_result = fn(*args)
-    _assert_results_close(result, cpu_result, cpu_atol, cpu_rtol, "cpu")
-
-    sendnn_result = _compile_and_run(fn, args, "cpu", backend="sendnn")
-    _assert_results_close(result, sendnn_result, atol, rtol, "sendnn")
+    spyre_compiled_result = _compile_and_run(
+        fn, args, DEVICE, needs_device=needs_device
+    )
+    compare_with_cpu(
+        fn,
+        *args,
+        atol=cpu_atol,
+        rtol=cpu_rtol,
+        needs_device=needs_device,
+        target=spyre_compiled_result,
+    )
+    compare_with_sendnn(
+        fn,
+        *args,
+        atol=atol,
+        rtol=rtol,
+        needs_device=needs_device,
+        target=spyre_compiled_result,
+    )
