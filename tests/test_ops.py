@@ -15,6 +15,7 @@
 # Owner(s): ["module: cpp"]
 
 import pathlib
+import pytest
 import yaml
 import unittest
 
@@ -139,10 +140,10 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("View tensors do not have SpyreTensorImpl")
     def test_t_1d(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
+        assert x_spyre.t().device_tensor_layout() is not None
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
@@ -167,7 +168,6 @@ class TestOps(TestCase):
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Implement permute properly on eager")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -212,6 +212,31 @@ class TestOps(TestCase):
         x_spyre = x.to("spyre")
         y = torch.relu(x_spyre).to("cpu")
         torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
+
+    def test_silu(self):
+        x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.silu(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
+    @unittest.expectedFailure
+    def test_silu_larger_input(self):
+        x = torch.rand([2, 100, 12800], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.silu(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
+        )
+
+    def test_mish(self):
+        x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x_spyre = x.to("spyre")
+        y = torch.nn.functional.mish(x_spyre).to("cpu")
+        torch.testing.assert_close(
+            y, torch.nn.functional.mish(x), rtol=self.rtol, atol=self.atol
+        )
 
     def test_exp(self):
         x = torch.tensor([-10, -1, 0, 1, 10], dtype=self.dtype)
@@ -387,7 +412,63 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: bmm.out not implemented yet in eager")
+    def test_addmm_ab_bc(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        z = torch.addmm(mat_spyre, x_spyre, y_spyre).to("cpu")
+        torch.testing.assert_close(
+            z, torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
+        )
+
+    @unittest.expectedFailure
+    def test_addmm_ab_bc_scaled(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        alpha = 0.5
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        z = torch.addmm(mat_spyre, x_spyre, y_spyre, alpha=alpha).to("cpu")
+        torch.testing.assert_close(
+            z, torch.addmm(mat, x, y, alpha=alpha), rtol=self.rtol, atol=self.atol
+        )
+
+    def test_addmm_ab_bc_out(self):
+        mat = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
+            self.mm_a, self.mm_c
+        )
+        x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
+            self.mm_a, self.mm_b
+        )
+        y = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
+            self.mm_b, self.mm_c
+        )
+        mat_spyre = mat.to("spyre")
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+        out_spyre = torch.empty(self.mm_a, self.mm_c, dtype=self.dtype, device="spyre")
+        torch.addmm(mat_spyre, x_spyre, y_spyre, out=out_spyre)
+        torch.testing.assert_close(
+            out_spyre.to("cpu"), torch.addmm(mat, x, y), rtol=self.rtol, atol=self.atol
+        )
+
     def test_bmm_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -401,7 +482,6 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: bmm.out not implemented yet in eager")
     def test_bmm_cb_ba(self):
         B = 1
         x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
@@ -480,6 +560,17 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
+
+    def test_zeros(self):
+        x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 64, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
+
+    def test_zeros_padded_last_dim(self):
+        # Test zeros with last dimension requiring padding (not 64)
+        x_spyre = torch.zeros(3, 50, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 50, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
 
     # --- View layout: identity ---
 
@@ -637,6 +728,21 @@ class TestOps(TestCase):
         x = torch.rand(512, dtype=self.dtype).to("spyre")
         with self.assertRaisesRegex(RuntimeError, "elems_per_stick"):
             x.view(16, 32)
+
+    # NOTE: embedding / indirect indexing / index_select are not supported yet
+    @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
+    def test_embedding(self):
+        # an embedding matrix containing 10 tensors of size 3
+        embedding_matrix = torch.rand(10, 3, dtype=torch.float16)
+        # a batch of 2 samples of 4 indices each
+        indices = torch.tensor([[1, 2, 4, 5], [4, 3, 2, 9]], dtype=torch.int64)
+        cpu_y = torch.nn.functional.embedding(indices, embedding_matrix)
+
+        embed_spyre = embedding_matrix.to("spyre")
+        indices_spyre = indices.to("spyre")
+        spyre_y = torch.nn.functional.embedding(indices_spyre, embed_spyre).to("cpu")
+
+        torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
