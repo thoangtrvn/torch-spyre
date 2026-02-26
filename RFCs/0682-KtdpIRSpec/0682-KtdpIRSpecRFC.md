@@ -1,4 +1,4 @@
-# Kernel Tile Data Parallel (`ktdp`) Intermediate Representation
+# Kernel Tile Intermediate Representation
 
 **Authors:**
 * @pchath
@@ -16,7 +16,7 @@
 * @vswagath1989
 
 ## **Summary**
-This RFC defines `ktdp` IR, a new interface between compiler frontends (TorchInductor, custom kernels via. Triton, and others) and Spyre compiler backend (Deeptools)
+This RFC defines Kernel Tile Intermediate Representation (KTIR), a new interface between compiler frontends (TorchInductor, custom kernels via. Triton, and others) and Spyre compiler backend (Deeptools)
 
 ## **Motivation**
 Transtion from SuperDSC-bundle into tile-based interface built over open-source MLIR compiler infrastructure. It enables sufficient expressivity to capture data-parallel mappings from: 1) Torch inductor compiler frontend 2) Custom Spyre kernels written in Triton/Helion
@@ -25,36 +25,36 @@ Transtion from SuperDSC-bundle into tile-based interface built over open-source 
 
 ## Introduction
 
-`ktdp` is a tile-based, block-structured intermediate representation (IR) designed to express programs targeting multi-core accelerator architectures. It embodies a data-parallel abstraction of the accelerator shown in Figure 1. The accelerator contains multiple cores, with each core comprising a compute engine and an on-chip scratchpad memory associated with the compute unit. The cores are attached together through an on-chip interconnect fabric, which also interfaces with one or more off-chip memory banks.
+KTIR is a tile-based, block-structured intermediate representation (IR) designed to express programs targeting multi-core accelerator architectures. It embodies a data-parallel abstraction of the accelerator shown in Figure 1. The accelerator contains multiple cores, with each core comprising a compute engine and an on-chip scratchpad memory associated with the compute unit. The cores are attached together through an on-chip interconnect fabric, which also interfaces with one or more off-chip memory banks.
 
 <p align="center">
   <img src="ktdp_hw_abstraction.png" alt="ktdp_hw_abstraction" width="450"/>
 </p>
 <p align="center">
-  Figure 1. Hardware abstraction of multi-core accelerator embodied in `ktdp` IR
+  Figure 1. Hardware abstraction of multi-core accelerator embodied in KTIR
 </p>  
 
-`ktdp` programs allow tensors to be placed in a distributed fashion across multiple memory elements (on-chip and/or off-chip memory). In the same vein, compute operations can be split into compute tiles and assigned to the compute engine within each core. `ktdp` allows each compute tile to have global view of all on-chip and off-chip memory elements via the on-chip interconnect fabric.
+KTIR programs allow tensors to be placed in a distributed fashion across multiple memory elements (on-chip and/or off-chip memory). In the same vein, compute operations can be split into compute tiles and assigned to the compute engine within each core. KTIR allows each compute tile to have global view of all on-chip and off-chip memory elements via the on-chip interconnect fabric.
 
-`ktdp` is built to represent complex computation kernels (e.g., attention in LLMs) mapped onto multi-core accelerators, going beyond a single operation (e.g., tensor Add). Kernels span multiple operations that are composed sequentially, interleaved with structured control-flow such as loops, conditionals, and multi-stage pipelines. `ktdp` includes construts to capture kernel execution semantics including dependencies, synchronization points, and tensor liveliness. Intermediate tensors within the kernel could be placed on on-chip memory elements and reused across producer-consumer operations. With each compute tile having global access to all memory elements, individual compute operations can be flexibly tiled along different dimensions.
+KTIR is built to represent complex computation kernels (e.g., attention in LLMs) mapped onto multi-core accelerators, going beyond a single operation (e.g., tensor Add). Kernels span multiple operations that are composed sequentially, interleaved with structured control-flow such as loops, conditionals, and multi-stage pipelines. KTIR includes construts to capture kernel execution semantics including dependencies, synchronization points, and tensor liveliness. Intermediate tensors within the kernel could be placed on on-chip memory elements and reused across producer-consumer operations. With each compute tile having global access to all memory elements, individual compute operations can be flexibly tiled along different dimensions.
 
-### Who Produces `ktdp` IR?
-`ktdp` is mid-level IR in the compilation pipeline. Starting from a graph-level description or expert-written versions of the kernel, higher-level compiler frameworks (e.g., TorchInductor, Triton) are expected to optimize data-parallel work partitioning and memory management and generate `ktdp` IR. `ktdp` can express the already established parallel decomposition from the front-end compiler and facilitates further optimizations within that decomposition.
+### Who Produces KTIR?
+KTIR is mid-level IR in the compilation pipeline. Starting from a graph-level description or expert-written versions of the kernel, higher-level compiler frameworks (e.g., TorchInductor, Triton) are expected to optimize data-parallel work partitioning and memory management and generate KTIR. It can express the already established parallel decomposition from the front-end compiler and facilitates further optimizations within that decomposition.
 
-#### Who Consumes `ktdp` IR?
-Kernel scheduler operates on `ktdp` programs and performs data-flow scheduling. The scheduler is responsible for efficient data-flow mapping of the kernel onto the hardware preserving correctness.
+#### Who Consumes KTIR?
+Kernel scheduler operates on KTIR programs and performs data-flow scheduling. The scheduler is responsible for efficient data-flow mapping of the kernel onto the hardware preserving correctness.
 
 ## Table of Contents
 
-* [A) Operations in `ktdp` IR](#a-operations-in-ktdp-ir)
+* [A) Operations in KTIR](#a-operations-in-ktdp-ir)
   * [1. Layouts, Access Tiles, Loads, and Stores](#1-layouts-access-tiles-loads-and-stores)
   * [2. Compute Operations](#2-compute-operations)
   * [3. Control-Flow Operations](#3-control-flow-operations)
   * [Overall Design Perspective](#overall-design-perspective)
 
-* [B) Example: Tile-Parallel Matrix Add in `ktdp`](#b-example-tile-parallel-matrix-add-in-ktdp)
+* [B) Example: Tile-Parallel Matrix Add in KTIR](#b-example-tile-parallel-matrix-add-in-ktir)
 
-* [C) Operations within KTDP dialect](#c-operations-within-ktdp-dialect)
+* [C) Operations within `ktdp` dialect](#c-operations-within-ktdp-dialect)
   * [1. `ktdp.get_compute_tile_id`](#1-ktdpget_compute_tile_id-ktdpgetcomputetileid)
   * [2. `ktdp.construct_memory_view`](#2-ktdpconstruct_memory_view-ktdpconstructmemoryviewop)
   * [3. `ktdp.construct_distributed_memory_view`](#3-ktdpconstruct_distributed_memory_view-ktdpconstructdistributedmemoryviewop)
@@ -63,20 +63,20 @@ Kernel scheduler operates on `ktdp` programs and performs data-flow scheduling. 
   * [6. `ktdp.load`](#6-ktdpload-ktdploadop)
   * [7. `ktdp.store`](#7-ktdpstore-ktdpstoreop)
 
-* [D) Types within KTDP dialect](#d-types-within-ktdp-dialect)
+* [D) Types within `ktdp` dialect](#d-types-within-ktdp-dialect)
   * [1. AccessTileType](#1-accesstiletype)
 
-* [E) Attributes within KTDP dialect](#e-attributes-within-ktdp-dialect)
+* [E) Attributes within `ktdp` dialect](#e-attributes-within-ktdp-dialect)
   * [1. SpyreMemorySpaceAttr](#1-spyrememoryspaceattr)
   
-## A) Operations in `ktdp` IR
-The operations within `ktdp` IR can be organized into several functional categories, reflecting the different roles they play in expressing kernel semantics and execution structure.
+## A) Operations in KTIR
+The operations within KTIR can be organized into several functional categories, reflecting the different roles they play in expressing kernel semantics and execution structure.
 
 ### 1. Layouts, Access Tiles, Loads, and Stores
-`ktdp` IR introduces a dedicated dialect named KTDP to model all memory-view and access–related abstractions. This dialect provides operations for describing layouts that define logical views over memory regions allocated in specific memory spaces, constructing distributed memory or tensor views that span multiple physical memories, and representing access tiles that encode structured collections of logical tensor coordinates. It also includes the corresponding load and store primitives that consume these access tiles to perform explicit data movement. Together, these operations make memory, locality, and access patterns first-class entities in the IR.
+KTIR introduces a dedicated dialect named `ktdp` to model all memory-view and access–related abstractions. This dialect provides operations for describing layouts that define logical views over memory regions allocated in specific memory spaces, constructing distributed memory or tensor views that span multiple physical memories, and representing access tiles that encode structured collections of logical tensor coordinates. It also includes the corresponding load and store primitives that consume these access tiles to perform explicit data movement. Together, these operations make memory, locality, and access patterns first-class entities in the IR.
 
 ### 2. Compute Operations
-For arithmetic and numerical computation, `ktdp` reuses operations from existing MLIR dialects such as Arith, Math, and LinAlg. These dialects already provide a rich set of well-defined semantics for scalar, vector, and tensor computation. When kernel-specific functionality is required that is not directly expressible using the standard dialect operations, `ktdp` extends them in a disciplined manner through auxiliary variants (e.g., suffixed with _Ext).
+For arithmetic and numerical computation, KTIR reuses operations from existing MLIR dialects such as Arith, Math, and LinAlg. These dialects already provide a rich set of well-defined semantics for scalar, vector, and tensor computation. When kernel-specific functionality is required that is not directly expressible using the standard dialect operations, KTIR extends them in a disciplined manner through auxiliary variants (e.g., suffixed with _Ext).
 
 Arith dialect - https://mlir.llvm.org/docs/Dialects/ArithOps/
 
@@ -85,16 +85,16 @@ Math dialect - https://mlir.llvm.org/docs/Dialects/MathOps/
 LinAlg dialect - https://mlir.llvm.org/docs/Dialects/Linalg/
 
 ### 3. Control-Flow Operations
-Structured control flow in `ktdp` is represented using operations borrowed from MLIR’s SCF dialect, which supports constructs such as conditionals, loops having region-based iterations with explicit loop-carried variables. This allows `ktdp` programs to describe complex kernel, including multi-stage pipelines, conditional execution paths, and iterative computations, while retaining analyzable structure for optimization and scheduling.
+Structured control flow in KTIR is represented using operations borrowed from MLIR’s SCF dialect, which supports constructs such as conditionals, loops having region-based iterations with explicit loop-carried variables. This allows KTIR programs to describe complex kernel, including multi-stage pipelines, conditional execution paths, and iterative computations, while retaining analyzable structure for optimization and scheduling.
 
 SCF dialect - https://mlir.llvm.org/docs/Dialects/SCFDialect/
 
 ### Overall Design Perspective
-In summary, `ktdp` is a compositional IR that integrates established MLIR dialects—such as Arith, Math, LinAlg, MemRef, and SCF—for computation, memory representation, and control flow, while introducing the KTDP dialect to capture specialized abstractions for layouts, distributed views, access tiles, and explicit memory accesses. This multi-dialect design enables `ktdp` to leverage existing MLIR infrastructure and optimizations while providing the domain-specific constructs required to model tile-level execution on data-parallel accelerator architectures with distributed scratchpads and global memory.
+In summary, KTIR is a compositional IR that integrates established MLIR dialects—such as Arith, Math, LinAlg, MemRef, and SCF—for computation, memory representation, and control flow, while introducing the `ktdp` dialect to capture specialized abstractions for layouts, distributed views, access tiles, and explicit memory accesses. This multi-dialect design enables KTIR to leverage existing MLIR infrastructure and optimizations while providing the domain-specific constructs required to model tile-level execution on data-parallel accelerator architectures with distributed scratchpads and global memory.
 
-## B) Example: Tile-Parallel Matrix Add in `ktdp`
+## B) Example: Tile-Parallel Matrix Add in KTIR
 
-This example demonstrates how `ktdp` operations express a data-parallel tensor addition kernel executing across multiple compute tiles over an accelerator.
+This example demonstrates how KTIR operations express a data-parallel tensor addition kernel executing across multiple compute tiles over an accelerator.
 
 ```mlir
 
@@ -169,11 +169,11 @@ module {
 
 ```
 
-The above IR implements a tile-parallel elementwise addition kernel using KTDP dialect's memory and access abstractions combined with standard MLIR's compute and control-flow dialects. It operates on three tensors—A, B, and C—each of size 96×64 with FP16 elements stored in HBM memory. The computation is distributed across 32 compute tiles, corresponding to the available cores, where each tile is responsible for processing a distinct 3×64 slice of the tensors. This partitioning ensures that the workload is evenly divided and that each tile works on a non-overlapping region, enabling parallel execution without synchronization conflicts.
+The above IR implements a tile-parallel elementwise addition kernel using `ktdp` dialect's memory and access abstractions combined with standard MLIR's compute and control-flow dialects. It operates on three tensors—A, B, and C—each of size 96×64 with FP16 elements stored in HBM memory. The computation is distributed across 32 compute tiles, corresponding to the available cores, where each tile is responsible for processing a distinct 3×64 slice of the tensors. This partitioning ensures that the workload is evenly divided and that each tile works on a non-overlapping region, enabling parallel execution without synchronization conflicts.
 
 At the start of execution, each compute tile determines its identity using the `ktdp.get_compute_tile_id` operation. This ID is used to compute the starting row of the tile’s assigned region by multiplying it with the tile height (3 rows). This establishes a deterministic mapping from tiles to data regions and reflects `ktdp`’s design principle that work partitioning is decided prior to scheduling. Consequently, the IR assumes that decomposition is already fixed and focuses solely on expressing how each tile should execute its portion efficiently.
 
-The program then constructs logical memory views for tensors A, B, and C using `ktdp.construct_memory_view`. These operations interpret raw memory addresses as structured tensors by specifying sizes, strides, and coordinate bounds. They do not allocate or move data; instead, they define how the underlying memory should be viewed. This separation between memory interpretation and data movement is a key KTDP abstraction that allows the compiler to reason precisely about layout, locality, and address computation.
+The program then constructs logical memory views for tensors A, B, and C using `ktdp.construct_memory_view`. These operations interpret raw memory addresses as structured tensors by specifying sizes, strides, and coordinate bounds. They do not allocate or move data; instead, they define how the underlying memory should be viewed. This separation between memory interpretation and data movement is a key `ktdp` abstraction that allows the compiler to reason precisely about layout, locality, and address computation.
 
 Within each tile, a loop iterates over the three rows assigned to that tile. During each iteration, the program constructs access tiles for A and B using `ktdp.construct_access_tile`. These access tiles symbolically describe the coordinates corresponding to a single row slice of width 64. Rather than performing memory reads immediately, the operation produces a structured representation of the coordinates that will be accessed. This explicit representation of access regions enables advanced analyses, scheduling, and transformations before any actual memory traffic occurs.
 
@@ -183,9 +183,9 @@ After computation, another access tile is constructed for tensor C that describe
 
 Overall, this sample IR illustrates `ktdp`’s fundamental design philosophy: computation, memory interpretation, and memory access are represented as separate but composable abstractions. Logical views define how memory is seen, access tiles define data to be accessed, loads and stores perform memory operation, and compute dialects perform arithmetic. Together, these constructs form a tiled data-parallel execution suitable for scheduling and lowering onto spatial accelerators.
 
-The following sections describe the operations and types specific to the KTDP dialect. Operations originating from other dialects are documented in the referenced links above and are not repeated here.
+The following sections describe the operations and types specific to the `ktdp` dialect. Operations originating from other dialects are documented in the referenced links above and are not repeated here.
 
-## C) Operations within KTDP dialect
+## C) Operations within `ktdp` dialect
 
 ### 1. `ktdp.get_compute_tile_id` (ktdp::GetComputeTileId)
 
@@ -421,7 +421,7 @@ for, e.g.,
 
 _Operation to construct access tiles over a tensor or memref objects._
 
-The `ktir.construct_indirect_access_tile` operation constructs an *access tile*
+The `ktdp.construct_indirect_access_tile` operation constructs an *access tile*
 for indirect (a.k.a. gather/scatter-style) indexing into a base memref/tensor.
 
 The operation defines a collection of logical coordinates into `$base` by
@@ -474,7 +474,7 @@ Consider the indirect indexing pattern:
 `Y[m, k] = X[ IDX1[m, k], IDX2[m, k] ]`
 
 ```mlir
-%Y = ktir.construct_indirect_access_tile intermediate_variables (%m, %k) %X[%IDX1[%m, %k], %IDX2[%m, %k]] {
+%Y = ktdp.construct_indirect_access_tile intermediate_variables (%m, %k) %X[%IDX1[%m, %k], %IDX2[%m, %k]] {
           variables_space_set = {(d0, d1) | 0 <= d0 < 2, 0 <= d1 < 64}
         } : memref<64x64xfp16>, memref<64x64xfp16>, memref<64x64xfp16>, !ktdp.tile<64x64xindex>
 ```
@@ -636,7 +636,7 @@ ktdp.store %A_data_tile, %A_access_tile : tensor<32x64xf16>, !ktdp.tile<32x64xin
 [//]: # (### KTDPMemorySpaceAttr)
 
 [//]: # ()
-[//]: # (attributes representing memory spaces in the KTDP IR)
+[//]: # (attributes representing memory spaces in the KTDP)
 
 [//]: # ()
 [//]: # (Syntax:)
@@ -678,7 +678,7 @@ ktdp.store %A_data_tile, %A_access_tile : tensor<32x64xf16>, !ktdp.tile<32x64xin
 [//]: # (### KTDPMemorySpace)
 
 [//]: # ()
-[//]: # (attributes representing memory spaces in the KTDP IR)
+[//]: # (attributes representing memory spaces in the KTDP)
 
 [//]: # ()
 [//]: # (#### Cases:)
@@ -696,7 +696,7 @@ ktdp.store %A_data_tile, %A_access_tile : tensor<32x64xf16>, !ktdp.tile<32x64xin
 
 [//]: # ()
 
-## D) Types within KTDP dialect
+## D) Types within `ktdp` dialect
 
 ### 1. AccessTileType
 
@@ -711,7 +711,7 @@ dimension ::= `?` | decimal-literal
 ```
 
 The tile type is similar to the builtin ranked tensor type but is specific
-to the KTDP dialect. It represents aggregate N-dimensional data values with
+to the `ktdp` dialect. It represents aggregate N-dimensional data values with
 a fixed rank with a list of dimensions. Each dimension may be a static
 non-negative decimal constant or be dynamically determined (indicated by `?`).
 
@@ -745,7 +745,7 @@ tile<0 x 42 x index>
 | shape | `::llvm::ArrayRef<int64_t>` |  |
 | elementType | `Type` |  |
 
-## E) Attributes within KTDP dialect
+## E) Attributes within `ktdp` dialect
 
 ### 1. SpyreMemorySpaceAttr
 
