@@ -143,6 +143,30 @@ def make_spyre_module() -> types.ModuleType:
             impl._lazy_init()
         if hasattr(impl._C, name):
             return getattr(impl._C, name)
+        if name in {
+            "Stream",
+            "stream",
+            "current_stream",
+            "default_stream",
+            "synchronize",
+        }:
+            impl._lazy_init()
+            from torch_spyre.streams import (
+                Stream,
+                stream,
+                current_stream,
+                default_stream,
+                synchronize,
+            )
+
+            streams_map = {
+                "Stream": Stream,
+                "stream": stream,
+                "current_stream": current_stream,
+                "default_stream": default_stream,
+                "synchronize": synchronize,
+            }
+            return streams_map[name]
         raise AttributeError(name)
 
     mod.__getattr__ = __getattr__

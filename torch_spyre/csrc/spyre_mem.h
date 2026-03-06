@@ -19,6 +19,8 @@
 #include <ATen/ATen.h>
 #include <c10/util/intrusive_ptr.h>
 
+#include "module.h"
+
 namespace spyre {
 
 at::Tensor spyre_empty_strided(c10::IntArrayRef size, c10::IntArrayRef stride,
