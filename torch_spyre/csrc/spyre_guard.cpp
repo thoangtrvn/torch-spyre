@@ -55,7 +55,7 @@ c10::Stream SpyreGuardImpl::getStream(c10::Device device) const {
 
 c10::Stream SpyreGuardImpl::getNewStream(c10::Device device,
                                          int priority) const {
-  return getStreamFromPool(device, priority);
+  return getStreamFromPool(device, priority).unwrap();
 }
 
 void SpyreGuardImpl::synchronizeStream(const c10::Stream& stream) const {
