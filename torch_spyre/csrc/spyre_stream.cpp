@@ -103,13 +103,9 @@ bool SpyreStream::query() const {
   DEBUGINFO("SpyreStream::query() - stream ", id(), " on device ",
             device().index());
 
-  // DEFAULT IMPLEMENTATION: Always return true (assume completed)
-  // TODO(tmhoangt): Query actual stream status from flex runtime
-  // auto runtime = GlobalRuntime::get();
-  // flex::StreamHandle handle = get_flex_handle();
-  // return runtime->query_stream(handle);
-
-  return true;  // Assume all work completed
+  auto runtime = GlobalRuntime::get();
+  flex::StreamHandle handle = get_flex_handle();
+  return runtime->queryStream(handle);
 }
 
 void SpyreStream::synchronize() const {
@@ -118,14 +114,9 @@ void SpyreStream::synchronize() const {
   DEBUGINFO("SpyreStream::synchronize() - stream ", id(), " on device ",
             device().index());
 
-  // DEFAULT IMPLEMENTATION: No-op (synchronous execution)
-  // TODO(tmhoangt): Actually synchronize with flex runtime
-  // auto runtime = GlobalRuntime::get();
-  // flex::StreamHandle handle = get_flex_handle();
-  // runtime->synchronize_stream(handle);
-
-  // TODO(tmhoangt): add code
-  // For now, do nothing (assumes synchronous execution)
+  auto runtime = GlobalRuntime::get();
+  flex::StreamHandle handle = get_flex_handle();
+  runtime->synchronizeStream(handle);
 }
 
 c10::Stream SpyreStream::unwrap() const {
