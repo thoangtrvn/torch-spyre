@@ -246,7 +246,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
     flex::StreamHandle flex_handle =
-        runtime->create_stream(device.index(), priority);
+        runtime->createStream(device.index(), priority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
