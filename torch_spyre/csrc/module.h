@@ -20,13 +20,15 @@
 #include <torch/csrc/utils/pybind.h>
 #include <util/sen_host_ops.h>
 
-#include <flex/runtime.hpp>
+#include <flex/v2/runtime.hpp>
 #include <memory>
 
 using DataConversionStrideInfo = data_conversion_stride_info;
 using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
+
+using Runtime = flex::v2::Runtime;
 
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
@@ -35,14 +37,14 @@ struct SharedOwnerCtx {
 
 class GlobalRuntime {
  public:
-  static void set(const std::shared_ptr<flex::Runtime>& runtime) {
+  static void set(const std::shared_ptr<Runtime>& runtime) {
     instance() = runtime;
   }
   static void reset() {
     instance().reset();  // sets the shared_ptr to nullptr
   }
 
-  static const std::shared_ptr<flex::Runtime>& get() {
+  static const std::shared_ptr<Runtime>& get() {
     return instance();
   }
 
@@ -50,8 +52,8 @@ class GlobalRuntime {
   GlobalRuntime() = delete;
   ~GlobalRuntime() = delete;
 
-  static std::shared_ptr<flex::Runtime>& instance() {
-    static std::shared_ptr<flex::Runtime> s;
+  static std::shared_ptr<Runtime>& instance() {
+    static std::shared_ptr<Runtime> s;
     return s;
   }
 };

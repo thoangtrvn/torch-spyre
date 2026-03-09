@@ -19,7 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
-#include <flex/stream_handle.hpp>
+#include <flex/v2/stream_handle.hpp>
 
 #include "module.h"
 
@@ -44,7 +44,6 @@ class SpyreStream {
   void copy_async(const at::Tensor& src, const at::Tensor& dst) const;
 
   // Conversions
-  operator c10::Stream() const;
   c10::Stream unwrap() const;
 
  private:

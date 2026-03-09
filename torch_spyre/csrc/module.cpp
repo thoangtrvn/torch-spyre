@@ -73,9 +73,9 @@ void _startRuntime() {
   // TODO(tmhoangt): move sendnn::RuntimeInterface to flex to isolate from
   // sendnn
   std::shared_ptr<sendnn::RuntimeInterface> base_runtime;
-  auto s = flex::CreateRuntimeInterface(&base_runtime);
-  std::shared_ptr<flex::Runtime> runtime =
-      std::dynamic_pointer_cast<flex::Runtime>(base_runtime);
+  auto s = flex::CreateRuntimeInterface_v2(&base_runtime);
+  std::shared_ptr<Runtime> runtime =
+      std::dynamic_pointer_cast<Runtime>(base_runtime);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);

@@ -19,7 +19,6 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
-#include <flex/stream_handle.hpp>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +29,38 @@
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
+namespace {
+
+// TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
+// creates/destroys individual streams when asked.
+
+// Global stream pool (shared across all threads)
+struct StreamPool {
+  std::mutex mutex;
+
+  // Per-device stream pools
+  std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
+      low_priority_streams;
+  std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
+      high_priority_streams;
+
+  // Round-robin indices
+  std::unordered_map<c10::DeviceIndex, size_t> next_low_priority_idx;
+  std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
+
+  // Mapping from c10::StreamId to flex::StreamHandle
+  std::unordered_map<c10::StreamId, flex::StreamHandle> stream_handle_map;
+};
+
+StreamPool& getStreamPool() {
+  static StreamPool pool;
+  return pool;
+}
+
+thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
+    current_streams;
+
+}  // anonymous namespace
 
 // Stream pool configuration
 // Per device:
@@ -59,10 +90,8 @@ c10::Device SpyreStream::device() const {
 
 int SpyreStream::priority() const {
   // Determine priority from stream ID
-  if (id() == 0) {
-    return 0;
-  } else if (id() <= kStreamsPerDevice) {
-    return 0;
+  if (id() <= kStreamsPerDevice) {
+    return 0;  // Low priority: stream 0 (default) and streams 1-32
   } else {
     return -1;
   }
@@ -99,10 +128,6 @@ void SpyreStream::synchronize() const {
   // For now, do nothing (assumes synchronous execution)
 }
 
-SpyreStream::operator c10::Stream() const {
-  return stream_;
-}
-
 c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
@@ -112,46 +137,26 @@ void SpyreStream::copy_async(const at::Tensor& src,
   // TODO(tmhoangt): plase-holder to be implemented in the next PR
 }
 
-flex::StreamHandle SpyreStream::get_flex_handle() const {}
+flex::StreamHandle SpyreStream::get_flex_handle() const {
+  auto& pool = getStreamPool();
+  std::lock_guard<std::mutex> lock(pool.mutex);
+
+  // Look up the flex handle using this stream's ID
+  auto it = pool.stream_handle_map.find(id());
+
+  if (it != pool.stream_handle_map.end()) {
+    return it->second;
+  }
+
+  // Default stream (ID 0) returns nullptr
+  return flex::DEFAULT_STREAM;
+}
 
 void SpyreStream::copy_async_impl(
     void* cpu_ptr, flex::DeviceMemoryAllocationPtr& device_allocation,
     int device_id, const DataConversionInfo& dci, bool host2device) const {
   // TODO(tmhoangt): plase-holder to be implemented in the next PR
 }
-
-namespace {
-
-// TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
-// creates/destroys individual streams when asked.
-
-// Global stream pool (shared across all threads)
-struct StreamPool {
-  std::mutex mutex;
-
-  // Per-device stream pools
-  std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
-      low_priority_streams;
-  std::unordered_map<c10::DeviceIndex, std::vector<c10::StreamId>>
-      high_priority_streams;
-
-  // Round-robin indices
-  std::unordered_map<c10::DeviceIndex, size_t> next_low_priority_idx;
-  std::unordered_map<c10::DeviceIndex, size_t> next_high_priority_idx;
-
-  // Mapping from c10::StreamId to flex::StreamHandle
-  std::unordered_map<c10::StreamId, flex::StreamHandle> stream_handle_map;
-};
-
-StreamPool& getStreamPool() {
-  static StreamPool pool;
-  return pool;
-}
-
-thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
-    current_streams;
-
-}  // anonymous namespace
 
 void initializeStreamPool(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
