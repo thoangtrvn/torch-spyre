@@ -50,6 +50,9 @@ struct StreamPool {
 
   // Mapping from c10::StreamId to flex::StreamHandle
   std::unordered_map<c10::StreamId, flex::StreamHandle> stream_handle_map;
+
+  // Per-device initialization flags
+  std::unordered_map<c10::DeviceIndex, std::once_flag> device_init_flags;
 };
 
 StreamPool& getStreamPool() {
@@ -149,14 +152,9 @@ void SpyreStream::copy_async_impl(
   // TODO(tmhoangt): plase-holder to be implemented in the next PR
 }
 
-void initializeStreamPool(c10::DeviceIndex device_index) {
+void _initializeStreamPool(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
-
-  if (pool.low_priority_streams.find(device_index) !=
-      pool.low_priority_streams.end()) {
-    return;  // Already initialized
-  }
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -172,6 +170,11 @@ void initializeStreamPool(c10::DeviceIndex device_index) {
     pool.high_priority_streams[device_index].push_back(kStreamsPerDevice + i);
   }
   pool.next_high_priority_idx[device_index] = 0;
+}
+void initializeStreamPool(c10::DeviceIndex device_index) {
+  auto& pool = getStreamPool();
+  std::call_once(pool.device_init_flags[device_index], _initializeStreamPool,
+                 device_index);
 }
 
 SpyreStream getDefaultStream(c10::Device device) {
