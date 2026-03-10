@@ -79,6 +79,7 @@ void _startRuntime() {
     DEBUGINFO("runtime started");
   } else {
     DEBUGINFO("runtime FAILED TO START.");
+    throw std::runtime_error("Failed to initialize Spyre runtime. ");
   }
 }
 void startRuntime() {
