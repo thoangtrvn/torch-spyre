@@ -20,7 +20,7 @@
 #include <torch/csrc/utils/pybind.h>
 #include <util/sen_host_ops.h>
 
-#include <flex/v2/runtime.hpp>
+#include <flex/stream_runtime.hpp>
 #include <memory>
 
 using DataConversionStrideInfo = data_conversion_stride_info;
@@ -28,7 +28,7 @@ using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
-using Runtime = flex::v2::Runtime;
+using Runtime = flex::StreamRuntime;
 
 struct SharedOwnerCtx {
   flex::DeviceMemoryAllocationPtr owner;
