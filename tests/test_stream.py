@@ -63,7 +63,7 @@ class TestSpyreStream(TestCase):
         """Test using stream as context manager."""
         with torch.Stream(self.device):
             # Create tensor within stream context
-            a = torch.randn(1, 32).to(device="spyre")
+            a = torch.randn(1, 32, device="spyre")
             self.assertEqual(a.device.type, "spyre")
             self.assertEqual(a.shape, (1, 32))
 
@@ -77,11 +77,10 @@ class TestSpyreStream(TestCase):
         stream = torch.Stream(self.device)
         # Perform operation on stream
         with stream:
-            _ = torch.randn(10, 10).to(device="spyre")
+            _ = torch.randn(10, 10, device="spyre")
         # Synchronize the stream
         stream.synchronize()
-        # If we reach here without error, synchronization worked
-        self.assertTrue(True)
+        self.assertTrue(stream.query())
 
     def test_device_synchronize(self):
         """Test device-level synchronization."""
@@ -89,24 +88,25 @@ class TestSpyreStream(TestCase):
         stream2 = torch.Stream(self.device)
 
         with stream1:
-            a = torch.randn(10, 10).to(device="spyre")  # noqa: F841
+            a = torch.randn(10, 10, device="spyre")  # noqa: F841
 
         with stream2:
-            b = torch.randn(10, 10).to(device="spyre")  # noqa: F841
+            b = torch.randn(10, 10, device="spyre")  # noqa: F841
 
         # Synchronize all streams on the device
         torch.accelerator.synchronize(self.device)
-        self.assertTrue(True)
+        self.assertTrue(stream1.query())
+        self.assertTrue(stream2.query())
 
     def test_global_synchronize(self):
         """Test global synchronization across all devices."""
         stream = torch.Stream(self.device)
         with stream:
-            a = torch.randn(10, 10).to(device="spyre")  # noqa: F841
+            a = torch.randn(10, 10, device="spyre")  # noqa: F841
 
         # Synchronize all streams on all devices
         torch.accelerator.synchronize()
-        self.assertTrue(True)
+        self.assertTrue(stream.query())
 
     def test_multiple_streams(self):
         """Test creating and using multiple streams."""
@@ -124,16 +124,18 @@ class TestSpyreStream(TestCase):
         stream2 = torch.Stream(self.device)
 
         with stream1:
-            a = torch.randn(5, 5).to(device="spyre")
+            a = torch.randn(5, 5, device="spyre")
             result1 = a + a
 
         with stream2:
-            b = torch.randn(5, 5).to(device="spyre")
+            b = torch.randn(5, 5, device="spyre")
             result2 = b + b
 
         # Synchronize both streams
         stream1.synchronize()
         stream2.synchronize()
+        self.assertTrue(stream1.query())
+        self.assertTrue(stream2.query())
 
         self.assertEqual(result1.shape, (5, 5))
         self.assertEqual(result2.shape, (5, 5))
@@ -144,13 +146,15 @@ class TestSpyreStream(TestCase):
         stream2 = torch.Stream(self.device)
 
         with stream1:
-            a = torch.randn(3, 3).to(device="spyre")
+            a = torch.randn(3, 3, device="spyre")
             with stream2:
-                b = torch.randn(3, 3).to(device="spyre")
+                b = torch.randn(3, 3, device="spyre")
                 c = a + b
 
         stream1.synchronize()
         stream2.synchronize()
+        self.assertTrue(stream1.query())
+        self.assertTrue(stream2.query())
         self.assertEqual(c.shape, (3, 3))
 
     def test_stream_priority_levels(self):
@@ -169,8 +173,8 @@ class TestSpyreStream(TestCase):
 
         with stream:
             # Create tensors
-            a = torch.randn(10, 64, dtype=torch.float16).to(device="spyre")
-            b = torch.randn(10, 64, dtype=torch.float16).to(device="spyre")
+            a = torch.randn(10, 64, dtype=torch.float16, device="spyre")
+            b = torch.randn(10, 64, dtype=torch.float16, device="spyre")
 
             # Perform operations
             c = a + b
@@ -180,6 +184,7 @@ class TestSpyreStream(TestCase):
             self.assertEqual(d.shape, (10, 64))
 
         stream.synchronize()
+        self.assertTrue(stream.query())
 
     def test_default_stream(self):
         """Test that default stream exists and is accessible."""
@@ -187,7 +192,7 @@ class TestSpyreStream(TestCase):
         self.assertIsNotNone(default_stream)
 
         # Operations without explicit stream should use default stream
-        a = torch.randn(5, 5).to(device="spyre")
+        a = torch.randn(5, 5, device="spyre")
         self.assertEqual(a.device.type, "spyre")
 
     def test_stream_query_after_context(self):
@@ -209,13 +214,15 @@ class TestSpyreStream(TestCase):
 
         # First use
         with stream:
-            a = torch.randn(5, 5).to(device="spyre")
+            a = torch.randn(5, 5, device="spyre")
         stream.synchronize()
+        self.assertTrue(stream.query())
 
         # Second use
         with stream:
-            b = torch.randn(5, 5).to(device="spyre")
+            b = torch.randn(5, 5, device="spyre")
         stream.synchronize()
+        self.assertTrue(stream.query())
 
         self.assertEqual(a.shape, (5, 5))
         self.assertEqual(b.shape, (5, 5))

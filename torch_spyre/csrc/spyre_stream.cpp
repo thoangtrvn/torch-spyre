@@ -128,7 +128,7 @@ c10::Stream SpyreStream::unwrap() const {
 
 void SpyreStream::copy_async(const at::Tensor& src,
                              const at::Tensor& dst) const {
-  // TODO(tmhoangt): plase-holder to be implemented in the next PR
+  // TODO(tmhoangt): place-holder to be implemented in the next PR
 }
 
 flex::StreamHandle SpyreStream::get_flex_handle() const {
@@ -149,10 +149,10 @@ flex::StreamHandle SpyreStream::get_flex_handle() const {
 void SpyreStream::copy_async_impl(
     void* cpu_ptr, flex::DeviceMemoryAllocationPtr& device_allocation,
     int device_id, const DataConversionInfo& dci, bool host2device) const {
-  // TODO(tmhoangt): plase-holder to be implemented in the next PR
+  // TODO(tmhoangt): place-holder to be implemented in the next PR
 }
 
-void _initializeStreamPool(c10::DeviceIndex device_index) {
+void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 
@@ -171,9 +171,10 @@ void _initializeStreamPool(c10::DeviceIndex device_index) {
   }
   pool.next_high_priority_idx[device_index] = 0;
 }
+
 void initializeStreamPool(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
-  std::call_once(pool.device_init_flags[device_index], _initializeStreamPool,
+  std::call_once(pool.device_init_flags[device_index], initializeStreamPoolImpl,
                  device_index);
 }
 
@@ -248,15 +249,46 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
 }
 
 void synchronizeDevice(c10::optional<c10::Device> device) {
+  auto sync_one_device = [](c10::Device dev) {
+    if (dev.index() == -1) {
+      dev = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    }
+    const auto device_index = dev.index();
+
+    std::vector<flex::StreamHandle> handles_to_sync;
+    {
+      auto& pool = getStreamPool();
+      std::lock_guard<std::mutex> lock(pool.mutex);
+
+      // Default stream is always present
+      handles_to_sync.push_back(flex::DEFAULT_STREAM);
+
+      auto collect = [&](auto& stream_map) {
+        auto it = stream_map.find(device_index);
+        if (it == stream_map.end()) return;
+        for (auto sid : it->second) {
+          auto h = pool.stream_handle_map.find(sid);
+          if (h != pool.stream_handle_map.end()) {
+            handles_to_sync.push_back(h->second);
+          }
+        }
+      };
+      collect(pool.low_priority_streams);
+      collect(pool.high_priority_streams);
+    }  // lock released
+
+    auto runtime = GlobalRuntime::get();
+    c10::DeviceGuard guard(dev);
+    for (auto handle : handles_to_sync) {
+      runtime->synchronizeStream(handle);
+    }
+  };
   if (device.has_value()) {
-    auto stream = getCurrentStream(device.value());
-    stream.synchronize();
+    sync_one_device(device.value());
   } else {
     // Synchronize all devices
     for (int i = 0; i < device_count(); ++i) {
-      auto dev = c10::Device(c10::DeviceType::PrivateUse1, i);
-      auto stream = getCurrentStream(dev);
-      stream.synchronize();
+      sync_one_device(c10::Device(c10::DeviceType::PrivateUse1, i));
     }
   }
 }

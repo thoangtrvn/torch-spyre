@@ -63,6 +63,11 @@ void SpyreGuardImpl::synchronizeStream(const c10::Stream& stream) const {
   SpyreStream(stream).synchronize();
 }
 
+bool SpyreGuardImpl::queryStream(const c10::Stream& stream) const {
+  TORCH_CHECK(stream.device().type() == this->type());
+  return SpyreStream(stream).query();
+}
+
 void SpyreGuardImpl::synchronizeDevice(c10::DeviceIndex device_index) const {
   c10::Device dev(c10::DeviceType::PrivateUse1, device_index);
   spyre::synchronizeDevice(dev);
