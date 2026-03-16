@@ -46,20 +46,20 @@ class Stream:
             device = torch.device(device)
 
         # Get stream from pool via C++ binding
-        self._cdata = _C._spyre_getStreamFromPool(device, priority)
+        self._cdata = _C.get_stream_from_pool(device, priority)
 
     def __enter__(self):
         """Enter stream context - set as current stream"""
         # Save previous stream
-        self._prev_stream = _C._spyre_getCurrentStream(self.device())
+        self._prev_stream = _C.current_stream(self.device())
         # Set this stream as current
-        _C._spyre_setCurrentStream(self._cdata)
+        _C.set_current_stream(self._cdata)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Exit stream context - restore previous stream"""
         # Restore previous stream
-        _C._spyre_setCurrentStream(self._prev_stream)
+        _C.set_current_stream(self._prev_stream)
         return False
 
     def synchronize(self):
@@ -133,7 +133,7 @@ def current_stream(device: Optional[torch.device] = None) -> Stream:
     elif isinstance(device, int):
         device = torch.device(DEVICE_NAME, device)
 
-    cdata = _C._spyre_getCurrentStream(device)
+    cdata = _C.current_stream(device)
 
     # Wrap in Python Stream object
     stream_obj = Stream.__new__(Stream)
@@ -156,7 +156,7 @@ def default_stream(device: Optional[torch.device] = None) -> Stream:
     elif isinstance(device, int):
         device = torch.device(DEVICE_NAME, device)
 
-    cdata = _C._spyre_getDefaultStream(device)
+    cdata = _C.default_stream(device)
 
     stream_obj = Stream.__new__(Stream)
     stream_obj._cdata = cdata
@@ -182,4 +182,4 @@ def synchronize(device: Optional[torch.device] = None):
         elif isinstance(device, str):
             device = torch.device(device)
 
-    _C._spyre_synchronize(device)
+    _C.synchronize(device)

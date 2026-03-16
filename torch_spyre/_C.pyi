@@ -11,11 +11,11 @@ __all__: list[str] = [
     "DataFormats",
     "SpyreTensorLayout",
     "_SpyreStreamBase",
-    "_spyre_getCurrentStream",
-    "_spyre_getDefaultStream",
-    "_spyre_getStreamFromPool",
-    "_spyre_setCurrentStream",
-    "_spyre_synchronize",
+    "current_stream",
+    "default_stream",
+    "get_stream_from_pool",
+    "set_current_stream",
+    "synchronize",
     "as_strided_with_layout",
     "convert_artifacts",
     "empty_with_layout",
@@ -177,9 +177,7 @@ class _SpyreStreamBase:
 
     def __repr__(self) -> str: ...
 
-def _spyre_getStreamFromPool(
-    device: torch.device, priority: int = 0
-) -> _SpyreStreamBase:
+def get_stream_from_pool(device: torch.device, priority: int = 0) -> _SpyreStreamBase:
     """
     Get a stream from the pool for the specified device and priority.
 
@@ -192,7 +190,7 @@ def _spyre_getStreamFromPool(
     """
     ...
 
-def _spyre_getCurrentStream(device: torch.device) -> _SpyreStreamBase:
+def current_stream(device: torch.device) -> _SpyreStreamBase:
     """
     Get the current stream for a device.
 
@@ -204,7 +202,7 @@ def _spyre_getCurrentStream(device: torch.device) -> _SpyreStreamBase:
     """
     ...
 
-def _spyre_getDefaultStream(device: torch.device) -> _SpyreStreamBase:
+def default_stream(device: torch.device) -> _SpyreStreamBase:
     """
     Get the default stream for a device.
 
@@ -216,7 +214,7 @@ def _spyre_getDefaultStream(device: torch.device) -> _SpyreStreamBase:
     """
     ...
 
-def _spyre_setCurrentStream(stream: _SpyreStreamBase) -> None:
+def set_current_stream(stream: _SpyreStreamBase) -> None:
     """
     Set the current stream for the stream's device.
 
@@ -225,7 +223,7 @@ def _spyre_setCurrentStream(stream: _SpyreStreamBase) -> None:
     """
     ...
 
-def _spyre_synchronize(device: torch.device | None = None) -> None:
+def synchronize(device: torch.device | None = None) -> None:
     """
     Synchronize all streams on a device or all devices.
 

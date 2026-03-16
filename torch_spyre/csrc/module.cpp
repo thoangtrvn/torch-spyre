@@ -317,20 +317,20 @@ PYBIND11_MODULE(_C, m) {
   m.def("get_device_dtype", &spyre::get_device_dtype);
 
   // Stream management functions
-  m.def("_spyre_getStreamFromPool", &spyre::getStreamFromPool,
-        py::arg("device"), py::arg("priority") = 0,
+  m.def("get_stream_from_pool", &spyre::getStreamFromPool, py::arg("device"),
+        py::arg("priority") = 0,
         "Get a stream from the pool with specified device and priority");
 
-  m.def("_spyre_getCurrentStream", &spyre::getCurrentStream, py::arg("device"),
+  m.def("current_stream", &spyre::getCurrentStream, py::arg("device"),
         "Get the current stream for a device");
 
-  m.def("_spyre_setCurrentStream", &spyre::setCurrentStream, py::arg("stream"),
+  m.def("set_current_stream", &spyre::setCurrentStream, py::arg("stream"),
         "Set the current stream and return the previous one");
 
-  m.def("_spyre_getDefaultStream", &spyre::getDefaultStream, py::arg("device"),
+  m.def("default_stream", &spyre::getDefaultStream, py::arg("device"),
         "Get the default stream for a device");
 
-  m.def("_spyre_synchronize", &spyre::synchronizeDevice,
+  m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
   // Expose SpyreStream class to Python

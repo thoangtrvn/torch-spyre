@@ -141,8 +141,6 @@ def make_spyre_module() -> types.ModuleType:
             return getattr(impl, name)
         if not hasattr(impl, "_C"):
             impl._lazy_init()
-        if hasattr(impl._C, name):
-            return getattr(impl._C, name)
         if name in {
             "Stream",
             "stream",
@@ -167,6 +165,8 @@ def make_spyre_module() -> types.ModuleType:
                 "synchronize": synchronize,
             }
             return streams_map[name]
+        if hasattr(impl._C, name):
+            return getattr(impl._C, name)
         raise AttributeError(name)
 
     mod.__getattr__ = __getattr__
