@@ -25,6 +25,7 @@
 
 #include "logging.h"
 #include "module.h"
+#include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
 
@@ -295,7 +296,7 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
 void synchronizeDevice(c10::optional<c10::Device> device) {
   auto sync_one_device = [](c10::Device dev) {
     if (dev.index() == -1) {
-      dev = c10::Device(c10::DeviceType::PrivateUse1, 0);
+      dev = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
     }
     const auto device_index = dev.index();
 
@@ -330,10 +331,8 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
   if (device.has_value()) {
     sync_one_device(device.value());
   } else {
-    // Synchronize all devices
-    for (int i = 0; i < device_count(); ++i) {
-      sync_one_device(c10::Device(c10::DeviceType::PrivateUse1, i));
-    }
+    sync_one_device(
+        c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
   }
 }
 
