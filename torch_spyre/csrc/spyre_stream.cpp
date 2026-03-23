@@ -76,7 +76,8 @@ constexpr int kHighPriorityStreamsPerDevice = 32;
 
 // Constructor
 SpyreStream::SpyreStream()
-    : stream_(getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, 0))
+    : stream_(getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1,
+                                           SpyreGuardImpl::tls_idx))
                   .unwrap()) {}
 SpyreStream::SpyreStream(c10::Stream stream) : stream_(stream) {
   TORCH_CHECK(stream_.device_type() == c10::DeviceType::PrivateUse1,
@@ -174,15 +175,11 @@ flex::StreamHandle SpyreStream::getRuntimeHandle() const {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
 
-  // Look up the flex handle using this stream's ID
   auto it = pool.stream_handle_map.find(id());
-
-  if (it != pool.stream_handle_map.end()) {
-    return it->second;
-  }
-
-  // Default stream (ID 0) returns nullptr
-  return flex::DEFAULT_STREAM;
+  TORCH_CHECK(it != pool.stream_handle_map.end(),
+              "SpyreStream: no flex handle for stream id ", id(),
+              " — was the stream pool initialized for this device?");
+  return it->second;
 }
 
 void SpyreStream::copyAsyncImpl(
@@ -200,6 +197,12 @@ void SpyreStream::copyAsyncImpl(
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
   auto& pool = getStreamPool();
   std::lock_guard<std::mutex> lock(pool.mutex);
+
+  // Register the default stream (ID 0) using the concrete flex handle.
+  // This ensures getRuntimeHandle() resolves stream 0 to the real RuntimeStream
+  // instance owned by RuntimeContext.
+  auto runtime = GlobalRuntime::get();
+  pool.stream_handle_map[0] = runtime->getDefaultStream(device_index);
 
   // Initialize low priority streams (IDs 1 to kStreamsPerDevice)
   pool.low_priority_streams[device_index].reserve(kStreamsPerDevice);
@@ -225,14 +228,15 @@ void initializeStreamPool(c10::DeviceIndex device_index) {
 
 SpyreStream getDefaultStream(c10::Device device) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
+  initializeStreamPool(device.index());
   return SpyreStream(c10::Stream(c10::Stream::DEFAULT, device));
 }
 
 SpyreStream getCurrentStream(c10::Device device) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
 
   auto it = current_streams.find(device.index());
@@ -252,7 +256,7 @@ SpyreStream setCurrentStream(SpyreStream stream) {
 
 SpyreStream getStreamFromPool(c10::Device device, int priority) {
   if (device.index() == -1) {
-    device = c10::Device(c10::DeviceType::PrivateUse1, 0);
+    device = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
   }
 
   // Ensure runtime is initialized before creating streams
@@ -305,8 +309,11 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
       auto& pool = getStreamPool();
       std::lock_guard<std::mutex> lock(pool.mutex);
 
-      // Default stream is always present
-      handles_to_sync.push_back(flex::DEFAULT_STREAM);
+      // Default stream (ID 0) is always present when the pool is initialized
+      auto default_it = pool.stream_handle_map.find(0);
+      if (default_it != pool.stream_handle_map.end()) {
+        handles_to_sync.push_back(default_it->second);
+      }
 
       auto collect = [&](auto& stream_map) {
         auto it = stream_map.find(device_index);
