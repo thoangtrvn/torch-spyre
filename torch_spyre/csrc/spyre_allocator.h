@@ -19,7 +19,7 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
-#include <flex/device_memory_allocator.hpp>
+#include <flex/device_types/device_memory_allocator.hpp>
 
 namespace spyre {
 
