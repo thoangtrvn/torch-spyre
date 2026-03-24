@@ -19,8 +19,6 @@
 
 #include "logging.h"
 #include "module.h"
-#include "spyre_mem.h"
-#include "spyre_tensor_impl.h"
 
 namespace spyre {
 
