@@ -19,7 +19,6 @@
 
 #include "logging.h"
 #include "spyre_mem.h"
-#include "spyre_stream.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
@@ -43,7 +42,6 @@ at::DataPtr SpyreAllocator::allocate(size_t nbytes) {
       c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)->getDevice();
 
   auto device_id = curr_device.index();
-  auto current_stream = getCurrentStream(curr_device);
 
   DEBUGINFO("allocating ", nbytes, " (bytes) on Spyre", curr_device);
   if (nbytes <= 0) {

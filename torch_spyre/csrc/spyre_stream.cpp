@@ -157,7 +157,7 @@ void SpyreStream::copyAsync(const at::Tensor& src,
       dev_tensor->storage().data_ptr().get_context());
   dci = generate_dci(&src, stl, host2device);
   if (host2device || device2host) {
-    copyAsyncImpl(cpu_ptr, ctx->owner, ctx->device_id, dci, host2device);
+    copyAsyncImpl(cpu_ptr, ctx->owner, dci, host2device);
   } else if (src.is_privateuseone() && dst.is_privateuseone()) {
     // Device to device copy - for now, we can just do a device to host copy
     // followed by a host to device copy
@@ -184,13 +184,13 @@ flex::StreamHandle SpyreStream::getRuntimeHandle() const {
 
 void SpyreStream::copyAsyncImpl(
     void* cpu_ptr, flex::DeviceMemoryAllocationPtr& device_allocation,
-    int device_id, const DataConversionInfo& dci, bool host2device) const {
+    const DataConversionInfo& dci, bool host2device) const {
   auto runtime = GlobalRuntime::get();
   flex::StreamHandle handle = getRuntimeHandle();
   if (host2device) {
-    runtime->copyAsync(cpu_ptr, device_allocation, device_id, dci, handle);
+    runtime->copyAsync(cpu_ptr, device_allocation, dci, handle);
   } else {
-    runtime->copyAsync(device_allocation, cpu_ptr, device_id, dci, handle);
+    runtime->copyAsync(device_allocation, cpu_ptr, dci, handle);
   }
 }
 
