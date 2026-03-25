@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "logging.h"
+#include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_sendnn_utils.h"
 #include "spyre_stream.h"
@@ -70,8 +71,19 @@ static void init_from_env() {
 
 void _startRuntime() {
   DEBUGINFO("starting runtime");
+  // Determine logical device index with priority:
+  //   1. tls_idx (non-zero) — set via explicit set_device() call
+  //   2. LOCAL_RANK env var — set by torchrun per process
+  //   3. 0 — single-device / non-torchrun default
+  int logical_device_id = 0;
+  int tls_idx = static_cast<int>(SpyreGuardImpl::tls_idx);
+  if (tls_idx != 0) {
+    logical_device_id = tls_idx;
+  } else if (const char *lr = std::getenv("LOCAL_RANK")) {
+    logical_device_id = std::atoi(lr);
+  }
   std::shared_ptr<Runtime> runtime;
-  auto s = flex::initializeRuntime(&runtime);
+  auto s = flex::initializeRuntime(&runtime, logical_device_id);
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
@@ -351,4 +363,9 @@ PYBIND11_MODULE(_C, m) {
                std::to_string(stream.device().index()) +
                " id=" + std::to_string(stream.id()) + ">";
       });
+  m.def("set_device", [](int idx) {
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->setDevice(c10::Device(c10::DeviceType::PrivateUse1,
+                                static_cast<c10::DeviceIndex>(idx)));
+  });
 }
