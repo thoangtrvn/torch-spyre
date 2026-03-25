@@ -23,6 +23,11 @@
 
 namespace spyre {
 
+struct SharedOwnerCtx {
+  flex::DeviceMemoryAllocationPtr owner;
+  signed char device_id;
+};
+
 // A custom allocator for our custom device, which returns a handle to the
 // allocated memory, not the actual pointer.
 struct SpyreAllocator final : public at::Allocator {

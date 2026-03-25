@@ -45,7 +45,7 @@ at::DataPtr SpyreAllocator::allocate(size_t nbytes) {
   auto device_id = curr_device.index();
 
   DEBUGINFO("allocating ", nbytes, " (bytes) on Spyre", curr_device);
-  if (nbytes <= 0) {
+  if (nbytes == 0) {
     return {nullptr, nullptr, &ReportAndDelete, curr_device};
   }
   auto allocator = getAllocator(device_id);
@@ -72,6 +72,11 @@ void SpyreAllocator::ReportAndDelete(void* ctx_void) {
   delete ctx;
 }
 
+// The raw deleter only gets passed the data ptr, no context, so
+// it would not work right now. To implement this, we first need to
+// create a runtime interface that can correctly free an allocation
+// only based on the data ptr, without the allocation idx from the
+// context
 at::DeleterFnPtr SpyreAllocator::raw_deleter() const {
   return nullptr;
 }
