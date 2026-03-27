@@ -28,7 +28,7 @@ using DataConversionInfo = data_conversion_info;
 
 namespace spyre {
 
-using Runtime = flex::StreamRuntime;
+using Runtime = flex::RuntimeEntry;
 
 class GlobalRuntime {
  public:
