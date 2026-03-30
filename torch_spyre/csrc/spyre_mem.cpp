@@ -698,10 +698,18 @@ at::Tensor py_empty_with_layout(
                            pin_memory_opt, memory_format_opt);
 }
 
+at::Tensor& spyre_copy_(at::Tensor& self, const at::Tensor& src,
+                        bool non_blocking) {
+  TORCH_CHECK(self.is_privateuseone());
+  spyre_copy_from(src, self, non_blocking);
+  return self;
+}
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_empty));
   m.impl("empty_strided", TORCH_FN(spyre_empty_strided));
   m.impl("set_.source_Storage_storage_offset", TORCH_FN(spyre_set_storage));
+  m.impl("copy_", TORCH_FN(spyre_copy_));
   m.impl("_copy_from", TORCH_FN(spyre_copy_from));
 }
 
