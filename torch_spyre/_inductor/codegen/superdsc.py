@@ -47,6 +47,8 @@ class SDSCArgs:
     max_dim_sizes: dict[Symbol, Any]
     allocation: dict[str, Any]
     start_address: int | Symbol
+    backGap: dict[Symbol, int]
+    offset: int
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -64,6 +66,8 @@ class SDSCArgs:
             f"  max_dim_sizes=[{max_dim_sizes}],\n"
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
+            f"  backGap={self.backGap}\n"
+            f"  offset={self.offset}\n"
             f")"
         )
 
@@ -254,6 +258,23 @@ def _create_sdsc_tensors(
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
+    output_offset = 0
+    gap = 0
+    device_stride = None
+    backGap = {}
+    if op_spec.op == "overwrite":
+        op_info = (
+            dict(op_spec.op_info.get("overwrite_info", {})) if op_spec.op_info else {}
+        )
+        if (
+            "gap" in op_info
+            and "device_offset" in op_info
+            and "device_stride" in op_info
+        ):
+            device_stride = op_info["device_stride"]
+            gap = op_info["gap"]
+            output_offset = op_info["device_offset"] * device_stride
+
     sdsc_args: list[SDSCArgs] = []
     for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
@@ -280,6 +301,11 @@ def _create_sdsc_tensors(
             else:
                 scales[dim] = 1
             strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
+            if (
+                device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
+                and not arg.is_input
+            ):
+                backGap[dim] = gap
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
@@ -301,17 +327,30 @@ def _create_sdsc_tensors(
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=addr,
+                backGap=backGap if not arg.is_input else {},
+                offset=output_offset if not arg.is_input else 0,
             )
         )
     return sdsc_args, layouts
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype":
+    if op == "to_dtype" or op == "overwrite":
         return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
     return op
+
+
+def _ref_arg(op_spec):
+    if op_spec.is_reduction:
+        return op_spec.args[0]
+
+    # op specific layout choice
+    if op_spec.op == "overwrite":
+        return op_spec.args[0]
+
+    return op_spec.args[-1]
 
 
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
@@ -333,16 +372,17 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     }
 
     dim_splits = {
-        symbol_mapping[dim]: value[-1] for dim, value in op_spec.iteration_space.items()
+        symbol_mapping[dim]: value[-1] if op_spec.op != "overwrite" else 1
+        for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
-        symbol_mapping[sym]: wk_slice
+        symbol_mapping[sym]: wk_slice if op_spec.op != "overwrite" else 1
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
-    ref_arg = op_spec.args[0] if op_spec.is_reduction else op_spec.args[-1]
+    ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
     if op_stick_dim is None:
@@ -352,12 +392,16 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         dim_splits[stick_sym] = 1
 
     args, layouts = _create_sdsc_tensors(
-        op_spec, symbol_mapping, sdsc_iteration_space, op_dim_order, op_stick_dim
+        op_spec,
+        symbol_mapping,
+        sdsc_iteration_space,
+        op_dim_order,
+        op_stick_dim,
     )
 
     if is_matmul:
         pad_args, pad_sdsc_args = list(op_spec.args), args
-    elif op_spec.is_reduction:
+    elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
         pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
