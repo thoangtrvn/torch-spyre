@@ -225,6 +225,16 @@ def _autoload():
     # You'll get recursion errors if this is exceeded
     torch._dynamo.config.cache_size_limit = 1024
 
+    _orig_isAllocatorInitialized = torch._C._accelerator_isAllocatorInitialized
+
+    def _patched_isAllocatorInitialized():
+        try:
+            return _orig_isAllocatorInitialized()
+        except RuntimeError:
+            return False
+
+    torch._C._accelerator_isAllocatorInitialized = _patched_isAllocatorInitialized
+
     # set the default backend debugging to quiet
     # enable these if you would like to see runtime/compiler logging
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
