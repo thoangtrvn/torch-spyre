@@ -42,6 +42,20 @@ int readSysfsHex(const std::string& path) {
   return val;
 }
 
+// Scan AIU_WORLD_RANK_* env vars for device discovery.
+// These are set by login scripts in all environments (OpenShift & bare metal).
+// Returns PCI bus IDs in rank order, stopping at the first gap.
+std::vector<std::string> scanEnvRanks() {
+  std::vector<std::string> bus_ids;
+  for (int i = 0;; ++i) {
+    std::string key = "AIU_WORLD_RANK_" + std::to_string(i);
+    const char* val = std::getenv(key.c_str());
+    if (!val || val[0] == '\0') break;
+    bus_ids.push_back(val);
+  }
+  return bus_ids;
+}
+
 // Scan /sys/bus/pci/devices/ for all Spyre accelerators.
 // Returns PCI bus IDs sorted lexicographically.
 std::vector<std::string> scanPciBus() {
@@ -114,30 +128,43 @@ std::vector<std::string> parseVisibleDevices(
 }
 
 std::vector<SpyreDeviceInfo> buildDeviceList() {
-  std::vector<std::string> all_bus_ids = scanPciBus();
-  std::vector<std::string> visible_bus_ids;
+  // Step 1: Discover all available devices.
+  // Priority: AIU_WORLD_RANK_* > PCIDEVICE_IBM_COM_AIU_PF > PCI bus scan
+  std::vector<std::string> all_bus_ids = scanEnvRanks();
+  const char* discovery_source = nullptr;
 
-  // Priority:
-  //   1. SPYRE_VISIBLE_DEVICES — explicit user/admin override
-  //   2. PCIDEVICE_IBM_COM_AIU_PF — set by K8s device plugin
-  //   3. Full PCI bus scan
+  if (!all_bus_ids.empty()) {
+    discovery_source = "AIU_WORLD_RANK_*";
+  } else {
+    const char* k8s_env = std::getenv("PCIDEVICE_IBM_COM_AIU_PF");
+    if (k8s_env && k8s_env[0] != '\0') {
+      // Validate K8s bus IDs against PCI scan — filters out any IDs
+      // that don't match real hardware on this host.
+      std::vector<std::string> pci_bus_ids = scanPciBus();
+      all_bus_ids = parseVisibleDevices(k8s_env, pci_bus_ids);
+      discovery_source = "PCIDEVICE_IBM_COM_AIU_PF";
+    } else {
+      all_bus_ids = scanPciBus();
+      discovery_source = "PCI bus scan";
+    }
+  }
+
+  DEBUGINFO("spyre_device_enum:", discovery_source, "found", all_bus_ids.size(),
+            "devices");
+
+  // Step 2: Apply SPYRE_VISIBLE_DEVICES filter.
+  std::vector<std::string> visible_bus_ids;
   const char* env = std::getenv("SPYRE_VISIBLE_DEVICES");
-  const char* k8s_env = std::getenv("PCIDEVICE_IBM_COM_AIU_PF");
 
   if (env && env[0] != '\0') {
     visible_bus_ids = parseVisibleDevices(env, all_bus_ids);
     DEBUGINFO("spyre_device_enum: SPYRE_VISIBLE_DEVICES =", env, "->",
               visible_bus_ids.size(), "devices");
-  } else if (k8s_env && k8s_env[0] != '\0') {
-    visible_bus_ids = parseVisibleDevices(k8s_env, all_bus_ids);
-    DEBUGINFO("spyre_device_enum: PCIDEVICE_IBM_COM_AIU_PF =", k8s_env, "->",
-              visible_bus_ids.size(), "devices");
   } else {
     visible_bus_ids = all_bus_ids;
-    DEBUGINFO("spyre_device_enum: found", visible_bus_ids.size(),
-              "Spyre devices via PCI scan");
   }
 
+  // Step 3: Build device info list.
   std::vector<SpyreDeviceInfo> devices;
   devices.reserve(visible_bus_ids.size());
   for (int i = 0; i < static_cast<int>(visible_bus_ids.size()); ++i) {
@@ -167,38 +194,32 @@ void ensureSpyreDevicesEnv() {
     return;
   }
 
-  // If no K8s or user override is active, let flex use its default scan.
-  const char* k8s_env = std::getenv("PCIDEVICE_IBM_COM_AIU_PF");
-  const char* user_env = std::getenv("SPYRE_VISIBLE_DEVICES");
-  if ((!k8s_env || k8s_env[0] == '\0') && (!user_env || user_env[0] == '\0')) {
-    return;
-  }
+  const auto& visible = getVisibleDevices();
+  if (visible.empty()) return;
 
   // Set AIU_WORLD_RANK_<i> env vars with the PCI bus IDs of visible devices.
   // flex's CreatePciId reads RANK (set by torchrun), then calls
   // RdmaGetPCIeAddress(rank) which checks AIU_WORLD_RANK_<id> and passes
   // the PCI bus ID directly to senlib::SenPci::pf(pci_address).
   //
-  // This avoids senlib index mapping entirely — we pass the exact PCI bus ID.
-  const auto& visible = getVisibleDevices();
-
+  // overwrite=1: SPYRE_VISIBLE_DEVICES may have re-indexed the list, so
+  // the mapping from index to PCI bus ID may differ from what the login
+  // script originally set.
   for (const auto& dev : visible) {
     std::string env_name = "AIU_WORLD_RANK_" + std::to_string(dev.index);
-    setenv(env_name.c_str(), dev.pci_bus_id.c_str(), /*overwrite=*/0);
+    setenv(env_name.c_str(), dev.pci_bus_id.c_str(), /*overwrite=*/1);
     DEBUGINFO("spyre_device_enum: set", env_name, "=", dev.pci_bus_id);
   }
 
-  // Also set SPYRE_DEVICES as sequential indices so flex's
+  // Set SPYRE_DEVICES as sequential indices so flex's
   // RdmaGetPCIeAddress uses the correct rank-to-index mapping.
   std::string spyre_devices;
   for (int i = 0; i < static_cast<int>(visible.size()); ++i) {
     if (!spyre_devices.empty()) spyre_devices += ',';
     spyre_devices += std::to_string(i);
   }
-  if (!spyre_devices.empty()) {
-    setenv("SPYRE_DEVICES", spyre_devices.c_str(), /*overwrite=*/0);
-    DEBUGINFO("spyre_device_enum: synthesized SPYRE_DEVICES =", spyre_devices);
-  }
+  setenv("SPYRE_DEVICES", spyre_devices.c_str(), /*overwrite=*/0);
+  DEBUGINFO("spyre_device_enum: synthesized SPYRE_DEVICES =", spyre_devices);
 }
 
 }  // namespace spyre

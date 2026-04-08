@@ -69,6 +69,10 @@ print(torch.spyre.device_count())
 """
     env = os.environ.copy()
     if env_vars is not None:
+        # Remove AIU_WORLD_RANK_* env vars to prevent parent interference
+        for key in list(env.keys()):
+            if key.startswith("AIU_WORLD_RANK_"):
+                del env[key]
         env.update(env_vars)
         # Remove env vars that might interfere if not specified
         for key in ["SPYRE_VISIBLE_DEVICES", "PCIDEVICE_IBM_COM_AIU_PF"]:
@@ -125,15 +129,19 @@ class TestDeviceEnumEnvVars:
         count = get_device_count_in_subprocess({"PCIDEVICE_IBM_COM_AIU_PF": bus_ids[0]})
         assert count == 1
 
-    def test_env_var_priority(self):
-        """SPYRE_VISIBLE_DEVICES takes priority over PCIDEVICE_IBM_COM_AIU_PF."""
+    def test_spyre_visible_devices_filters_k8s(self):
+        """SPYRE_VISIBLE_DEVICES filters the PCIDEVICE_IBM_COM_AIU_PF list."""
+        bus_ids = discover_spyre_pci_bus_ids()
+        if len(bus_ids) < 2:
+            pytest.skip("Need at least 2 Spyre devices")
+
         count = get_device_count_in_subprocess(
             {
                 "SPYRE_VISIBLE_DEVICES": "0",
-                "PCIDEVICE_IBM_COM_AIU_PF": "invalid_bus_id",
+                "PCIDEVICE_IBM_COM_AIU_PF": ",".join(bus_ids[:2]),
             }
         )
-        assert count == 1, "SPYRE_VISIBLE_DEVICES should take priority"
+        assert count == 1, "SPYRE_VISIBLE_DEVICES should filter the device list"
 
     def test_k8s_invalid_pci_bus_id_filtered(self):
         """Invalid PCI bus IDs are filtered out, count equals valid IDs only."""
@@ -148,6 +156,64 @@ class TestDeviceEnumEnvVars:
 
         # Count should be 1 (invalid ID filtered out)
         assert count == 1, f"Expected 1 (invalid ID filtered), got {count}"
+
+    def test_aiu_world_rank_discovery(self):
+        """AIU_WORLD_RANK_* env vars are used for device discovery."""
+        bus_ids = discover_spyre_pci_bus_ids()
+        if len(bus_ids) < 2:
+            pytest.skip("Need at least 2 Spyre devices")
+
+        count = get_device_count_in_subprocess(
+            {
+                "AIU_WORLD_RANK_0": bus_ids[0],
+                "AIU_WORLD_RANK_1": bus_ids[1],
+            }
+        )
+        assert count == 2
+
+    def test_aiu_world_rank_priority_over_pci_scan(self):
+        """AIU_WORLD_RANK_* takes priority over PCI bus scan."""
+        bus_ids = discover_spyre_pci_bus_ids()
+        if not bus_ids:
+            pytest.skip("No Spyre devices found via sysfs scan")
+
+        # Set only one AIU_WORLD_RANK — should see 1 device even if
+        # PCI scan would find more.
+        count = get_device_count_in_subprocess({"AIU_WORLD_RANK_0": bus_ids[0]})
+        assert count == 1, "AIU_WORLD_RANK_* should take priority over PCI scan"
+
+    def test_spyre_visible_devices_filters_aiu_world_rank(self):
+        """SPYRE_VISIBLE_DEVICES filters the AIU_WORLD_RANK_* list."""
+        bus_ids = discover_spyre_pci_bus_ids()
+        if len(bus_ids) < 2:
+            pytest.skip("Need at least 2 Spyre devices")
+
+        count = get_device_count_in_subprocess(
+            {
+                "AIU_WORLD_RANK_0": bus_ids[0],
+                "AIU_WORLD_RANK_1": bus_ids[1],
+                "SPYRE_VISIBLE_DEVICES": "0",
+            }
+        )
+        assert count == 1, "SPYRE_VISIBLE_DEVICES should filter AIU_WORLD_RANK_* list"
+
+    def test_aiu_world_rank_priority_over_k8s(self):
+        """AIU_WORLD_RANK_* takes priority over PCIDEVICE_IBM_COM_AIU_PF."""
+        bus_ids = discover_spyre_pci_bus_ids()
+        if len(bus_ids) < 2:
+            pytest.skip("Need at least 2 Spyre devices")
+
+        # AIU_WORLD_RANK sets 1 device, PCIDEVICE_IBM_COM_AIU_PF sets 2.
+        # AIU_WORLD_RANK should win.
+        count = get_device_count_in_subprocess(
+            {
+                "AIU_WORLD_RANK_0": bus_ids[0],
+                "PCIDEVICE_IBM_COM_AIU_PF": ",".join(bus_ids[:2]),
+            }
+        )
+        assert count == 1, (
+            "AIU_WORLD_RANK_* should take priority over PCIDEVICE_IBM_COM_AIU_PF"
+        )
 
 
 if __name__ == "__main__":

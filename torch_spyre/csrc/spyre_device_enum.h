@@ -34,12 +34,16 @@ struct SpyreDeviceInfo {
 
 // Returns the list of Spyre devices visible to this process.
 //
-// Priority:
-//   1. SPYRE_VISIBLE_DEVICES env var — comma-separated PCI bus IDs or
-//      0-based indices (e.g. "0,1,2" or "0000:29:00.0,0000:2a:00.0")
+// Discovery priority (full device list):
+//   1. AIU_WORLD_RANK_* env vars — set by login scripts in all environments,
+//      scanned as _0, _1, ... until a gap
 //   2. PCIDEVICE_IBM_COM_AIU_PF env var — set by K8s device plugin,
 //      comma-separated PCI bus IDs
 //   3. Full PCI bus scan via /sys/bus/pci/devices/
+//
+// Filter (applied on top of the discovered list):
+//   SPYRE_VISIBLE_DEVICES env var — comma-separated PCI bus IDs or
+//   0-based indices (e.g. "0,1" or "0000:29:00.0,0000:2a:00.0")
 //
 // The result is cached after the first call.
 const std::vector<SpyreDeviceInfo>& getVisibleDevices();
@@ -47,9 +51,12 @@ const std::vector<SpyreDeviceInfo>& getVisibleDevices();
 // Convenience: returns the number of visible Spyre devices.
 int getVisibleDeviceCount();
 
-// If SPYRE_DEVICES is not already set, and PCIDEVICE_IBM_COM_AIU_PF is
-// available, synthesize SPYRE_DEVICES from the K8s-assigned PCI bus IDs
-// so that flex picks the correct physical cards.
+// Ensure AIU_WORLD_RANK_* and SPYRE_DEVICES env vars are set correctly
+// for flex, based on the visible device list from getVisibleDevices().
+//
+// If SPYRE_DEVICES is already set, this is a no-op.  Otherwise it
+// overwrites AIU_WORLD_RANK_<i> to match the (potentially filtered)
+// visible device list and sets SPYRE_DEVICES to sequential indices.
 //
 // Must be called before flex::initializeRuntime().
 void ensureSpyreDevicesEnv();
