@@ -15,6 +15,7 @@
  */
 
 #include <ATen/detail/PrivateUse1HooksInterface.h>
+#include <c10/core/CPUAllocator.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -40,6 +41,13 @@ struct SpyreHooksInterface : public at::PrivateUse1HooksInterface {
   }
   bool isAvailable() const override {
     return true;
+  }
+
+  // Provide a pinned memory allocator for CPU tensors with pin_memory=True
+  c10::Allocator* getPinnedMemoryAllocator() const override {
+    // Return the default CPU pinned memory allocator
+    // This allows pin_memory=True to work with CPU tensors
+    return c10::GetDefaultCPUAllocator();
   }
 };
 
