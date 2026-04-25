@@ -82,9 +82,6 @@ def unregister_lowering(op, lowering_dict=lowering.lowerings, allow_missing=Fals
             raise RuntimeError(f"lowering of {overload} is not registered")
 
 
-for op in fallback_ops:
-    unregister_lowering(op, allow_missing=True)
-
 # Overload names for aten.clamp
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
 
@@ -144,9 +141,19 @@ def enable_spyre_lowerings():
             _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
             _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
 
+            # Unregister fallback-op lowerings so that implicit fallback to eager
+            # becomes effective (previously done at module level, which leaked state)
+            saved_fallback_lowerings = {}
+            for op in fallback_ops:
+                for overload in lowering.get_overloads(op):
+                    if overload in lowering.lowerings:
+                        saved_fallback_lowerings[overload] = lowering.lowerings[overload]
+                        del lowering.lowerings[overload]
+
             # Attach to the function so we can restore on last exit
             enable_spyre_lowerings._saved_aten_lowerings = saved
             enable_spyre_lowerings._saved_lowerings = saved_intree_lowerings
+            enable_spyre_lowerings._saved_fallback_lowerings = saved_fallback_lowerings
 
         try:
             yield
@@ -176,6 +183,14 @@ def enable_spyre_lowerings():
                         lowering.lowerings.pop(spyre_lowering_op, None)
                 # Clean up
                 enable_spyre_lowerings._saved_lowerings = {}
+                # Restore fallback-op lowerings removed on entry
+                saved_fallback_lowerings = getattr(
+                    enable_spyre_lowerings, "_saved_fallback_lowerings", {}
+                )
+                for overload, prev in saved_fallback_lowerings.items():
+                    lowering.lowerings[overload] = prev
+                # Clean up
+                enable_spyre_lowerings._saved_fallback_lowerings = {}
 
 
 def ensure_default_handler(op_name):
