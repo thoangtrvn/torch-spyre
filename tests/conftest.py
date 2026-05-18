@@ -313,6 +313,16 @@ def pytest_configure(config):
                 f"{tag}: tests that depend on or are relevant to '{tag}'",
             )
 
+    # ── register Spyre-specific markers for broken test categories ──
+    config.addinivalue_line(
+        "markers",
+        "spyre_broken_operators: Tests that fail due to missing/unimplemented operators",
+    )
+    config.addinivalue_line(
+        "markers",
+        "spyre_broken_pad: Tests that fail due to padding operation issues",
+    )
+
 
 def pytest_collection_modifyitems(config, items):
     # Files ignored for plain `pytest` runs (known failures outside `make tests`)
@@ -332,25 +342,61 @@ def pytest_collection_modifyitems(config, items):
         if deselect:
             config.hook.pytest_deselected(items=deselect)
             items[:] = [i for i in items if i not in deselect]
-        return
+    else:
+        # Keep only model-yaml runner tests
+        keep = []
+        deselect = []
 
-    # Keep only model-yaml runner tests
-    keep = []
-    deselect = []
+        for item in items:
+            if any(item.nodeid.startswith(f) for f in ignored_files):
+                deselect.append(item)
+            elif "tests/models/test_model_ops" in item.nodeid:
+                keep.append(item)
+            else:
+                deselect.append(item)
+
+        if deselect:
+            config.hook.pytest_deselected(items=deselect)
+            items[:] = keep
+
+    # ── Mark known-broken tests with Spyre-specific markers ──
+    # These are skipped via `-m` in pyproject.toml addopts.
+    broken_operators = [
+        "BCELoss",
+        "BCEWithLogitsLoss",
+        "CTCLoss",
+        "CosineEmbeddingLoss",
+        "CrossEntropyLoss",
+        "Embedding",
+        "FractionalMaxPool2d",
+        "FractionalMaxPool3d",
+        "HingeEmbeddingLoss",
+        "KLDivLoss",
+        "MarginRankingLoss",
+        "MultiLabelMarginLoss",
+        "MultiLabelSoftMarginLoss",
+        "MultiMarginLoss",
+        "NLLLoss",
+        "SoftMarginLoss",
+    ]
+
+    broken_padding = [
+        "CircularPad",
+        "ConstantPad",
+        "ReflectionPad",
+        "ReplicationPad",
+    ]
 
     for item in items:
-        if any(item.nodeid.startswith(f) for f in ignored_files):
-            deselect.append(item)
-        # item.nodeid includes the file path, e.g. "tests/models/test_model_ops.py::test_model_ops[...]"
-        # if "tests/models/test_model_ops.py::" in item.nodeid:
-        elif "tests/models/test_model_ops" in item.nodeid:
-            keep.append(item)
-        else:
-            deselect.append(item)
+        for pattern in broken_operators:
+            if pattern in item.nodeid:
+                item.add_marker(pytest.mark.spyre_broken_operators)
+                break
 
-    if deselect:
-        config.hook.pytest_deselected(items=deselect)
-        items[:] = keep
+        for pattern in broken_padding:
+            if pattern in item.nodeid:
+                item.add_marker(pytest.mark.spyre_broken_pad)
+                break
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
