@@ -208,10 +208,67 @@ void launchKernel(const std::string& code_dir,
   stream.executeProgramAsync(arts, args);
 }
 
+// Cache for launchKernelFromBytes: hash of binary -> loaded artifacts
+// Avoids re-allocating and copying device memory on repeated launches
+// of the same kernel (e.g., training loops).
+static std::unordered_map<size_t, KernelArtifacts> g_bytes_artifact_cache;
+static std::shared_mutex g_bytes_cache_mtx;
+
+void launchKernelFromBytes(const std::vector<uint8_t>& binary,
+                           const std::vector<at::Tensor>& args) {
+  // Compute a hash of the binary for cache lookup.
+  // Uses FNV-1a over the raw bytes — fast and sufficient for caching.
+  size_t key = 0xcbf29ce484222325ULL;  // FNV offset basis
+  for (uint8_t b : binary) {
+    key ^= static_cast<size_t>(b);
+    key *= 0x100000001b3ULL;  // FNV prime
+  }
+
+  {
+    std::shared_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    auto it = g_bytes_artifact_cache.find(key);
+    if (it != g_bytes_artifact_cache.end()) {
+      auto stream =
+          getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+      stream.executeProgramAsync(it->second, args);
+      return;
+    }
+  }
+
+  // Cache miss: allocate device memory, copy binary, cache artifacts
+  KernelArtifacts arts;
+  arts.init_bin = binary;
+  arts.program_size = binary.size();
+
+  auto stream = getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+  auto& allocator = SpyreAllocator::instance();
+  arts.device_alloc = std::move(allocator.allocate(arts.program_size));
+  auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
+  TORCH_CHECK(arts.program_size <= ctx->composite_addr.total_size(),
+              "Program size (", arts.program_size,
+              ") exceeds allocated device memory (",
+              ctx->composite_addr.total_size(), ")");
+  stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
+
+  // Cache and execute
+  {
+    std::unique_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    auto [it, inserted] =
+        g_bytes_artifact_cache.emplace(key, std::move(arts));
+    stream.executeProgramAsync(it->second, args);
+  }
+}
+
 void clearArtifactCache() {
-  std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
-  g_artifact_cache.clear();
-  g_key_mtxs.clear();
+  {
+    std::unique_lock<std::shared_mutex> lock(g_artifact_cache_mtx);
+    g_artifact_cache.clear();
+    g_key_mtxs.clear();
+  }
+  {
+    std::unique_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    g_bytes_artifact_cache.clear();
+  }
 }
 
 }  // namespace spyre

@@ -156,6 +156,23 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
+  m.def(
+      "launch_kernel_from_bytes",
+      [](py::bytes binary_data, py::list args) {
+        // Convert py::bytes -> std::vector<uint8_t>
+        std::string raw = binary_data;
+        std::vector<uint8_t> binary(raw.begin(), raw.end());
+
+        // Convert py::list of tensors -> std::vector<at::Tensor>
+        std::vector<at::Tensor> tensor_args;
+        tensor_args.reserve(args.size());
+        for (auto& item : args) {
+          tensor_args.push_back(item.cast<at::Tensor>());
+        }
+
+        spyre::launchKernelFromBytes(binary, tensor_args);
+      },
+      "Launch a kernel from raw init packet bytes (Triton path)");
   m.def("encode_constant", &spyre::encodeConstant);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");

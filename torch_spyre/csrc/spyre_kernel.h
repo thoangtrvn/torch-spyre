@@ -59,6 +59,8 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
                                     const SpyreStream& stream);
 void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
+void launchKernelFromBytes(const std::vector<uint8_t>& binary,
+                           const std::vector<at::Tensor>& args);
 
 void clearArtifactCache();
 
