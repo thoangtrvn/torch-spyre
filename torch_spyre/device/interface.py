@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import torch
 from torch._dynamo.device_interface import DeviceInterface
 from typing import Any
@@ -20,6 +22,40 @@ from dataclasses import dataclass
 # Recording the device properties in the main process but used in worker process.
 caching_worker_device_properties: dict[str, Any] = {}
 caching_worker_current_devices: dict[str, int] = {}
+
+# Cached compute capability — detected once on first access.
+_cached_compute_capability: str | None = None
+_cached_device_properties: SpyreDeviceProperties | None = None
+
+
+def _detect_compute_capability() -> str:
+    """Detect the Sentient generation. Called once, result is cached.
+
+    TODO: Query from C++ runtime (flex knows the hardware generation).
+    Falls back to SENARCH env var, then "rcudd1a" default.
+    """
+    import os
+
+    return os.environ.get("SENARCH", "rcudd1a")
+
+
+def _detect_device_properties() -> SpyreDeviceProperties:
+    """Build device properties from runtime configuration.
+
+    TODO: Query from C++ runtime for hardware-detected values.
+    """
+    import os
+
+    try:
+        num_cores = int(os.environ.get("SENCORES", "32"))
+    except ValueError:
+        num_cores = 32
+
+    return SpyreDeviceProperties(
+        type="spyre",
+        index=0,
+        multi_processor_count=num_cores,
+    )
 
 
 @dataclass(frozen=True)
@@ -43,9 +79,16 @@ class SpyreInterface(DeviceInterface):
 
     @staticmethod
     def get_compute_capability(device: torch.types.Device = None) -> Any:
-        # TODO (tmhoangt): read this from cache
-        # as worker process don't get access to device due to driver limitation
-        return ""
+        """Return the Sentient generation identifier (e.g., "rcudd1a", "sen1p5").
+
+        This is an architectural identifier that matches GPUTarget.arch in
+        the Triton backend, not a version number like CUDA's "8.0". Inductor
+        uses it for backend routing, not for heuristic tile-size tables.
+        """
+        global _cached_compute_capability
+        if _cached_compute_capability is None:
+            _cached_compute_capability = _detect_compute_capability()
+        return _cached_compute_capability
 
     class Worker(DeviceInterface.Worker):
         # TODO (yoheiueda) Support non-zero index values when multiple Spyre cards are supported in the future
@@ -59,6 +102,7 @@ class SpyreInterface(DeviceInterface):
 
         @staticmethod
         def get_device_properties(device: torch.types.Device = None):
-            # TODO (tmhoangt): read this from cache
-            # as worker process don't get access to device due to driver limitation
-            return SpyreDeviceProperties(type="dd2", index=0, multi_processor_count=32)
+            global _cached_device_properties
+            if _cached_device_properties is None:
+                _cached_device_properties = _detect_device_properties()
+            return _cached_device_properties

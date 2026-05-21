@@ -213,17 +213,24 @@ void launchKernel(const std::string& code_dir,
 // of the same kernel (e.g., training loops).
 static std::unordered_map<size_t, KernelArtifacts> g_bytes_artifact_cache;
 static std::shared_mutex g_bytes_cache_mtx;
+// Per-key mutexes to prevent concurrent loads of the same binary.
+static std::unordered_map<size_t, std::unique_ptr<std::mutex>> g_bytes_key_mtxs;
 
 void launchKernelFromBytes(const std::vector<uint8_t>& binary,
                            const std::vector<at::Tensor>& args) {
   // Compute a hash of the binary for cache lookup.
-  // Uses FNV-1a over the raw bytes — fast and sufficient for caching.
+  // Uses FNV-1a over the raw bytes. Collisions are possible but
+  // extremely unlikely in practice (<1 MB init packets, small number
+  // of distinct kernels per session). A collision would cause wrong-code
+  // execution — if this becomes a concern, replace with SHA-256 truncated
+  // to 64 bits.
   size_t key = 0xcbf29ce484222325ULL;  // FNV offset basis
   for (uint8_t b : binary) {
     key ^= static_cast<size_t>(b);
     key *= 0x100000001b3ULL;  // FNV prime
   }
 
+  // Fast path: check cache under shared lock
   {
     std::shared_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
     auto it = g_bytes_artifact_cache.find(key);
@@ -235,7 +242,36 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
     }
   }
 
-  // Cache miss: allocate device memory, copy binary, cache artifacts
+  // Ensure a per-key mutex exists (under unique lock on the cache map)
+  {
+    std::unique_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    auto& key_mtx = g_bytes_key_mtxs[key];
+    if (!key_mtx) {
+      key_mtx = std::make_unique<std::mutex>();
+    }
+  }
+
+  // Acquire per-key mutex — only one thread loads a given binary
+  std::mutex* key_mtx = nullptr;
+  {
+    std::shared_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    key_mtx = g_bytes_key_mtxs[key].get();
+  }
+  std::lock_guard<std::mutex> key_lock(*key_mtx);
+
+  // Double-check after acquiring per-key lock
+  {
+    std::shared_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    auto it = g_bytes_artifact_cache.find(key);
+    if (it != g_bytes_artifact_cache.end()) {
+      auto stream =
+          getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+      stream.executeProgramAsync(it->second, args);
+      return;
+    }
+  }
+
+  // Load artifacts — no global lock held during device allocation/copy
   KernelArtifacts arts;
   arts.init_bin = binary;
   arts.program_size = binary.size();
@@ -250,11 +286,18 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
               ctx->composite_addr.total_size(), ")");
   stream.copyProgramAsync(arts.init_bin.data(), &ctx->composite_addr);
 
-  // Cache and execute
+  // Cache under unique lock
   {
     std::unique_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
-    auto [it, inserted] =
-        g_bytes_artifact_cache.emplace(key, std::move(arts));
+    g_bytes_artifact_cache.emplace(key, std::move(arts));
+  }
+
+  // Execute outside all locks — same pattern as launchKernel
+  {
+    std::shared_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
+    auto it = g_bytes_artifact_cache.find(key);
+    TORCH_CHECK(it != g_bytes_artifact_cache.end(),
+                "Cached artifact not found after insertion");
     stream.executeProgramAsync(it->second, args);
   }
 }
@@ -268,6 +311,7 @@ void clearArtifactCache() {
   {
     std::unique_lock<std::shared_mutex> lock(g_bytes_cache_mtx);
     g_bytes_artifact_cache.clear();
+    g_bytes_key_mtxs.clear();
   }
 }
 

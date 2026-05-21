@@ -72,6 +72,18 @@ class _SpyreImpl:
 
             _patch_tensor_for_spyre()
 
+            # Activate SpyreDriver as Triton's active driver BEFORE registering
+            # the Inductor backend, so any Triton compilation triggered during
+            # registration finds the correct driver. SpyreDriver.is_active()
+            # returns False to avoid conflicting with CUDA during auto-discovery.
+            try:
+                from triton.runtime.driver import driver as triton_driver
+                from triton.backends.spyre.driver import SpyreDriver
+
+                triton_driver.set_active(SpyreDriver())
+            except ImportError:
+                pass  # triton-spyre not installed — Triton path unavailable
+
             from torch_spyre._inductor import _autoload as ts_autoload
 
             ts_autoload()

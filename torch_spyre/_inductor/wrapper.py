@@ -16,17 +16,31 @@ from typing import Optional
 
 import sympy
 from torch._inductor.codegen.wrapper import (
-    BufferLike,
     PythonWrapperCodegen,
     SubgraphPythonWrapperCodegen,
 )
 from torch._inductor.ir import GraphPartitionSignature
-from torch._inductor.utils import ValueWithLineMap
 from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
-from .ir import FixedTiledLayout
-from .constants import SEGMENT_SIZE
+
+def noop_simplify_loops_impl(
+    self, index_vars: list[sympy.Symbol], sizes, index_formulas
+):
+    """Noop implementation of SizeVarAllocator._simplify_loops_impl.
+
+    Inductor's loop simplification assumes flat byte-level addressability.
+    The AIU has stick-granular addressability (EAR increments in 128-byte
+    units), so the relationship between logical index and physical address
+    involves integer division by stick size and modular arithmetic within
+    sticks. Inductor's stride model cannot express this, so dimension
+    fusion must be disabled.
+
+    Size-1 elimination is also lost here. A future BackendFeature flag
+    (NON_STANDARD_CONTIGUITY) would recover it by gating only dimension
+    fusion, not size-1 elimination.
+    """
+    return sizes, lambda x: x, lambda x: x
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -50,125 +64,3 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                 subgraph_name, parent_wrapper, partition_signatures
             )
         return SpyrePythonWrapperCodegen()
-
-    def write_header(self) -> None:
-        super().write_header()
-        self.imports.splice(
-            """
-                from sympy import sympify
-                from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, spyre_constant_tensor
-                from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, SpyreTensorLayout, spyre_empty_with_layout
-                import subprocess
-            """,
-            strip=True,
-        )
-        self.header.writeline(
-            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
-        )
-        self.header.writeline(
-            "from torch_spyre._C import reinterpret_tensor_with_layout"
-        )
-        self.header.writeline("del async_compile")
-        self.header.writeline("async_compile = SpyreAsyncCompile()")
-
-    def generate(self, is_inference):
-        """Override to add pool allocation/deallocation around kernel calls."""
-        result_tuple = super().generate(is_inference)
-        wrapper_value_with_linemap, kernel_decls = result_tuple
-
-        pool_size = getattr(V.graph, "pool_size", 0)
-        if pool_size > 0:
-            wrapper_str = str(wrapper_value_with_linemap.value)
-
-            # Inject pool allocation before kernel calls and cleanup before return.
-            lines = wrapper_str.split("\n")
-
-            # Add `del _pool` before `return (` statement.
-            for i in range(len(lines) - 1, -1, -1):
-                line = lines[i].strip()
-                if line.startswith("return ("):
-                    indent = len(lines[i]) - len(lines[i].lstrip())
-                    lines.insert(i, " " * indent + "del _pool")
-                    break
-
-            # Add pool allocation before first kernel call (`.run(`).
-            pool_alloc_code = self.allocate_pool()
-            for i, line in enumerate(lines):
-                if ".run(" in line:
-                    indent = len(line) - len(line.lstrip())
-                    lines.insert(i, " " * indent + pool_alloc_code)
-                    break
-
-            wrapper_str = "\n".join(lines)
-            wrapper_value_with_linemap = ValueWithLineMap(
-                value=wrapper_str, line_map=wrapper_value_with_linemap.line_map
-            )
-
-        return (wrapper_value_with_linemap, kernel_decls)
-
-    def make_buffer_allocation(self, buffer: BufferLike):
-        layout = buffer.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
-            return super().make_buffer_allocation(buffer)
-
-        name = buffer.get_name()
-        codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
-        codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
-
-        out = (
-            f"{name} = spyre_empty_with_layout("
-            f"{codegen_shape_tuple}, "
-            f"{codegen_stride_tuple}, "
-            f"{layout.dtype}, "
-            f"{layout.device_layout!r})"
-        )
-
-        return out
-
-    def generate_const_tensor_fallback(self, node):
-        value = node.constant_args[0]
-        dtype = node.layout.dtype
-        device = node.layout.device
-        self.writeline(
-            f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
-        )
-
-    def make_buffer_reuse(self, old: BufferLike, new: BufferLike, delete_old: bool):
-        assert old.get_dtype() == new.get_dtype()
-        old_name = old.get_name()
-        new_name = new.get_name()
-        del_line = ";"
-        if old_name not in V.graph.get_output_names() and delete_old:
-            del_line = f"; {self.make_buffer_free(old)}"
-
-        if old.get_size() == new.get_size() and old.get_stride() == new.get_stride():
-            return self.codegen_exact_buffer_reuse(old_name, new_name, del_line)
-
-        new_stl = new.get_layout().device_layout
-        reinterpret_view = f"reinterpret_tensor_with_layout({old_name}, {new.get_size()}, {new.get_stride()}, 0, {new_stl!r})"
-        return f"{self.declare}{new_name} = {reinterpret_view}{del_line}  {self.comment} reuse"
-
-    def allocate_pool(self):
-        """Allocate the intermediate pool."""
-        pool_size_bytes = getattr(V.graph, "pool_size", SEGMENT_SIZE)
-        pool_size_sticks = (pool_size_bytes + 127) // 128
-        return (
-            f"_pool = spyre_empty_with_layout("
-            f"({pool_size_sticks},), (1,), "
-            f"torch.uint8, SpyreTensorLayout(device_size=[{pool_size_sticks}, 1, 1], "
-            f"stride_map=[1, 1, 1], device_dtype=DataFormats.SENINT8))"
-        )
-
-
-def noop_simplify_loops_impl(
-    self, index_vars: list[sympy.Symbol], sizes, index_formulas
-):
-    """
-    This is a noop implementation of SizeVarAllocator._simplify_loops_impl.
-
-    We do this because the memory layout of tensors on the Spyre device is not
-    entirely visible to Inductor.  Therefore Inductor's understanding of which
-    tensor dimensions are actually contiguous is not accurate.
-    """
-    return sizes, lambda x: x, lambda x: x
