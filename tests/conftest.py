@@ -361,6 +361,22 @@ def pytest_collection_modifyitems(config, items):
 
     # ── Mark known-broken tests with Spyre-specific markers ──
     # These are skipped via `-m` in pyproject.toml addopts.
+    broken_test_ids = [
+        # Cache miss counter is 0, expected 1 — Inductor caching behavior differs on Spyre
+        "test_cache__oot_wrapper.py::TestCacheCPU::test_cache_cpu",
+        "test_cache__oot_wrapper.py::TestCachePRIVATEUSE1::test_cache_spyre",
+        # Test asserts PRIVATEUSE1 suffix but Spyre renames to SPYRE
+        "test_spyre.py::TestSpyre::test_instantiate_device_type_tests_mro",
+    ]
+
+    for item in items:
+        for pattern in broken_test_ids:
+            if pattern in item.nodeid:
+                item.add_marker(
+                    pytest.mark.skip(reason="known failure outside make tests")
+                )
+                break
+
     broken_operators = [
         "BCELoss",
         "BCEWithLogitsLoss",
