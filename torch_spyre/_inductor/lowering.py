@@ -24,7 +24,7 @@ from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from typing import Any, Callable, Union
 
-from .constants import BATCH_MATMUL_OP
+BATCH_MATMUL_OP = "batchmatmul"
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction

@@ -21,7 +21,7 @@ import torch
 from torch.utils import _pytree as pytree
 import torch._decomp as decomp
 
-from .constants import DEVICE_NAME
+from torch_spyre.constants import DEVICE_NAME
 from .errors import Unsupported
 from . import customops  # noqa: F401
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .constants import DEVICE_NAME
+from torch_spyre.constants import DEVICE_NAME
 from .patches import enable_spyre_context
 
 import threading

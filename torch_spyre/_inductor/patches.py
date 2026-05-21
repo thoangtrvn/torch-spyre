@@ -41,14 +41,12 @@ def enable_spyre_context(
     decomps: Optional[dict[torch._ops.OperatorBase, Callable]] = None,
 ):
     """
-    Context manager that sets up the complete Spyre compilation environment.
+    Context manager that sets up the Spyre compilation environment.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
-      - Enabling Spyre-specific data type handling
+      - Enabling Spyre-specific data type handling (bfloat16 computation)
       - Activating Spyre lowerings and decompositions
-      - Configuring Inductor settings optimized for Spyre
-      - Setting up custom pre/post compilation passes
-      - Disabling incompatible optimizations (e.g., reduction splitting, permute fusion)
+      - Disabling incompatible optimizations (reduction splitting, permute fusion)
 
     Args:
         example_inputs: List of example inputs to the graph being compiled. Used to
@@ -62,7 +60,7 @@ def enable_spyre_context(
     if decomps is None:
         decomps = torch._inductor.decomposition.decompositions
 
-    from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
+    from torch_spyre._inductor.lowering import enable_spyre_lowerings
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)
     import torch_spyre._inductor.customops  # noqa: F401
@@ -72,24 +70,11 @@ def enable_spyre_context(
 
     import torch_spyre._inductor.lowering  # noqa: F401
     from torch_spyre._inductor.choices import SpyreHeuristics
-    from torch_spyre._inductor.passes import (
-        CustomPreGradPasses,
-        CustomPrePasses,
-        CustomPostPasses,
-        CustomPreFusionPasses,
-        CustomPostFusionPasses,
-        CustomPreSchedulingPasses,
-    )
 
-    # *) Inductor config tweaks (saved/restored)
+    # Inductor config tweaks (saved/restored)
     new_config = {
         "split_reductions": False,
         "benchmark_harness": False,
-        "pre_grad_custom_pass": CustomPreGradPasses(),
-        "post_grad_custom_pre_pass": CustomPrePasses(),
-        "post_grad_custom_post_pass": CustomPostPasses(),
-        "_pre_fusion_custom_pass": CustomPreFusionPasses(),
-        "_post_fusion_custom_pass": CustomPostFusionPasses(),
         # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
         # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
         "unroll_reductions_threshold": 1,
@@ -98,29 +83,11 @@ def enable_spyre_context(
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
     }
 
-    from torch._inductor.ir import Loops
-
-    # Force all operations to be realized when LoopLevel IR is initially constructed
-    old_loop = Loops.has_large_inner_fn
-    Loops.has_large_inner_fn = lambda self, threshold=None: True
-
     from torch._inductor.fx_passes import joint_graph
 
     origin_pass = list(joint_graph.pass_patterns)
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
-
-    # Inject the pre_scheduling_passes before the Scheduler is constructed,
-    # allowing the passes to modify the graph IR (buffers, inputs, constants).
-    old_update_scheduler = GraphLowering._update_scheduler
-
-    _pre_scheduling_pass = CustomPreSchedulingPasses()
-
-    def _spyre_update_scheduler(self: GraphLowering) -> None:
-        _pre_scheduling_pass(self.operations)
-        old_update_scheduler(self)
-
-    GraphLowering._update_scheduler = _spyre_update_scheduler  # type: ignore[method-assign]
 
     with (
         spyre_data_types(),
@@ -134,5 +101,3 @@ def enable_spyre_context(
             yield spyre_context_decompositions
         finally:
             joint_graph.pass_patterns[:] = origin_pass
-            Loops.has_large_inner_fn = old_loop
-            GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
