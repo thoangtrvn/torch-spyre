@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import platform
 from pathlib import Path
 import yaml
 import pytest
@@ -395,6 +396,24 @@ def pytest_collection_modifyitems(config, items):
         "NLLLoss",
         "SoftMarginLoss",
     ]
+
+    # ── Mark slow tests on PowerPC ──
+    # Large matmul tests are prohibitively slow on PowerPC (hardware
+    # completion latency + large tensor sizes). Skip them via the
+    # spyre_slow_on_ppc64 marker so they still run on x86.
+    if platform.machine() == "ppc64le" or platform.machine() == "ppc64":
+        slow_on_ppc64_patterns = [
+            "test_large_matmul",
+        ]
+        for item in items:
+            for pattern in slow_on_ppc64_patterns:
+                if pattern in item.nodeid:
+                    item.add_marker(
+                        pytest.mark.spyre_slow_on_ppc64(
+                            reason=f"slow on {platform.machine()}"
+                        )
+                    )
+                    break
 
     broken_padding = [
         "CircularPad",

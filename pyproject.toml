@@ -88,6 +88,12 @@ module = ["torch_spyre._inductor.*"]
 disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
+markers = [
+    "spyre_broken_operators: tests for unsupported/broken operators",
+    "spyre_broken_runtime: tests that fail at runtime on Spyre",
+    "spyre_broken_pad: tests for unsupported padding modes",
+    "spyre_slow_on_ppc64: tests that are prohibitively slow on PowerPC",
+]
 filterwarnings = [
     # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
     # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
@@ -110,7 +116,7 @@ norecursedirs = ['tests/models']
 # Use pytest markers for more maintainable test exclusion.
 addopts = [
     "-k", "not _spyre_float64 and not _spyre_bfloat16 and not _spyre_complex64 and not _spyre_complex128 and not _spyre_complex32",
-    "-m", "not spyre_broken_operators and not spyre_broken_runtime and not spyre_broken_pad",
+    "-m", "not spyre_broken_operators and not spyre_broken_runtime and not spyre_broken_pad and not spyre_slow_on_ppc64",
 ]
 
 [tool.uv]
