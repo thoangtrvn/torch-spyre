@@ -97,10 +97,29 @@ class SpyreHeuristics(InductorChoices):
                 val = tiling.get(tiling_key)
                 if val is not None:
                     try:
-                        # PyTorch 2.11 uses size_hint(); 2.12+ has
-                        # statically_known_int() which returns None for
-                        # symbolic exprs instead of a heuristic estimate.
-                        concrete = int(V.graph.sizevars.size_hint(val))
+                        # Prefer statically_known_int() (PyTorch 2.12+)
+                        # which returns None for symbolic expressions. We
+                        # must NOT inject FixedTritonConfig with heuristic
+                        # estimates from size_hint() — a wrong block size
+                        # causes Triton assertion failures at runtime.
+                        # PyTorch 2.11 lacks statically_known_int() but all
+                        # Spyre shapes are currently static, so size_hint()
+                        # is safe there. When upgrading to 2.12, remove the
+                        # fallback and use only statically_known_int().
+                        _ski = getattr(
+                            V.graph.sizevars, "statically_known_int", None
+                        )
+                        if _ski is not None:
+                            concrete = _ski(val)
+                        else:
+                            # PyTorch 2.11: size_hint() is the only option.
+                            # Safe for static shapes (our current use case).
+                            concrete = int(
+                                V.graph.sizevars.size_hint(val)
+                            )
+                        if concrete is None:
+                            # Symbolic expression — skip this dimension.
+                            continue
                         problem_dims[dim_name] = concrete
                     except (TypeError, ValueError):
                         pass

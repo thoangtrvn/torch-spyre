@@ -14,6 +14,8 @@
 
 from contextlib import contextmanager
 
+import logging
+
 import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
@@ -112,8 +114,9 @@ def enable_spyre_context(
 
     _orig_use_native_matmul = mm_common.use_native_matmul
 
+    _log = logging.getLogger("torch_spyre.patches")
+
     def _spyre_aware_use_native_matmul(mat1, mat2):
-        import sys as _sys
         _dev = mat1.get_device().type
         if _dev == DEVICE_NAME:
             # tl.dot requires all of M, K, N > 1. When M=1 (vector-matrix
@@ -124,25 +127,25 @@ def enable_spyre_context(
             m_le1 = V.graph.sizevars.statically_known_leq(m, 1)
             k_le1 = V.graph.sizevars.statically_known_leq(k, 1)
             n_le1 = V.graph.sizevars.statically_known_leq(n, 1)
-            print(f"[SPYRE_DIAG] use_native_matmul: dev={_dev} m={m} k={k} n={n} m_le1={m_le1} k_le1={k_le1} n_le1={n_le1}", file=_sys.stderr, flush=True)
+            _log.debug(
+                "use_native_matmul: dev=%s m=%s k=%s n=%s m_le1=%s k_le1=%s n_le1=%s",
+                _dev, m, k, n, m_le1, k_le1, n_le1,
+            )
             if m_le1 or k_le1 or n_le1:
                 return False
             return True
         result = _orig_use_native_matmul(mat1, mat2)
-        print(f"[SPYRE_DIAG] use_native_matmul: dev={_dev} → orig returned {result}", file=_sys.stderr, flush=True)
+        _log.debug("use_native_matmul: dev=%s -> orig returned %s", _dev, result)
         return result
 
     mm_common.use_native_matmul = _spyre_aware_use_native_matmul
     mm.use_native_matmul = _spyre_aware_use_native_matmul
     bmm.use_native_matmul = _spyre_aware_use_native_matmul
 
-    # --- DIAGNOSTIC: verify patches and lowering/decomposition state ---
-    import sys
-    _diag = lambda msg: print(f"[SPYRE_DIAG] {msg}", file=sys.stderr, flush=True)
-    _diag(f"mm.use_native_matmul = {mm.use_native_matmul}")
-    _diag(f"mm_common.use_native_matmul = {mm_common.use_native_matmul}")
-    _diag(f"bmm.use_native_matmul = {bmm.use_native_matmul}")
-    # --- END DIAGNOSTIC ---
+    # Verify patches applied correctly
+    _log.debug("mm.use_native_matmul = %s", mm.use_native_matmul)
+    _log.debug("mm_common.use_native_matmul = %s", mm_common.use_native_matmul)
+    _log.debug("bmm.use_native_matmul = %s", bmm.use_native_matmul)
 
     with (
         spyre_data_types(),
@@ -152,19 +155,12 @@ def enable_spyre_context(
         V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),
     ):
-        # --- DIAGNOSTIC: check lowering + decomposition tables after context setup ---
-        _mm_lowering = torch._inductor.lowering.lowerings.get(torch.ops.aten.mm.default)
-        _addmm_lowering = torch._inductor.lowering.lowerings.get(torch.ops.aten.addmm.default)
-        _mm_decomp = decomps.get(torch.ops.aten.mm.default)
-        _addmm_decomp = decomps.get(torch.ops.aten.addmm.default)
-        _linear_decomp = decomps.get(torch.ops.aten.linear.default)
-        _diag(f"lowering[aten.mm.default] = {_mm_lowering}")
-        _diag(f"lowering[aten.addmm.default] = {_addmm_lowering}")
-        _diag(f"decomp[aten.mm.default] = {_mm_decomp}")
-        _diag(f"decomp[aten.addmm.default] = {_addmm_decomp}")
-        _diag(f"decomp[aten.linear.default] = {_linear_decomp}")
-        _diag(f"config.triton.native_matmul = {torch._inductor.config.triton.native_matmul}")
-        # --- END DIAGNOSTIC ---
+        _log.debug("lowering[aten.mm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.mm.default))
+        _log.debug("lowering[aten.addmm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.addmm.default))
+        _log.debug("decomp[aten.mm.default] = %s", decomps.get(torch.ops.aten.mm.default))
+        _log.debug("decomp[aten.addmm.default] = %s", decomps.get(torch.ops.aten.addmm.default))
+        _log.debug("decomp[aten.linear.default] = %s", decomps.get(torch.ops.aten.linear.default))
+        _log.debug("config.triton.native_matmul = %s", torch._inductor.config.triton.native_matmul)
 
         try:
             yield spyre_context_decompositions
