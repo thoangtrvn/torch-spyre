@@ -24,12 +24,10 @@ from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
 from typing import Any, Callable, Union
 
-BATCH_MATMUL_OP = "batchmatmul"
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction
 from torch._inductor.virtualized import V
-from .errors import Unsupported
 import threading
 from .logging_utils import get_inductor_logger
 import logging
@@ -112,15 +110,39 @@ def restore_lowerings(saved_overloads, lowering_dict):
 _CLAMP_FUNC_OVS = ["default", "Tensor", "Tensor_minmax"]
 
 
+# Lowerings that create SDSC-specific IR nodes (non-standard reduction types,
+# SpyreReduction, etc.) and must be excluded when TritonScheduling is active.
+# TritonScheduling needs standard Inductor IR (Reduction("dot"), Reduction("sum"),
+# etc.) to emit proper TTIR with tt.dot/tt.reduce operations.
+_TRITON_INCOMPATIBLE_LOWERINGS = frozenset({
+    torch.ops.aten.mm.default,               # → Inductor tuned_mm (native_matmul) → Reduction("dot") → tt.dot → sentient_codegen matmul
+    torch.ops.aten.bmm.default,              # → Inductor tuned_bmm (native_matmul) → Reduction("dot") → tt.dot → sentient_codegen matmul
+    torch.ops.aten.mean.dim,                 # creates SpyreReduction("mean")
+    torch.ops.spyre.exx2.default,            # creates SpyreReduction("exx2")
+    torch.ops.spyre.layernormscale.default,  # bypasses Inductor layernorm decomposition
+    torch.ops.spyre.layernormnorm.default,   # bypasses Inductor layernorm decomposition
+    torch.ops.spyre.topkvalue.default,       # creates Reduction("topkvalue")
+    torch.ops.spyre.topkindex.default,       # creates Reduction("topkindex")
+})
+
+
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
 @contextmanager
-def enable_spyre_lowerings():
+def enable_spyre_lowerings(*, triton_path: bool = False):
     """
     CM that enables Spyre lowerings:
       - Temporarily redirect relevant aten ops → Spyre lowering
       - Restore original aten lowerings on exit
 
     This CM is reentrant and safe under nested usage.
+
+    Args:
+        triton_path: If True, only activate lowerings compatible with
+            TritonScheduling. Excludes matmul/reduction lowerings that
+            create SDSC-specific reduction types ("batchmatmul", "exx2",
+            "mean", etc.). These ops are handled by Inductor's standard
+            lowerings, which create "dot"/"sum" reduction types that
+            TritonKernel can emit as tt.dot/tt.reduce.
     """
     global _lowerings_nesting
     with _lowerings_lock:
@@ -128,12 +150,16 @@ def enable_spyre_lowerings():
         _lowerings_nesting += 1
 
         if first_enter:
+            excluded = _TRITON_INCOMPATIBLE_LOWERINGS if triton_path else frozenset()
+
             enable_spyre_lowerings._removed_fallbacks = {}
             enable_spyre_lowerings._removed_fallbacks = unregister_lowerings(
                 fallback_ops, lowering.lowerings, allow_missing=True
             )
             saved_intree_lowerings = {}
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+                if spyre_lowering_op in excluded:
+                    continue
                 if spyre_lowering_op in lowering.lowerings:
                     saved_intree_lowerings[spyre_lowering_op] = lowering.lowerings[
                         spyre_lowering_op
@@ -230,139 +256,6 @@ def ensure_default_handler(op_name):
     if op_name not in cls.__dict__:
         method = cls._call_default(op_name)
         setattr(cls, op_name, method)
-
-
-@register_spyre_lowering(torch.ops.aten.mm.default)
-def lower_mm(x, y):
-    x.realize()
-    y.realize()
-    x_loader = x.make_loader()
-    y_loader = y.make_loader()
-
-    x_size = x.get_size()
-    y_size = y.get_size()
-    x_ndim = len(x_size)
-    y_ndim = len(y_size)
-
-    reduction_numel = x_size[-1]  # K
-
-    # Handle 3D input with 2D weight (batched matmul)
-    if x_ndim == 3 and y_ndim == 2:
-        ranges = [x_size[0], x_size[1], y_size[1]]  # [B, M, N]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index  # batch, row, col
-            (r0,) = reduction_index
-            return (x_loader([i0, i1, r0]), y_loader([r0, i2]))
-    elif x_ndim == 2 and y_ndim == 2:
-        ranges = [x_size[0], y_size[1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1 = index
-            (r0,) = reduction_index
-            return (x_loader([i0, r0]), y_loader([r0, i1]))
-    else:
-        raise ValueError(
-            f"Unsupported tensor dimensions for mm: x.shape={x_size}, y.shape={y_size}. "
-            f"Expected (2D, 2D) or (3D, 2D), got ({x_ndim}D, {y_ndim}D)"
-        )
-
-    if reduction_numel == 1:
-        # Reduction degenerates to a pointwise mul
-        result = lowering.mul(x, y)
-    else:
-        result = Reduction.create(
-            reduction_type=BATCH_MATMUL_OP,
-            input_node=[x, y],
-            device=x.get_device(),
-            dst_dtype=x.get_dtype(),
-            src_dtype=x.get_dtype(),
-            inner_fn=inner_fn,
-            ranges=ranges,
-            reduction_ranges=[reduction_numel],
-        )
-
-    result.realize()
-
-    if logger.isEnabledFor(logging.DEBUG):
-        result_buf = V.graph.get_buffer(result.get_name())
-        logger.debug(
-            f"mm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}, "
-            f"x_layout={x.get_layout()}, y_layout={y.get_layout()}, out_layout={result_buf.get_layout()}"
-        )
-
-    return result
-
-
-@register_spyre_lowering(torch.ops.spyre.batched_matmul.default)
-@register_spyre_lowering(torch.ops.aten.bmm.default)
-def lower_bmm(x, y):
-    x.realize()
-    y.realize()
-    x_loader = x.make_loader()
-    y_loader = y.make_loader()
-
-    x_size = x.get_size()
-    y_size = y.get_size()
-    x_ndim = len(x_size)
-    y_ndim = len(y_size)
-
-    reduction_numel = x_size[-1]  # K
-
-    if x_ndim == 3 and y_ndim == 3:
-        ranges = [x_size[0], x_size[1], y_size[2]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([i0, r0, i2])
-            return (tmp1, tmp2)
-    elif x_ndim == 4 and y_ndim == 4:
-        ranges = [x_size[0], x_size[1], x_size[2], y_size[-1]]
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2, i3 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, i2, r0])
-            tmp2 = y_loader([i0, i1, r0, i3])
-            return (tmp1, tmp2)
-    elif x_ndim == 3 and y_ndim == 2:
-        ranges = [x_size[0], x_size[1], y_size[1]]  # B, M, N
-
-        def inner_fn(index, reduction_index):
-            i0, i1, i2 = index
-            (r0,) = reduction_index
-            tmp1 = x_loader([i0, i1, r0])
-            tmp2 = y_loader([r0, i2])
-            return (tmp1, tmp2)
-    else:
-        raise Unsupported(f"BMM with input shapes {x.get_size()} and {y.get_size()}")
-
-    if reduction_numel == 1:
-        # Reduction degenerates to a pointwise mul
-        result = lowering.mul(x, y)
-    else:
-        result = Reduction.create(
-            reduction_type=BATCH_MATMUL_OP,
-            input_node=[x, y],
-            device=x.get_device(),
-            dst_dtype=x.get_dtype(),
-            src_dtype=x.get_dtype(),
-            inner_fn=inner_fn,
-            ranges=ranges,
-            reduction_ranges=[reduction_numel],
-        )
-
-    result.realize()
-
-    if logger.isEnabledFor(logging.DEBUG):
-        result_buf = V.graph.get_buffer(result.get_name())
-        logger.debug(
-            f"bmm: x{list(x_size)} @ y{list(y_size)} -> {list(result_buf.get_size())}"
-        )
-
-    return result
 
 
 @register_spyre_lowering(torch.ops.spyre.exx2)

@@ -40,6 +40,15 @@ spyre_decompositions: dict = {}
 spyre_decompositions_to_exclude = [
     torch.ops.aten.triu,
     torch.ops.aten.tril,
+    # Exclude aten.mm decomposition so that aten.mm reaches tuned_mm, which
+    # uses the native matmul path (ops.dot + make_reduction("dot")) when
+    # use_native_matmul() returns True. The in-tree decomposition at
+    # torch/_inductor/decomposition.py:424 decomposes mm into
+    # unsqueeze+mul+sum for M==1 cases, which prevents tuned_mm from ever
+    # being called and leaves extern_kernels.mm in the compiled function.
+    torch.ops.aten.mm,
+    # Same for bmm — exclude decomposition so tuned_bmm handles it natively.
+    torch.ops.aten.bmm,
 ]
 
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
@@ -97,10 +106,24 @@ def register_spyre_decomposition(
     return decorator
 
 
+# Decompositions that produce spyre.* custom ops, which then trigger SDSC-specific
+# lowerings. These must be excluded in the Triton path so that Inductor's standard
+# decompositions produce standard aten ops that TritonScheduling can handle.
+_TRITON_INCOMPATIBLE_DECOMPOSITIONS = frozenset({
+    torch.ops.aten.layer_norm.default,   # → spyre.layernormscale + spyre.layernormnorm
+    torch.ops.aten.rms_norm.default,     # → spyre.exx2
+    torch.ops.aten.gelu.default,         # → spyre.gelu
+    torch.ops.aten.softplus.default,     # → spyre.softplus
+    torch.ops.aten.topk,                 # → spyre.topkvalue + spyre.topkindex
+})
+
+
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
 @contextmanager
 def enable_spyre_decompositions(
     decomps: Optional[dict[torch._ops.OperatorBase, Callable]] = None,
+    *,
+    triton_path: bool = False,
 ):
     """
     CM that enables Spyre decompositions:
@@ -113,6 +136,11 @@ def enable_spyre_decompositions(
         decomps: Decomposition table to modify. Maps operator overloads to their
             decomposition implementations. Defaults to PyTorch Inductor's global
             decomposition registry (torch._inductor.decomposition.decompositions).
+        triton_path: If True, exclude decompositions that produce spyre.* custom
+            ops. In the Triton path, Inductor's standard decompositions produce
+            standard aten ops (e.g., aten.native_layer_norm instead of
+            spyre.layernormscale), which TritonScheduling compiles to TTIR
+            with standard tt.reduce operations.
     """
     if decomps is None:
         decomps = torch._inductor.decomposition.decompositions
@@ -138,11 +166,14 @@ def enable_spyre_decompositions(
             return _removed
 
         # 1. Add/override spyre-specific decompositions
+        excluded_decomps = _TRITON_INCOMPATIBLE_DECOMPOSITIONS if triton_path else frozenset()
         saved_intree_decompositions = {}
         for (
             spyre_decompositions_op,
             spyre_decompositions_impl,
         ) in spyre_decompositions.items():
+            if spyre_decompositions_op in excluded_decomps:
+                continue
             if spyre_decompositions_op in decomps:
                 saved_intree_decompositions[spyre_decompositions_op] = decomps[
                     spyre_decompositions_op

@@ -71,6 +71,14 @@ class SpyreInterface(DeviceInterface):
     def is_available() -> bool:
         return torch.spyre.is_available()  # type: ignore[attr-defined]
 
+    @staticmethod
+    def exchange_device(device: int) -> int:
+        return 0  # Spyre has a single device, previous is always 0
+
+    @staticmethod
+    def maybe_exchange_device(device: int) -> int:
+        return 0
+
     @classmethod
     def get_device_properties(
         cls, device: torch.types.Device = None
@@ -91,13 +99,20 @@ class SpyreInterface(DeviceInterface):
         return _cached_compute_capability
 
     class Worker(DeviceInterface.Worker):
-        # TODO (yoheiueda) Support non-zero index values when multiple Spyre cards are supported in the future
         @staticmethod
         def set_device(device: int):
-            raise NotImplementedError
+            pass  # Spyre has a single device, no-op
 
         @staticmethod
         def current_device() -> int:
+            return 0
+
+        @staticmethod
+        def exchange_device(device: int) -> int:
+            return 0  # Spyre has a single device, previous is always 0
+
+        @staticmethod
+        def maybe_exchange_device(device: int) -> int:
             return 0
 
         @staticmethod

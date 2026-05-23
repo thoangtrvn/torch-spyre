@@ -81,6 +81,22 @@ class _SpyreImpl:
                 from triton.backends.spyre.driver import SpyreDriver
 
                 triton_driver.set_active(SpyreDriver())
+
+                # Patch triton_helpers.set_driver_to_gpu to recognize the
+                # already-active SpyreDriver. Without this, the generated
+                # Triton kernel wrapper calls set_driver_to_gpu() which can't
+                # find SpyreDriver because is_active() returns False (by
+                # design, to avoid CUDA auto-discovery conflicts).
+                import torch._inductor.runtime.triton_helpers as _triton_helpers
+
+                _original_set_driver_to_gpu = _triton_helpers.set_driver_to_gpu
+
+                def _spyre_aware_set_driver_to_gpu():
+                    if isinstance(triton_driver.active, SpyreDriver):
+                        return
+                    _original_set_driver_to_gpu()
+
+                _triton_helpers.set_driver_to_gpu = _spyre_aware_set_driver_to_gpu
             except ImportError:
                 pass  # triton-spyre not installed — Triton path unavailable
 

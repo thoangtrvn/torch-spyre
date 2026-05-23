@@ -271,6 +271,16 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
     }
   }
 
+  // Sanity checks before device allocation — a malformed binary can crash
+  // or hang the C++ runtime. Init packets must be 32-byte aligned (flit
+  // granularity) and at least one flit (64 bytes = header + SPR flit).
+  TORCH_CHECK(binary.size() % 32 == 0,
+              "Init packet size must be 32-byte aligned, got ",
+              binary.size(), " bytes");
+  TORCH_CHECK(binary.size() >= 64,
+              "Init packet too small: ", binary.size(),
+              " bytes (minimum 64 = header + SPR flit)");
+
   // Load artifacts — no global lock held during device allocation/copy
   KernelArtifacts arts;
   arts.init_bin = binary;
