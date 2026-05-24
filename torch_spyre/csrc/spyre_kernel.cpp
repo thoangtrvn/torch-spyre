@@ -112,6 +112,32 @@ std::vector<uint8_t> readHexEncodedFile(const std::string& filepath) {
   return binary_data;
 }
 
+std::vector<uint8_t> readBinaryFile(const std::string& filepath) {
+  // Read a raw binary file in hardware-native byte order.
+  // No byte swapping needed — the file layout matches device memory exactly.
+  std::ifstream inpFile(filepath, std::ios::in | std::ios::binary);
+  if (!inpFile.is_open()) {
+    throw std::runtime_error("Failed to open binary file: " + filepath);
+  }
+  inpFile.seekg(0, std::ios::end);
+  auto size = static_cast<size_t>(inpFile.tellg());
+  inpFile.seekg(0, std::ios::beg);
+
+  if (size == 0) {
+    throw std::runtime_error("Empty binary file: " + filepath);
+  }
+  if (size % 128 != 0) {
+    throw std::runtime_error(
+        "Binary file size must be multiple of 128 bytes (row granularity), got " +
+        std::to_string(size) + " bytes in " + filepath);
+  }
+
+  std::vector<uint8_t> data(size);
+  inpFile.read(reinterpret_cast<char*>(data.data()),
+               static_cast<std::streamsize>(size));
+  return data;
+}
+
 std::string get_init_path(const std::string& code_dir) {
   fs::path dir(code_dir);
   std::string kernel_name = dir.filename().string();
@@ -177,9 +203,15 @@ KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
   TORCH_CHECK(std::filesystem::exists(bundle_path),
               "Bundle not found: ", bundle_path);
 
-  // Read init.bin (hex-encoded program binary)
-  std::string init_path = get_init_path(code_dir) + "/init.txt";
-  arts.init_bin = readHexEncodedFile(init_path);
+  // Read init packet binary — prefer raw binary (.bin) over hex (.txt)
+  std::string init_dir = get_init_path(code_dir);
+  std::string init_bin_path = init_dir + "/init.bin";
+  std::string init_txt_path = init_dir + "/init.txt";
+  if (std::filesystem::exists(init_bin_path)) {
+    arts.init_bin = readBinaryFile(init_bin_path);
+  } else {
+    arts.init_bin = readHexEncodedFile(init_txt_path);
+  }
 
   arts.program_size = arts.init_bin.size();
   auto& allocator = SpyreAllocator::instance();
