@@ -65,11 +65,85 @@ class SpyreDeviceProperties:
     multi_processor_count: int
 
 
+class SpyreEvent:
+    """Wall-clock event for benchmarking compatibility.
+
+    launch_kernel_from_bytes() is asynchronous — it submits a CB and
+    returns control to the CPU immediately (same as CUDA kernel launches).
+    Without device-side timestamp recording wired up yet, record()
+    synchronizes the device first, then captures a wall-clock timestamp.
+    This ensures elapsed_time() measures actual execution time, not just
+    CB submission time.
+
+    Future: GPU-style stream-ordered events
+    ----------------------------------------
+    CUDA events work differently from wall-clock timing:
+
+    1. event.record(stream) inserts a lightweight marker into the GPU
+       command stream. The CPU continues immediately — no blocking.
+    2. The GPU hardware captures a device-side timestamp when it
+       processes the marker in stream order (after all previously
+       submitted work on that stream).
+    3. event.elapsed_time(other) reads the GPU-captured timestamps
+       from both events and returns the difference. This gives pure
+       device execution time with zero CPU overhead.
+
+    Benefits over wall-clock timing:
+    - Non-blocking: record() doesn't stall the CPU pipeline
+    - Precise: measures device time, not wall-clock time that includes
+      CPU scheduling jitter and other host-side overhead
+    - Stream-ordered: timestamps are captured in the device's execution
+      order, not the host's submission order
+    - Overlapping: host can submit more work while reading timing from
+      previously completed events
+
+    To implement for AIU:
+    - The flex runtime / hardware needs an API to record a device-side
+      timestamp at a given point in the CB stream
+    - record() would submit a "record timestamp" CB command instead of
+      calling synchronize()
+    - elapsed_time() would query the recorded device timestamps
+    - The C++ binding in torch_spyre._C would expose these operations
+    """
+
+    def __init__(self, *, enable_timing: bool = False):
+        self._enable_timing = enable_timing
+        self._time_ns: int = 0
+        self._device = None
+
+    def record(self, stream=None):
+        if self._enable_timing:
+            import time
+            from torch_spyre.streams import synchronize
+            synchronize()
+            self._time_ns = time.monotonic_ns()
+
+    def elapsed_time(self, end_event: "SpyreEvent") -> float:
+        # Return milliseconds between two synchronized timestamps.
+        if self._enable_timing and end_event._enable_timing:
+            return (end_event._time_ns - self._time_ns) / 1_000_000.0
+        return 0.0
+
+
 class SpyreInterface(DeviceInterface):
+    Event = SpyreEvent
+
     # Can be mock patched by @patch decorator.
     @staticmethod
     def is_available() -> bool:
         return torch.spyre.is_available()  # type: ignore[attr-defined]
+
+    @staticmethod
+    def current_device() -> int:
+        return 0
+
+    @staticmethod
+    def set_device(device: torch.types.Device) -> None:
+        pass  # Spyre has a single device, no-op
+
+    @staticmethod
+    def device_count() -> int:
+        return 1
 
     @staticmethod
     def exchange_device(device: int) -> int:
@@ -78,6 +152,35 @@ class SpyreInterface(DeviceInterface):
     @staticmethod
     def maybe_exchange_device(device: int) -> int:
         return 0
+
+    @staticmethod
+    def stream(stream: torch.Stream) -> Any:
+        return stream.__enter__()
+
+    @staticmethod
+    def current_stream() -> torch.Stream:
+        from torch_spyre.streams import current_stream
+        return current_stream()
+
+    @staticmethod
+    def set_stream(stream: torch.Stream) -> None:
+        from torch_spyre import _C
+        _C.set_current_stream(stream._cdata if hasattr(stream, "_cdata") else stream)
+
+    @staticmethod
+    def _set_stream_by_id(stream_id: int, device_index: int, device_type: int) -> None:
+        pass  # Spyre is synchronous, no-op
+
+    @staticmethod
+    def get_raw_stream(device_idx: int) -> int:
+        from torch_spyre.streams import current_stream
+        s = current_stream(torch.device("spyre", device_idx))
+        return s.id
+
+    @staticmethod
+    def synchronize(device: torch.types.Device = None) -> None:
+        from torch_spyre.streams import synchronize
+        synchronize(device)
 
     @classmethod
     def get_device_properties(
