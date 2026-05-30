@@ -12,21 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import threading
-
 import torch
 
 from torch._inductor.choices import InductorChoices
 from torch._inductor.codegen.triton import FixedTritonConfig
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 from torch._inductor.virtualized import V
-
-
-# Module-level store for passing problem dims from Inductor scheduling
-# to the Spyre backend compilation stage. Keyed by kernel name to
-# avoid race conditions with multiple kernel compilations.
-_spyre_problem_dims_store: dict[str, dict[str, int]] = {}
-_spyre_problem_dims_lock = threading.Lock()
 
 
 class SpyreHeuristics(InductorChoices):
@@ -165,11 +156,28 @@ class SpyreHeuristics(InductorChoices):
                 "XBLOCK": elements_per_stick,
             })
 
-        # Store problem dims for the Spyre backend to read in _make_spyre_ir().
+        # Pass problem dims through FixedTritonConfig → cfg.kwargs →
+        # CachingAutotuner._create_compile_options() → options dict →
+        # backend.parse_options() → SpyreOptions.problem_m/n/k.
+        #
+        # NOTE: problem_m/n/k CANNOT go directly in kernel_kwargs because
+        # SIMDKernel.__init__() rejects unknown kwargs. They must be embedded
+        # inside FixedTritonConfig which is a recognized kwarg. At runtime,
+        # FixedTritonConfig.config becomes cfg.kwargs in the CachingAutotuner.
+        # A monkey-patch on _create_compile_options (in __init__.py _autoload)
+        # copies Spyre-recognized keys from cfg.kwargs into the options dict,
+        # so backend.parse_options() receives them.
         if problem_dims and tiling:
-            kernel_key = f"{kernel_cls.__name__}_{id(tiling)}"
-            with _spyre_problem_dims_lock:
-                _spyre_problem_dims_store[kernel_key] = problem_dims
-                _spyre_problem_dims_store["_latest"] = problem_dims
+            m = problem_dims.get("M", 0)
+            n = problem_dims.get("N", 0)
+            k = problem_dims.get("K", 0)
+            config_dict = kernel_kwargs.get("fixed_config", FixedTritonConfig({})).config.copy()
+            if m > 0:
+                config_dict["problem_m"] = m
+            if n > 0:
+                config_dict["problem_n"] = n
+            if k > 0:
+                config_dict["problem_k"] = k
+            kernel_kwargs["fixed_config"] = FixedTritonConfig(config_dict)
 
         return kernel_kwargs

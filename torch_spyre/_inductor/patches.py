@@ -72,7 +72,6 @@ def enable_spyre_context(
     )
 
     import torch_spyre._inductor.lowering  # noqa: F401
-    from torch_spyre._inductor.choices import SpyreHeuristics
 
     # Inductor config tweaks (saved/restored)
     new_config = {
@@ -152,7 +151,6 @@ def enable_spyre_context(
         enable_spyre_lowerings(triton_path=True),
         enable_spyre_decompositions(decomps=decomps, triton_path=True) as spyre_context_decompositions,
         V.set_real_inputs(example_inputs),
-        V.set_choices_handler(SpyreHeuristics()),
         torch._inductor.config.patch(new_config),
     ):
         _log.debug("lowering[aten.mm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.mm.default))
