@@ -525,7 +525,7 @@ def analyze(path):
         tree = ast.parse(source, filename=path)
     except SyntaxError as e:
         print(json.dumps({"error": f"SyntaxError: {e}"})); return
-    
+
     # Pre-scan for names assigned from parametrize(...) calls (e.g. parametrize_unary_ufuncs).
     # These are used as decorators and must be recognised as equivalent to @parametrize.
     parametrize_names = _get_parametrize_names(tree)
@@ -888,7 +888,7 @@ if '${cls}' in globals():
 #     privateuse1/spyre. Re-injected here WITHOUT only_for so TorchTestBase
 #     can generate the spyre variant and control it via the YAML config.
 # Classes with no 'device' arg are safe when YAML mode is 'skip'.
- 
+
 import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
@@ -937,7 +937,7 @@ _restricted_names = set([${quoted_restricted_list}])
 def _do_pre_import():
     """Capture original class objects before the star-import deletes them."""
     import torch.testing._internal.common_device_type as _cdtype
-    
+
     real_fn = _cdtype.instantiate_device_type_tests
 
     def _capturing_instantiate(cls, *args, **kwargs):
@@ -1360,8 +1360,11 @@ _run_pytest_isolated() {
             rm -rf "${_LOGDIR}"
         else
             echo "[torch_oot_device_tests_run] Running serial test"
-            # Regular pytest for non-distributed tests
-            python3 -m pytest "$_base" "${_args[@]}"
+            # Regular pytest for non-distributed tests.
+            # Pass -c explicitly so pytest picks up torch-spyre's
+            # pyproject.toml (markers, addopts, filterwarnings, etc.)
+            # even though we cd'd into the test file's directory.
+            python3 -m pytest -c "${TORCH_DEVICE_ROOT}/pyproject.toml" "$_base" "${_args[@]}"
             echo $? > "$_exit_tmp"
         fi
     ) || true
@@ -1483,7 +1486,7 @@ for i in "${!RUN_FILES[@]}"; do
     # so conftest.py files are discovered correctly.
     #
     # If the probe finds 0 matching tests (exit code 5) the -m flag is stripped
-    # from _FILE_PYTEST_ARGS so the file's tests all run normally. 
+    # from _FILE_PYTEST_ARGS so the file's tests all run normally.
     # the marker filter applies to files that USE that marker
     # family; files that don't use it are unaffected.
     #

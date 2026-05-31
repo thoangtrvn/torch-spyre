@@ -88,6 +88,9 @@ module = ["torch_spyre._inductor.*"]
 disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
+markers = [
+    "spyre_slow_on_ppc64: tests that are prohibitively slow on PowerPC",
+]
 filterwarnings = [
     # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
     # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
@@ -95,6 +98,9 @@ filterwarnings = [
     "ignore::DeprecationWarning:torch.jit._script",
 ]
 norecursedirs = ['tests/models']
+addopts = [
+    "-m", "not spyre_slow_on_ppc64",
+]
 
 [tool.uv]
 required-version = ">=0.9.0"
