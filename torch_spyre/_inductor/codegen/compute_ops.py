@@ -459,9 +459,18 @@ def generate_sdsc(
                                     **(
                                         {
                                             "backGapCore_": {
-                                                str(dim): {
-                                                    "-1": str(gap)  # HBM is -1
-                                                }
+                                                str(dim): (
+                                                    # LX: per-core keys 0..num_cores-1
+                                                    {
+                                                        str(c): str(gap)
+                                                        for c in range(
+                                                            sdsc_spec.num_cores
+                                                        )
+                                                    }
+                                                    if "lx" in tensor.allocation
+                                                    # HBM: -1 sentinel covers all cores
+                                                    else {"-1": str(gap)}
+                                                )
                                                 for dim, gap in tensor.backGap.items()
                                             }
                                         }
