@@ -89,7 +89,7 @@ disable_error_code = ["attr-defined"]
 
 [tool.pytest.ini_options]
 markers = [
-    "spyre_slow_on_ppc64: tests that are prohibitively slow on PowerPC",
+    "longrunning_on_ppc64: tests that are prohibitively slow on PowerPC",
 ]
 filterwarnings = [
     # PyTorch 2.10.0+: Suppress torch.jit.script_method DeprecationWarning triggered by
@@ -99,7 +99,7 @@ filterwarnings = [
 ]
 norecursedirs = ['tests/models']
 addopts = [
-    "-m", "not spyre_slow_on_ppc64",
+    "-m", "not longrunning_on_ppc64",
 ]
 
 [tool.uv]
