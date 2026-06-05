@@ -96,6 +96,10 @@ filterwarnings = [
     # importing torch._inductor.compile_fx (which transitively imports torch.utils.mkldnn).
     # https://github.com/pytorch/pytorch/blob/v2.11.0/torch/jit/_script.py#L366
     "ignore::DeprecationWarning:torch.jit._script",
+    # pytest 9: upstream PyTorch conftest.py still uses the deprecated py.path.local
+    # signature for hooks Suppress until PyTorch updates.
+    # we have pinned to pytest~=9.0.0, the warning may have become a hard error in pytest 9.
+    "ignore::pytest.PytestRemovedIn9Warning",
 ]
 norecursedirs = ['tests/models']
 addopts = [
