@@ -23,8 +23,10 @@ def run_test(comm_rank, comm_size):
     """Run an allreduce test where all ranks contribute and all receive the sum."""
     global DEVICE
 
-    # Each rank creates a tensor filled with its rank+1 value
-    input_tensor = torch.zeros(128, dtype=torch.float16)
+    # Each rank creates a tensor filled with its rank+1 value.
+    # 4096 elements (8 KB) gives Ring allreduce reasonable chunk sizes
+    # across typical device counts (2-4).
+    input_tensor = torch.zeros(4096, dtype=torch.float16)
     input_tensor.fill_(float(comm_rank + 1))
 
     print("-" * 70)
@@ -47,7 +49,7 @@ def run_test(comm_rank, comm_size):
 
     # Expected result: sum of (1 + 2 + 3 + ... + comm_size)
     expected_sum = sum(range(1, comm_size + 1))
-    expected_tensor = torch.zeros(128, dtype=torch.float16)
+    expected_tensor = torch.zeros(4096, dtype=torch.float16)
     expected_tensor.fill_(float(expected_sum))
 
     print(f"  Expected value per element: {expected_sum}")
