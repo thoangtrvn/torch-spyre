@@ -18,6 +18,8 @@
 
 #include <ATen/core/op_registration/adaption.h>
 
+#include <flex/runtime_stream/runtime_event.hpp>
+
 #include "module.h"
 #include "spyre_device_enum.h"
 #include "spyre_stream.h"
@@ -54,6 +56,16 @@ c10::Stream SpyreGuardImpl::getStream(c10::Device device) const {
   return getCurrentStream(device).unwrap();
 }
 
+c10::Stream SpyreGuardImpl::getDefaultStream(c10::Device device) const {
+  return spyre::getDefaultStream(device).unwrap();
+}
+
+c10::Stream SpyreGuardImpl::getStreamFromGlobalPool(c10::Device device,
+                                                    bool isHighPriority) const {
+  int priority = isHighPriority ? -1 : 0;
+  return getStreamFromPool(device, priority).unwrap();
+}
+
 c10::Stream SpyreGuardImpl::getNewStream(c10::Device device,
                                          int priority) const {
   return getStreamFromPool(device, priority).unwrap();
@@ -88,6 +100,45 @@ c10::Stream SpyreGuardImpl::exchangeStream(c10::Stream stream) const {
 void SpyreGuardImpl::recordDataPtrOnStream(const c10::DataPtr&,
                                            const c10::Stream&) const {}
 
+// --- Event methods ---
+// RuntimeEvent is non-copyable/non-movable, so we store as void* via
+// new/delete. PyTorch's InlineEvent passes void* event_ to these methods.
+
+void SpyreGuardImpl::destroyEvent(
+    void* event, const c10::DeviceIndex device_index) const noexcept {
+  delete static_cast<flex::RuntimeEvent*>(event);
+}
+
+void SpyreGuardImpl::record(void** event, const c10::Stream& stream,
+                            const c10::DeviceIndex device_index,
+                            const c10::EventFlag flag) const {
+  if (!*event) {
+    *event = new flex::RuntimeEvent();
+  }
+  auto* re = static_cast<flex::RuntimeEvent*>(*event);
+  SpyreStream ss(stream);
+  re->record(ss.getRuntimeHandle());
+}
+
+void SpyreGuardImpl::block(void* event, const c10::Stream& stream) const {
+  if (!event) return;
+  auto* re = static_cast<flex::RuntimeEvent*>(event);
+  SpyreStream ss(stream);
+  re->wait(ss.getRuntimeHandle());
+}
+
+bool SpyreGuardImpl::queryEvent(void* event) const {
+  if (!event) return false;
+  auto* re = static_cast<flex::RuntimeEvent*>(event);
+  return re->query();
+}
+
+void SpyreGuardImpl::synchronizeEvent(void* event) const {
+  if (!event) return;
+  auto* re = static_cast<flex::RuntimeEvent*>(event);
+  re->synchronize();
+}
+
 c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
     c10::Device /*unused*/) const {
   c10::DeviceCapability cap{};
@@ -105,7 +156,9 @@ c10::DeviceCapability SpyreGuardImpl::getDeviceCapability(
 
 thread_local c10::DeviceIndex SpyreGuardImpl::tls_idx = 0;
 
-// Registration (runs at DSO load — after you import your module)
+// Registration — runs when _C.so is loaded.
+// Loading _C.so does NOT trigger device initialization; that only
+// happens when start_runtime() is called via _lazy_init().
 C10_REGISTER_GUARD_IMPL(PrivateUse1, SpyreGuardImpl);
 
 }  // namespace spyre

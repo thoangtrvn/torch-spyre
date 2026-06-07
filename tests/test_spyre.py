@@ -483,7 +483,7 @@ class TestSpyre(TestCase):
             x = torch.empty(64, dtype=dtype, device="spyre")
             x.detach().cpu()
 
-    def test_hooks_on_import(self):
+    def test_device_on_import(self):
         dev = torch._C._get_accelerator()
         self.assertEqual(str(dev), "spyre")
 

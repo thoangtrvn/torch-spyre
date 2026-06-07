@@ -16,6 +16,7 @@
 #include "spyre_ccl.hpp"
 
 #include <iostream>
+#include <memory>
 #include <string>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <unordered_map>
@@ -35,7 +36,7 @@ namespace c10d {
  ***********************************************/
 SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
                                  int rank, int size)
-    : Backend(rank, size), group_context_(nullptr) {
+    : Backend(rank, size), group_context_(nullptr), comm_stream_(nullptr) {
   DEBUGINFO("# [Spyre CCL]: Constructor for ", getBackendName());
 
   /*
@@ -50,6 +51,10 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
         "[" + getBackendName() + "]: Failed to capture the world context";
     throw std::runtime_error(_err_msg);
   }
+
+  // Use the dedicated comm stream so collectives run independently
+  // of the compute stream, enabling compute/communication overlap.
+  comm_stream_ = spyre_comms::get_comm_stream();
 }
 
 SpyreCCLBackend::~SpyreCCLBackend() {
@@ -414,10 +419,6 @@ void SpyreCCLBackend::check_vector_tensor(
 c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllgatherOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in allgather");
-  }
   if (static_cast<int>(outputTensors.size()) != 1) {
     std::string _err_msg =
         "[" + getBackendName() +
@@ -446,22 +447,15 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     output_tensors.push_back(output_tensor);
   }
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER);
-  work->work_schedule_ =
-      group_context_->allgather(output_tensors, input_tensor);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  auto ws = group_context_->allgather(output_tensors, input_tensor);
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const AllgatherOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in _allgather_base");
-  }
   // Do not intend to support: It is deprecated
   // https://github.com/pytorch/pytorch/blob/62226611ded023ff1119b103ed3f540f75e38e9d/torch/csrc/distributed/c10d/Backend.hpp#L197-L209
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
@@ -469,10 +463,6 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     std::vector<at::Tensor>& tensors, const AllreduceOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in allreduce");
-  }
   check_vector_tensor(tensors, 1, 1);
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
@@ -484,21 +474,15 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE);
-  work->work_schedule_ =
+  auto ws =
       group_context_->allreduce(tensor, convert_reduce_op_type(opts.reduceOp));
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(
     std::vector<at::Tensor>& tensors, const AllreduceCoalescedOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in allreduce_coalesced");
-  }
   // Do not intend to support: No public interface
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
@@ -506,10 +490,6 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(
 c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllToAllOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in alltoall");
-  }
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
 
@@ -517,51 +497,32 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall_base(
     at::Tensor& outputTensor, at::Tensor& inputTensor,
     std::vector<int64_t>& outputSplitSizes,
     std::vector<int64_t>& inputSplitSizes, const AllToAllOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in alltoall_base");
-  }
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(), "asyncOp in barrier");
-  }
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::BARRIER);
-  work->work_schedule_ = group_context_->barrier();
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  auto ws = group_context_->barrier();
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::BARRIER, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
     std::vector<at::Tensor>& tensors, const BroadcastOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in broadcast");
-  }
   check_vector_tensor(tensors, 1, 1);
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST);
 
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
 
-  work->work_schedule_ = group_context_->broadcast(tensor, opts.rootRank);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-
-  return work;
+  auto ws = group_context_->broadcast(tensor, opts.rootRank);
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const GatherOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(), "asyncOp in gather");
-  }
   if (opts.rootRank == group_context_->getRank()) {
     if (static_cast<int>(outputTensors.size()) != 1) {
       std::string _err_msg =
@@ -594,20 +555,14 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
     }
   }
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::GATHER);
-  work->work_schedule_ =
-      group_context_->gather(output_tensors, input_tensor, opts.rootRank);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  auto ws = group_context_->gather(output_tensors, input_tensor, opts.rootRank);
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
     std::vector<at::Tensor>& tensors, const ReduceOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(), "asyncOp in reduce");
-  }
   check_vector_tensor(tensors, 1, 1);
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
@@ -619,23 +574,17 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE);
-  work->work_schedule_ = group_context_->reduce(
+  auto ws = group_context_->reduce(
       tensor, convert_reduce_op_type(opts.reduceOp), opts.rootRank);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce_scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ReduceScatterOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(),
-                                        "asyncOp in reduce_scatter");
-  }
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
 
@@ -643,9 +592,6 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ScatterOptions& opts) {
-  if (opts.asyncOp) {
-    throw SpyreCCLNotSupportedException(getBackendName(), "asyncOp in scatter");
-  }
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
 
@@ -656,12 +602,10 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::SEND);
-  work->work_schedule_ = group_context_->send(tensor, dstRank, tag);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  auto ws = group_context_->send(tensor, dstRank, tag);
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
@@ -671,12 +615,10 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
 
-  c10::intrusive_ptr<SpyreCCLWork> work =
-      c10::make_intrusive<SpyreCCLWork>(OpType::RECV);
-  work->work_schedule_ = group_context_->recv(tensor, srcRank, tag);
-  work->work_schedule_->start();
-  work->work_schedule_->wait();
-  return work;
+  auto ws = group_context_->recv(tensor, srcRank, tag);
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recvAnysource(
@@ -694,21 +636,35 @@ c10::intrusive_ptr<Backend> SpyreCCLBackend::createSpyreCCLBackend(
 /***********************************************
  * Wrapper Work for the Sypre Collective Library
  ***********************************************/
-SpyreCCLWork::SpyreCCLWork(OpType opType)
+SpyreCCLWork::SpyreCCLWork(OpType opType,
+                           std::unique_ptr<spyre_comms::WorkSchedule> ws)
     : Work(-1, opType),
       future_(c10::make_intrusive<at::ivalue::Future>(
-          c10::ListType::create(c10::TensorType::get()))) {}
+          c10::ListType::create(c10::TensorType::get()))),
+      work_schedule_(std::move(ws)) {}
 
 bool SpyreCCLWork::isCompleted() {
-  return true;
+  if (completed_) return true;
+  if (work_schedule_ && work_schedule_->query()) {
+    completed_ = true;
+    future_->markSuccess();
+  }
+  return completed_;
 }
 
 bool SpyreCCLWork::isSuccess() const {
-  return true;
+  if (!work_schedule_) return true;
+  return work_schedule_->getState() !=
+         spyre_comms::WorkScheduleState::State::DONE_ERROR;
 }
 
 bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
-  return true;
+  if (completed_) return isSuccess();
+  if (!work_schedule_) return true;
+  work_schedule_->wait();
+  completed_ = true;
+  future_->markSuccess();
+  return isSuccess();
 }
 
 c10::intrusive_ptr<c10::ivalue::Future> SpyreCCLWork::getFuture() {

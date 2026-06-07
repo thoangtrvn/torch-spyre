@@ -181,6 +181,7 @@ class SpyreCCLBackend : public c10d::Backend {
 
  private:
   std::shared_ptr<spyre_comms::Context> group_context_;
+  flex::RuntimeStream* comm_stream_ = nullptr;
 
   [[nodiscard]] spyre_comms::TensorInfo getTensorInfo(const at::Tensor& input);
   void prepare_tensor(const at::Tensor& input_tensor,
@@ -197,7 +198,8 @@ class SpyreCCLWork : public Work {
   friend class SpyreCCLBackend;
 
  public:
-  SpyreCCLWork(OpType opType);
+  SpyreCCLWork(OpType opType,
+               std::unique_ptr<spyre_comms::WorkSchedule> work_schedule);
   [[nodiscard]] bool isCompleted() override;
   [[nodiscard]] bool isSuccess() const override;
   [[nodiscard]] bool wait(
@@ -207,7 +209,8 @@ class SpyreCCLWork : public Work {
 
  private:
   c10::intrusive_ptr<c10::ivalue::Future> future_;
-  std::shared_ptr<spyre_comms::WorkSchedule> work_schedule_;
+  std::unique_ptr<spyre_comms::WorkSchedule> work_schedule_;
+  bool completed_ = false;
 };
 
 }  // namespace c10d
