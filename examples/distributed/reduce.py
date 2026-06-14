@@ -18,8 +18,14 @@ import os
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
+# All selectable reduce algorithms (from collective_algo.cpp)
+# Note: Reduce has no algorithm decomposition in the coll library yet;
+# it is implemented directly in context.cpp using SEND/RECV + HostCompute.
+# This list is here for consistency with other test files and future expansion.
+REDUCE_ALGOS = []
 
-def run_test(comm_rank, comm_size):
+
+def run_test(comm_rank, comm_size, algo=None):
     """Run a reduce test where all ranks contribute and root receives the sum."""
     global DEVICE
 
@@ -27,18 +33,31 @@ def run_test(comm_rank, comm_size):
     input_tensor = torch.zeros(128, dtype=torch.float16)
     input_tensor.fill_(float(comm_rank + 1))
 
+    algo_label = algo if algo else os.environ.get("COLL_REDUCE_ALGO", "(default)")
     print("-" * 70)
     print(
         f"[{comm_rank} of {comm_size}] Input Tensor (Before Reduce): {input_tensor.shape}"
     )
     print(f"[{comm_rank} of {comm_size}] {input_tensor[:10]}")
 
+    # Set algorithm via env var if specified
+    old_algo = os.environ.get("COLL_REDUCE_ALGO")
+    if algo:
+        os.environ["COLL_REDUCE_ALGO"] = algo
+
     # Send input tensor to Spyre device
     input_device = input_tensor.to(DEVICE)
 
     # Reduce with the collective library (SUM operation to root rank 0)
-    print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM): Spyre")
+    print(f"[{comm_rank} of {comm_size}] Reduce Tensor (SUM) algo={algo_label}: Spyre")
     dist.reduce(input_device, dst=0, op=dist.ReduceOp.SUM)
+
+    # Restore env var
+    if algo:
+        if old_algo is not None:
+            os.environ["COLL_REDUCE_ALGO"] = old_algo
+        else:
+            os.environ.pop("COLL_REDUCE_ALGO", None)
 
     # Check the result at root
     if comm_rank == 0:
@@ -56,16 +75,19 @@ def run_test(comm_rank, comm_size):
         print(f"  Expected value per element: {expected_sum}")
 
         if torch.allclose(result, expected_tensor):
-            print(f"[{comm_rank} of {comm_size}] Reduced tensor is correct")
+            print(f"[{comm_rank} of {comm_size}] PASS: algo={algo_label}")
+            return True
         else:
-            raise RuntimeError(
-                f"[{comm_rank} of {comm_size}] Reduced tensor is incorrect: "
+            print(
+                f"[{comm_rank} of {comm_size}] FAIL: algo={algo_label} "
                 f"expected {expected_tensor[:10]} but got {result[:10]}"
             )
+            return False
     else:
         print(
             f"[{comm_rank} of {comm_size}] Non-root rank completed reduce (input consumed)"
         )
+        return True
 
 
 if __name__ == "__main__":
@@ -85,8 +107,34 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    run_test(comm_rank, comm_size)
+    # Determine which algorithm(s) to test:
+    # - If COLL_REDUCE_ALGO is set, test only that one (backward compatible)
+    # - Otherwise, test all selectable algorithms (currently none, so test default)
+    env_algo = os.environ.get("COLL_REDUCE_ALGO")
+    if env_algo:
+        algos_to_test = [env_algo]
+    else:
+        algos_to_test = REDUCE_ALGOS if REDUCE_ALGOS else [None]
+
+    passed = 0
+    failed = 0
+    for algo in algos_to_test:
+        ok = run_test(comm_rank, comm_size, algo=algo)
+        if ok:
+            passed += 1
+        else:
+            failed += 1
+        dist.barrier()
+
+    # Summary
+    if comm_rank == 0:
+        print("=" * 70)
+        print(f"# REDUCE RESULTS: {passed} passed, {failed} failed")
+        print("=" * 70)
 
     dist.destroy_process_group()
+
+    if failed > 0:
+        raise RuntimeError(f"{failed} reduce algorithm(s) failed")
 
 # Made with Bob

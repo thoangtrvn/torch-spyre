@@ -18,6 +18,7 @@
 #include <pybind11/chrono.h>
 #include <torch/python.h>
 
+#include <atomic>
 #include <spyre_comms.hpp>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
@@ -70,6 +71,20 @@ class SpyreCCLBackend : public c10d::Backend {
    */
   [[nodiscard]] const std::string getBackendName() const override {
     return std::string("SpyreCCL");
+  }
+
+  /*
+   * Sequence number support — required by _ProcessGroupWrapper when using
+   * compound backends (e.g. cpu:gloo,spyre:spyreccl).  Follows the Gloo
+   * model: start at 0 and increment on every collective.  The base class
+   * Backend::setSequenceNumberForGroup() would TORCH_CHECK(false), so we
+   * override to provide a working implementation.
+   */
+  void setSequenceNumberForGroup() override {
+    // Gloo just starts at 0 — no store coordination needed.
+  }
+  uint64_t getSequenceNumberForGroup() override {
+    return seq_.load(std::memory_order_relaxed);
   }
 
   /*
@@ -181,7 +196,12 @@ class SpyreCCLBackend : public c10d::Backend {
 
  private:
   std::shared_ptr<spyre_comms::Context> group_context_;
+  // Owned by spyre_comms global state. Valid from initialize_library()
+  // until finalize_library(). SpyreCCLWork objects hold WorkSchedules
+  // that reference this stream — they must not outlive the backend
+  // (which calls finalize_library() in its destructor).
   flex::RuntimeStream* comm_stream_ = nullptr;
+  std::atomic<uint64_t> seq_{0};
 
   [[nodiscard]] spyre_comms::TensorInfo getTensorInfo(const at::Tensor& input);
   void prepare_tensor(const at::Tensor& input_tensor,
@@ -210,7 +230,7 @@ class SpyreCCLWork : public Work {
  private:
   c10::intrusive_ptr<c10::ivalue::Future> future_;
   std::unique_ptr<spyre_comms::WorkSchedule> work_schedule_;
-  bool completed_ = false;
+  std::atomic<bool> completed_{false};
 };
 
 }  // namespace c10d

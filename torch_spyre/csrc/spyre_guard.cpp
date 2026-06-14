@@ -21,6 +21,7 @@
 #include <flex/runtime_stream/runtime_event.hpp>
 
 #include "module.h"
+#include "spyre_allocator.h"
 #include "spyre_device_enum.h"
 #include "spyre_stream.h"
 
@@ -97,12 +98,20 @@ c10::Stream SpyreGuardImpl::exchangeStream(c10::Stream stream) const {
   return old;
 }
 
-void SpyreGuardImpl::recordDataPtrOnStream(const c10::DataPtr&,
-                                           const c10::Stream&) const {}
+void SpyreGuardImpl::recordDataPtrOnStream(const c10::DataPtr& data_ptr,
+                                           const c10::Stream& stream) const {
+  SpyreAllocator::instance().recordStream(data_ptr, stream);
+}
 
 // --- Event methods ---
 // RuntimeEvent is non-copyable/non-movable, so we store as void* via
 // new/delete. PyTorch's InlineEvent passes void* event_ to these methods.
+//
+// P0 limitation: record() calls stream->synchronize() on the host, and
+// wait()/synchronize() block the host thread via shared_future. This means
+// events provide correctness but NOT compute/comm overlap — the host
+// serializes stream transitions. True device-side waiting (no host block)
+// requires P2 firmware support (R5 SIGNAL/WAIT on HMLT counters).
 
 void SpyreGuardImpl::destroyEvent(
     void* event, const c10::DeviceIndex device_index) const noexcept {
@@ -128,7 +137,7 @@ void SpyreGuardImpl::block(void* event, const c10::Stream& stream) const {
 }
 
 bool SpyreGuardImpl::queryEvent(void* event) const {
-  if (!event) return false;
+  if (!event) return true;
   auto* re = static_cast<flex::RuntimeEvent*>(event);
   return re->query();
 }

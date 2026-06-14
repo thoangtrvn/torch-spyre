@@ -30,6 +30,8 @@ namespace spyre {
 struct JobPlan;
 
 class SpyreStream {
+  friend class SpyreGuardImpl;
+
  private:
   c10::Stream stream_;
 

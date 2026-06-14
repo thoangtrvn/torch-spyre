@@ -112,7 +112,7 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
     INCLUDE_DIRS += [
         DEEPTOOLS_DIR / "include",
     ]
-    LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+    LIBRARY_DIRS += [RUNTIME_DIR / "lib", DEEPTOOLS_DIR / "lib", SENLIB_DIR / "lib"]
 
 # The USE_SPYRE_CCL environment variable can be used to build torch-spyre
 # without support for Multi-Spyre. This is for developers only.
@@ -157,7 +157,7 @@ INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
 
 if use_new_system:
-    LIBRARIES = ["flex"]
+    LIBRARIES = ["flex", "util"]
 else:
     LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 if use_spyre_ccl:

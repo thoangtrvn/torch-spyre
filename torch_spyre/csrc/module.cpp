@@ -116,6 +116,20 @@ void startRuntime() {
 }
 
 void freeRuntime() {
+  // Synchronize the device to ensure all in-flight operations complete
+  // before any cleanup begins.  This must happen before the RuntimeContext
+  // is destroyed, because ~RuntimeContextImpl resets the device before
+  // destroying the scheduler (and its ResponseWorker).  The ResponseWorker's
+  // Shutdown() method submits a cancel CB to the device, which corrupts
+  // the heap if the device has already been reset (malloc_consolidate:
+  // unaligned fastbin chunk detected).
+  //
+  // Since we cannot modify libflex.so to fix the destruction order in
+  // ~RuntimeContextImpl, we synchronize here and then clear only our own
+  // caches.  The RuntimeContext lives as a static and will be destroyed
+  // during atexit — to avoid the heap corruption from that path, the
+  // Python atexit handler calls os._exit() to bypass static destructors.
+  synchronizeDevice(c10::nullopt);
   clearArtifactCache();
   GlobalRuntime::reset();
 }
@@ -124,10 +138,9 @@ uint32_t encodeConstant(float torch_const, DataFormats df) {
   uint32_t sen_const;
 
   if (df == DataFormats::IEEE_FP32) {
-    sen_const =
-        deeptools::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
+    sen_const = flex::BinaryConvert<uint32_t>(static_cast<float>(torch_const));
   } else {
-    sen_const = deeptools::FloatToFp16Bin(torch_const);
+    sen_const = flex::FloatToFp16Bin(torch_const);
   }
   return sen_const;
 }
@@ -162,6 +175,37 @@ int device_count() {
 
 namespace py = pybind11;
 PYBIND11_MODULE(_C, m) {
+  // Register a C-level atexit handler at module load time to bypass
+  // C++ static destructors in libflex.so/libsenlib-dd2.so.  The bug:
+  // RuntimeContext::~RuntimeContextImpl() resets the device *before*
+  // destroying the scheduler/ResponseWorker, so the ResponseWorker's
+  // Shutdown() submits a cancel CB to an already-reset device, causing
+  // heap corruption (malloc_consolidate: unaligned fastbin chunk detected).
+  //
+  // This MUST be registered at module load time, not inside startRuntime(),
+  // because merely loading _C.so pulls in libflex.so/libsenlib-dd2.so via
+  // dynamic linking.  Even if the Spyre runtime is never initialized (e.g.
+  // just `import torch` then quit()), those libraries' static destructors
+  // still run on process exit and corrupt the heap.  By registering the
+  // atexit handler early, it runs BEFORE those destructors (LIFO order)
+  // and calls _exit(0) to bypass them entirely.
+  //
+  // If the runtime WAS initialized, we synchronize and clean up first
+  // (while the device and streams are still valid), then _exit(0).
+  // If the runtime was never used, we just _exit(0) — nothing to clean up,
+  // and the OS reclaims all resources on process exit anyway.
+  std::atexit([]() {
+    if (spyre::GlobalRuntime::get()) {
+      // Runtime was initialized — drain in-flight ops and clean up
+      // while the device and all streams (including the comm stream
+      // used by spyre_comms) are still valid.
+      spyre::synchronizeDevice(c10::nullopt);
+      spyre::clearArtifactCache();
+      spyre::GlobalRuntime::reset();
+    }
+    _exit(0);
+  });
+
   // Register PrivateUse1 hooks — tells PyTorch the device exists.
   // Loading _C.so does NOT trigger device initialization;
   // start_runtime() must be called explicitly (via _lazy_init()).

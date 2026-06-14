@@ -18,14 +18,28 @@ import os
 DEVICE = torch.device(f"spyre:{os.getenv('RANK', '0')}")
 C10D_BACKEND = "spyreccl"
 
+# All selectable broadcast algorithms (from collective_algo.cpp)
+BROADCAST_ALGOS = [
+    "Unicast",
+    "Linear",
+    "Hypertree",
+]
 
-def run_test(expected_tensor, comm_rank, comm_size):
+
+def run_test(expected_tensor, comm_rank, comm_size, algo=None):
     """Run a broadcast test with the given expected tensor."""
     global DEVICE
     if 0 != comm_rank:
         x = torch.ones_like(expected_tensor)
     else:
         x = expected_tensor
+
+    algo_label = algo if algo else os.environ.get("COLL_BROADCAST_ALGO", "(default)")
+
+    # Set algorithm via env var if specified
+    old_algo = os.environ.get("COLL_BROADCAST_ALGO")
+    if algo:
+        os.environ["COLL_BROADCAST_ALGO"] = algo
 
     # Send input tensor to Spyre device
     print("-" * 70)
@@ -34,8 +48,15 @@ def run_test(expected_tensor, comm_rank, comm_size):
     x_device = x.to(DEVICE)
 
     # Broadcast with the collective library
-    print(f"[{comm_rank} of {comm_size}] Broadcast Tensor: Spyre")
+    print(f"[{comm_rank} of {comm_size}] Broadcast Tensor algo={algo_label}: Spyre")
     dist.broadcast(x_device, 0)
+
+    # Restore env var
+    if algo:
+        if old_algo is not None:
+            os.environ["COLL_BROADCAST_ALGO"] = old_algo
+        else:
+            os.environ.pop("COLL_BROADCAST_ALGO", None)
 
     result = x_device.to("cpu")
     print(f"[{comm_rank} of {comm_size}] Tensor after collective")
@@ -43,12 +64,14 @@ def run_test(expected_tensor, comm_rank, comm_size):
 
     # Check the result
     if torch.allclose(result, expected_tensor):
-        print(f"[{comm_rank} of {comm_size}] Tensor is correct")
+        print(f"[{comm_rank} of {comm_size}] PASS: algo={algo_label}")
+        return True
     else:
-        raise RuntimeError(
-            f"[{comm_rank} of {comm_size}] Tensor is incorrect: "
+        print(
+            f"[{comm_rank} of {comm_size}] FAIL: algo={algo_label} "
             f"expected {expected_tensor[:10]} but got {result[:10]}"
         )
+        return False
 
 
 if __name__ == "__main__":
@@ -68,12 +91,39 @@ if __name__ == "__main__":
     comm_size = dist.get_world_size()
     comm_rank = dist.get_rank()
 
-    exp_result = torch.zeros(128, dtype=torch.float16)
-    exp_result.fill_(2.0)
-    run_test(exp_result, comm_rank, comm_size)
+    # Determine which algorithm(s) to test:
+    # - If COLL_BROADCAST_ALGO is set, test only that one (backward compatible)
+    # - Otherwise, test all selectable algorithms
+    env_algo = os.environ.get("COLL_BROADCAST_ALGO")
+    if env_algo:
+        algos_to_test = [env_algo]
+    else:
+        algos_to_test = BROADCAST_ALGOS
 
-    exp_result2 = torch.zeros(512, 1024, dtype=torch.float16)
-    exp_result2.fill_(4.0)
-    run_test(exp_result2, comm_rank, comm_size)
+    # Test cases: each is an expected tensor that root broadcasts to all ranks
+    test_cases = [
+        ("small", torch.zeros(128, dtype=torch.float16).fill_(2.0)),
+        ("large", torch.zeros(512, 1024, dtype=torch.float16).fill_(4.0)),
+    ]
+
+    passed = 0
+    failed = 0
+    for algo in algos_to_test:
+        for label, exp_tensor in test_cases:
+            ok = run_test(exp_tensor, comm_rank, comm_size, algo=algo)
+            if ok:
+                passed += 1
+            else:
+                failed += 1
+            dist.barrier()
+
+    # Summary
+    if comm_rank == 0:
+        print("=" * 70)
+        print(f"# BROADCAST RESULTS: {passed} passed, {failed} failed")
+        print("=" * 70)
 
     dist.destroy_process_group()
+
+    if failed > 0:
+        raise RuntimeError(f"{failed} broadcast algorithm(s) failed")

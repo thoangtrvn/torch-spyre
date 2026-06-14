@@ -15,6 +15,7 @@
  */
 #include "spyre_ccl.hpp"
 
+#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -351,11 +352,22 @@ spyre_comms::TensorInfo SpyreCCLBackend::getTensorInfo(
 void SpyreCCLBackend::prepare_tensor(const at::Tensor& input_tensor,
                                      spyre_comms::Tensor* output_tensor) {
   spyre_comms::TensorInfo tensor_info = getTensorInfo(input_tensor);
-  *output_tensor =
-      spyre_comms::Tensor(tensor_info, input_tensor.storage().data_ptr().get());
+
+  auto* raw_data_ptr = input_tensor.storage().data_ptr().get();
+  auto* raw_ctx = input_tensor.storage().data_ptr().get_context();
+  fprintf(stderr, "[DEBUG prepare_tensor] raw_data_ptr=%p raw_ctx=%p\n",
+          raw_data_ptr, raw_ctx);
+  *output_tensor = spyre_comms::Tensor(tensor_info, raw_data_ptr);
   // Update the data pointer on the object since it was eagerly allocated
-  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
-      input_tensor.storage().data_ptr().get_context());
+  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(raw_ctx);
+  if (ctx == nullptr) {
+    fprintf(stderr,
+            "[ERROR prepare_tensor] get_context() returned NULL! Tensor will "
+            "have null device address.\n");
+    fflush(stderr);
+    return;
+  }
+
   output_tensor->SetSpyreDeviceAddress(&ctx->composite_addr);
 }
 
@@ -415,6 +427,10 @@ void SpyreCCLBackend::check_vector_tensor(
 
 /* **********************************************
  * Interface functions
+ *
+ * NOTE: All collectives are inherently async (non-blocking). Callers
+ * passing asyncOp=false will not get synchronous completion — they must
+ * call work->wait() explicitly. This matches the behavior of NCCL/Gloo.
  ********************************************** */
 c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
@@ -450,6 +466,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   auto ws = group_context_->allgather(output_tensors, input_tensor);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws));
 }
 
@@ -464,6 +481,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     std::vector<at::Tensor>& tensors, const AllreduceOptions& opts) {
   check_vector_tensor(tensors, 1, 1);
+
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
                            "]: Allreduce only supports SUM operation." +
@@ -473,11 +491,16 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
 
   spyre_comms::Tensor tensor;
   prepare_tensor(tensors[0], &tensor);
+  fprintf(stderr,
+          "[DEBUG allreduce] tensor.HostData=%p tensor.SpyreDeviceAddress=%p "
+          "isHostOnly=%d\n",
+          tensor.HostData(), tensor.SpyreDeviceAddress(), tensor.isHostOnly());
 
   auto ws =
       group_context_->allreduce(tensor, convert_reduce_op_type(opts.reduceOp));
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws));
 }
 
@@ -504,6 +527,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
   auto ws = group_context_->barrier();
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::BARRIER, std::move(ws));
 }
 
@@ -517,6 +541,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
   auto ws = group_context_->broadcast(tensor, opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws));
 }
 
@@ -558,6 +583,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
   auto ws = group_context_->gather(output_tensors, input_tensor, opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws));
 }
 
@@ -578,6 +604,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
       tensor, convert_reduce_op_type(opts.reduceOp), opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE, std::move(ws));
 }
 
@@ -605,6 +632,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
   auto ws = group_context_->send(tensor, dstRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws));
 }
 
@@ -618,6 +646,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
   auto ws = group_context_->recv(tensor, srcRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+  seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws));
 }
 
@@ -647,7 +676,7 @@ bool SpyreCCLWork::isCompleted() {
   if (completed_) return true;
   if (work_schedule_ && work_schedule_->query()) {
     completed_ = true;
-    future_->markSuccess();
+    future_->markCompleted();
   }
   return completed_;
 }
@@ -663,7 +692,7 @@ bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
   if (!work_schedule_) return true;
   work_schedule_->wait();
   completed_ = true;
-  future_->markSuccess();
+  future_->markCompleted();
   return isSuccess();
 }
 

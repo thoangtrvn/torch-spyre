@@ -18,6 +18,7 @@
 
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -71,7 +72,7 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
     }
 
     auto op = std::make_unique<flex::RuntimeOperationCompute>(
-        &binary_address_, inp, "", bootstrap_addr_);
+        &binary_address_, inp, std::string(""));
     op->setPipelineBarrier(pipeline_barrier_);
     return op;
   }
