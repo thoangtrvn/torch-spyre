@@ -299,53 +299,44 @@ convert_string_to_datatype_pair(const std::string& type_name) {
   return {flex::sen_datatype_enum::dt_undef, flex::sen_datatype_enum::dt_undef};
 }
 
-spyre_comms::TensorInfo SpyreCCLBackend::getTensorInfo(
-    const at::Tensor& input) {
-  std::vector<int64_t> shape;
-  if (input.dim() == 0) {
-    shape = {1};
-  } else {
-    for (const int64_t& element : input.sizes()) {
-      shape.push_back(element);
-    }
-  }
-  auto str_type = spyre::torchScalarToString[input.scalar_type()];
-  const auto [sen_dtype_cpu, sen_dtype_dev] =
-      convert_string_to_datatype_pair(str_type);
-  spyre_comms::TensorShape t_shape(shape);
-  spyre_comms::TensorInfo ti{sen_dtype_cpu, t_shape};
-  return ti;
-}
-
 /**
- * @brief Prepares a PyTorch tensor for use with Spyre communication operations.
+ * @brief Converts a PyTorch tensor to a spyre_comms::BufferDesc.
  *
- * Converts a PyTorch tensor to a spyre_comms::Tensor with proper metadata.
+ * Produces a lightweight buffer descriptor with host pointer, device address,
+ * byte count, and dtype — without constructing a TensorInfo/TensorShape
+ * hierarchy.
  *
- * @param input_tensor The PyTorch tensor to prepare (must be on device)
- * @param output_tensor Pointer to the spyre_comms::Tensor to populate with
- * prepared data
+ * @param input_tensor The PyTorch tensor (must be on Spyre device)
+ * @return BufferDesc with host pointer, device address, byte count, dtype
  */
-void SpyreCCLBackend::prepare_tensor(const at::Tensor& input_tensor,
-                                     spyre_comms::Tensor* output_tensor) {
-  spyre_comms::TensorInfo tensor_info = getTensorInfo(input_tensor);
-
+spyre_comms::BufferDesc SpyreCCLBackend::prepare_buffer_desc(
+    const at::Tensor& input_tensor) {
   auto* raw_data_ptr = input_tensor.storage().data_ptr().get();
   auto* raw_ctx = input_tensor.storage().data_ptr().get_context();
-  fprintf(stderr, "[DEBUG prepare_tensor] raw_data_ptr=%p raw_ctx=%p\n",
-          raw_data_ptr, raw_ctx);
-  *output_tensor = spyre_comms::Tensor(tensor_info, raw_data_ptr);
-  // Update the data pointer on the object since it was eagerly allocated
   auto* ctx = static_cast<spyre::SharedOwnerCtx*>(raw_ctx);
   if (ctx == nullptr) {
-    fprintf(stderr,
-            "[ERROR prepare_tensor] get_context() returned NULL! Tensor will "
-            "have null device address.\n");
-    fflush(stderr);
-    return;
+    TORCH_CHECK(false,
+                "prepare_buffer_desc: get_context() returned NULL — tensor has "
+                "no device address");
   }
 
-  output_tensor->SetSpyreDeviceAddress(&ctx->composite_addr);
+  // Compute dtype directly from PyTorch scalar type
+  auto str_type = spyre::torchScalarToString[input_tensor.scalar_type()];
+  const auto [sen_dtype_cpu, _sen_dtype_dev] =
+      convert_string_to_datatype_pair(str_type);
+
+  // Compute byte count matching TensorInfo::DataSize():
+  // (volume * bits_per_element + 7) / 8, with rounding for sub-byte types.
+  size_t byte_count =
+      static_cast<size_t>((static_cast<uint64_t>(input_tensor.numel()) *
+                               flex::DataTypeSizeBits(sen_dtype_cpu) +
+                           7) /
+                          8);
+
+  return spyre_comms::BufferDesc{
+      raw_data_ptr, &ctx->composite_addr, byte_count, sen_dtype_cpu,
+      false  // is_host_only
+  };
 }
 
 /**
@@ -412,6 +403,11 @@ void SpyreCCLBackend::check_vector_tensor(
 c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllgatherOptions& opts) {
+  fprintf(stderr,
+          "[DEBUG allgather] ENTER SpyreCCLBackend::allgather, "
+          "outputTensors.size=%zu, inputTensors.size=%zu\n",
+          outputTensors.size(), inputTensors.size());
+  fflush(stderr);
   if (static_cast<int>(outputTensors.size()) != 1) {
     std::string _err_msg =
         "[" + getBackendName() +
@@ -430,19 +426,37 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   }
   check_vector_tensor(inputTensors, 1, 1);
 
-  spyre_comms::Tensor input_tensor;
-  prepare_tensor(inputTensors[0], &input_tensor);
+  fprintf(stderr,
+          "[DEBUG allgather] ENTER SpyreCCLBackend::allgather, "
+          "outputTensors.size=%zu, inputTensors.size=%zu\n",
+          outputTensors.size(), inputTensors.size());
+  fflush(stderr);
 
-  std::vector<spyre_comms::Tensor> output_tensors;
+  spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
+
+  std::vector<spyre_comms::BufferDesc> output_bufs;
   for (auto& outputTensor : outputTensors[0]) {
-    spyre_comms::Tensor output_tensor;
-    prepare_tensor(outputTensor, &output_tensor);
-    output_tensors.push_back(output_tensor);
+    output_bufs.push_back(prepare_buffer_desc(outputTensor));
   }
 
-  auto ws = group_context_->allgather(output_tensors, input_tensor);
+  fprintf(stderr,
+          "[DEBUG allgather] Calling group_context_->allgather, "
+          "output_bufs.size=%zu, rank=%d, size=%d\n",
+          output_bufs.size(), group_context_->getRank(),
+          group_context_->getSize());
+  fflush(stderr);
+
+  auto ws = group_context_->allgather(output_bufs, input_buf);
+
+  fprintf(stderr, "[DEBUG allgather] allgather returned, starting ws\n");
+  fflush(stderr);
+
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
+
+  fprintf(stderr, "[DEBUG allgather] ws started, returning Work\n");
+  fflush(stderr);
+
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws));
 }
@@ -466,15 +480,14 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     TORCH_CHECK(false, _err_msg);
   }
 
-  spyre_comms::Tensor tensor;
-  prepare_tensor(tensors[0], &tensor);
+  spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
   fprintf(stderr,
-          "[DEBUG allreduce] tensor.HostData=%p tensor.SpyreDeviceAddress=%p "
-          "isHostOnly=%d\n",
-          tensor.HostData(), tensor.SpyreDeviceAddress(), tensor.isHostOnly());
+          "[DEBUG allreduce] buf.host_ptr=%p buf.device_addr=%p "
+          "is_host_only=%d\n",
+          buf.host_ptr, buf.device_addr, buf.is_host_only);
 
   auto ws =
-      group_context_->allreduce(tensor, convert_reduce_op_type(opts.reduceOp));
+      group_context_->allreduce(buf, convert_reduce_op_type(opts.reduceOp));
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
@@ -512,10 +525,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
     std::vector<at::Tensor>& tensors, const BroadcastOptions& opts) {
   check_vector_tensor(tensors, 1, 1);
 
-  spyre_comms::Tensor tensor;
-  prepare_tensor(tensors[0], &tensor);
+  spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-  auto ws = group_context_->broadcast(tensor, opts.rootRank);
+  auto ws = group_context_->broadcast(buf, opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
@@ -545,19 +557,16 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
   }
   check_vector_tensor(inputTensors, 1, 1);
 
-  spyre_comms::Tensor input_tensor;
-  prepare_tensor(inputTensors[0], &input_tensor);
+  spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
 
-  std::vector<spyre_comms::Tensor> output_tensors;
+  std::vector<spyre_comms::BufferDesc> output_bufs;
   if (opts.rootRank == group_context_->getRank()) {
     for (auto& outputTensor : outputTensors[0]) {
-      spyre_comms::Tensor output_tensor;
-      prepare_tensor(outputTensor, &output_tensor);
-      output_tensors.push_back(output_tensor);
+      output_bufs.push_back(prepare_buffer_desc(outputTensor));
     }
   }
 
-  auto ws = group_context_->gather(output_tensors, input_tensor, opts.rootRank);
+  auto ws = group_context_->gather(output_bufs, input_buf, opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
@@ -574,11 +583,10 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
     TORCH_CHECK(false, _err_msg);
   }
 
-  spyre_comms::Tensor tensor;
-  prepare_tensor(tensors[0], &tensor);
+  spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-  auto ws = group_context_->reduce(
-      tensor, convert_reduce_op_type(opts.reduceOp), opts.rootRank);
+  auto ws = group_context_->reduce(buf, convert_reduce_op_type(opts.reduceOp),
+                                   opts.rootRank);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
@@ -603,10 +611,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
                                                int dstRank, int tag) {
   check_vector_tensor(tensors, 1, 1);
 
-  spyre_comms::Tensor tensor;
-  prepare_tensor(tensors[0], &tensor);
+  spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-  auto ws = group_context_->send(tensor, dstRank, tag);
+  auto ws = group_context_->send(buf, dstRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
@@ -617,10 +624,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
                                                int srcRank, int tag) {
   check_vector_tensor(tensors, 1, 1);
 
-  spyre_comms::Tensor tensor;
-  prepare_tensor(tensors[0], &tensor);
+  spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-  auto ws = group_context_->recv(tensor, srcRank, tag);
+  auto ws = group_context_->recv(buf, srcRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);

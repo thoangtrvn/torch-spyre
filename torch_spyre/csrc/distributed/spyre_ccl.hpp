@@ -203,9 +203,8 @@ class SpyreCCLBackend : public c10d::Backend {
   flex::RuntimeStream* comm_stream_ = nullptr;
   std::atomic<uint64_t> seq_{0};
 
-  [[nodiscard]] spyre_comms::TensorInfo getTensorInfo(const at::Tensor& input);
-  void prepare_tensor(const at::Tensor& input_tensor,
-                      spyre_comms::Tensor* output_tensor);
+  [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
+      const at::Tensor& input_tensor);
   void check_single_tensor(const at::Tensor& tensor);
   void check_vector_tensor(const std::vector<at::Tensor>& tensors,
                            int min_allowed = 1, int max_allowed = 1);
