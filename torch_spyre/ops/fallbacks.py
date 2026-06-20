@@ -241,7 +241,6 @@ register_fallback_default(
         aten.arange,
         aten.sin,
         aten.cos,
-        aten.embedding.default,
         aten.isin,
         aten.tril,
         aten.triu,
