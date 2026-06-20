@@ -45,16 +45,22 @@ def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
 
     launches, tokens_per_launch = build_embedding_launches(vocab, d_model, element_bits, flat_idx)
 
-    out_flat = torch.empty((len(flat_idx), d_model), dtype=weight.dtype, device="spyre")
+    # Assemble output on CPU then move to device once.
+    # Device-side strided slice-assign (out[start:end] = ...) ignores the start
+    # offset on spyre hardware — launch1's rows land at 0..43 instead of 256..299,
+    # corrupting multi-launch output.  CPU staging avoids this entirely: each
+    # launch's buffer is copied down and placed into the correct CPU rows; a single
+    # .to(device) at the end moves the fully-assembled tensor to the device.
+    out_cpu = torch.empty((len(flat_idx), d_model), dtype=weight.dtype)
     for (start, end), binary in launches:
         # Each binary writes exactly tokens_per_launch output rows regardless of
         # how many real tokens are in this launch (the final launch may be partial).
-        # Allocate a full-sized buffer so the binary never overruns a shorter slice,
-        # then copy only the real rows into the output tensor.
-        buf = torch.empty((tokens_per_launch, d_model), dtype=weight.dtype, device="spyre")
+        # Allocate a full-sized device buffer so the binary never overruns a shorter
+        # slice, then copy only the real rows to the CPU staging tensor.
+        buf = torch.empty((tokens_per_launch, d_model), dtype=weight.dtype, device=weight.device)
         launch_kernel_from_bytes(binary, [weight, buf])
-        out_flat[start:end] = buf[: end - start]
-    return out_flat.reshape(*indices.shape, d_model)
+        out_cpu[start:end] = buf[: end - start].cpu()
+    return out_cpu.to(weight.device).reshape(*indices.shape, d_model)
 
 
 @embedding.register_fake
