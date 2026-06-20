@@ -57,6 +57,14 @@ def build_embedding_launches(
 
     gen = get_generation(target)
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
+    elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit (DL16)
+    if d_model > elements_per_stick:
+        raise NotImplementedError(
+            f"embedding: only single-stick d_model (<= {elements_per_stick} at "
+            f"{element_bits}-bit) is hardware-verified; d_model={d_model} needs "
+            f"{-(-d_model // elements_per_stick)} sticks/token (multi-stick gather is "
+            f"the next codegen effort, not yet supported)."
+        )
     # sticks_per_token is folded into the schedule via tile_n=d_model; here we only
     # need the launch geometry. K = tokens/core, capped by ebr_count.
     N = len(flat_idx)
@@ -67,7 +75,8 @@ def build_embedding_launches(
     scheduled = schedule(
         "embedding",
         TilingConfig(M=tokens_per_launch, K=1, N=d_model, tile_m=tokens_per_launch,
-                     tile_k=1, tile_n=d_model, num_cores=num_cores),
+                     tile_k=1, tile_n=d_model, num_cores=num_cores,
+                     element_bits=element_bits),
         target,
     )
     if scheduled.address_spec is None:

@@ -43,8 +43,9 @@ def test_build_launches_single_launch_small():
 
 def test_build_launches_multipass_covers_all_tokens():
     h = _load_helper()
-    # 300 tokens, ceiling 256 (32 cores x 8) -> 2 launches covering [0,300)
-    launches, tokens_per_launch = h.build_embedding_launches(vocab=128000, d_model=2048, element_bits=16, flat_idx=list(range(300)))
+    # d_model=64 (single-stick, hardware-verified); N=300 -> 2 launches covering [0,300)
+    # (300 > 256 = 32 cores * 8 tokens/core, so multi-launch path is exercised)
+    launches, tokens_per_launch = h.build_embedding_launches(vocab=128000, d_model=64, element_bits=16, flat_idx=list(range(300)))
     slices = [s for s, _ in launches]
     assert slices[0][0] == 0 and slices[-1][1] == 300
     for i in range(len(slices) - 1):
@@ -53,6 +54,14 @@ def test_build_launches_multipass_covers_all_tokens():
     # (this is the key invariant: the final launch [256,300) writes into 256-row buf,
     # not a 44-row slice, preventing the hardware overrun bug)
     assert tokens_per_launch == 256
+
+
+def test_build_launches_rejects_multistick_d_model():
+    import pytest
+    h = _load_helper()
+    # d_model=2048 at 16-bit requires 32 sticks/token — multi-stick is NOT hardware-verified
+    with pytest.raises(NotImplementedError, match="single-stick|multi-stick"):
+        h.build_embedding_launches(vocab=1000, d_model=2048, element_bits=16, flat_idx=[0, 1])
 
 def test_build_launches_rejects_out_of_vocab():
     import pytest
