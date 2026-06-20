@@ -22,12 +22,19 @@ def build_embedding_launches(
     flat_idx: list[int],
     target: str = "rcudd1a",
     max_cores: int = 32,
-) -> list[tuple[tuple[int, int], bytes]]:
+) -> tuple[list[tuple[tuple[int, int], bytes]], int]:
     """Plan + build per-launch embedding binaries for a flat list of token indices.
 
-    Returns list[((start, end), binary_bytes)] covering [0, len(flat_idx)).
-    Each binary gathers flat_idx[start:end] on (end-start)-capped cores; the caller
-    writes its output rows [start:end].
+    Returns (launches, tokens_per_launch) where:
+      - launches is list[((start, end), binary_bytes)] covering [0, len(flat_idx)).
+      - tokens_per_launch is num_cores * K — the number of output sticks each
+        binary writes regardless of how many real tokens are in the final launch.
+        The caller must allocate a tokens_per_launch-sized buffer for each launch
+        and copy only the real rows (buf[:end-start]) into the output tensor.
+
+    Each binary is built for exactly tokens_per_launch output slots; passing a
+    shorter slice (as the old API did for the final partial launch) causes the
+    binary to overrun the slice and corrupt adjacent memory.
 
     Raises EmbeddingHostError if sentient_codegen is not importable (env.sh not
     sourced / codegen not on PYTHONPATH). Raises ValueError for invalid indices
@@ -46,7 +53,7 @@ def build_embedding_launches(
         ) from e
 
     if not flat_idx:
-        return []
+        return [], 0
 
     gen = get_generation(target)
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
@@ -55,11 +62,11 @@ def build_embedding_launches(
     N = len(flat_idx)
     K = min(ebr_count, N)
     num_cores = min(max_cores, math.ceil(N / K))
-    total = num_cores * K  # tile_m = total tokens (the load-bearing tiling rule)
+    tokens_per_launch = num_cores * K  # tile_m = total tokens (the load-bearing tiling rule)
 
     scheduled = schedule(
         "embedding",
-        TilingConfig(M=total, K=1, N=d_model, tile_m=total,
+        TilingConfig(M=tokens_per_launch, K=1, N=d_model, tile_m=tokens_per_launch,
                      tile_k=1, tile_n=d_model, num_cores=num_cores),
         target,
     )
@@ -71,6 +78,7 @@ def build_embedding_launches(
         if idx < 0 or idx >= vocab:
             raise ValueError(f"token index {idx} out of range [0, vocab={vocab})")
 
-    return plan_and_build_embedding_binaries(
+    launches = plan_and_build_embedding_binaries(
         scheduled, flat_idx, gen, num_cores=num_cores, tokens_per_core=K,
     )
+    return launches, tokens_per_launch

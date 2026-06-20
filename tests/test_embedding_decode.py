@@ -35,8 +35,8 @@ def test_multicore_binary_has_split_patch_rows_no_collision():
     h = _load_helper()
     # per-core capacity K = min(ebr_count=8, N); N > ebr_count(8) → num_cores≥2;
     # 9 tokens → num_cores=2 (genuine multi-core binary)
-    launches = h.build_embedding_launches(vocab=1000, d_model=64, element_bits=16,
-                                          flat_idx=list(range(9)))
+    launches, _ = h.build_embedding_launches(vocab=1000, d_model=64, element_bits=16,
+                                              flat_idx=list(range(9)))
     (start, end), binary = launches[0]
     slices_seen = set()
     for r in range(len(binary) // 128):  # PatchInit rows are 128 bytes on 1p0

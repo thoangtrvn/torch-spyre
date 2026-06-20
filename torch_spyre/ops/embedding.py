@@ -43,11 +43,17 @@ def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     element_bits = _DTYPE_BITS[weight.dtype]
     flat_idx = indices.reshape(-1).cpu().tolist()
 
-    launches = build_embedding_launches(vocab, d_model, element_bits, flat_idx)
+    launches, tokens_per_launch = build_embedding_launches(vocab, d_model, element_bits, flat_idx)
 
     out_flat = torch.empty((len(flat_idx), d_model), dtype=weight.dtype, device="spyre")
     for (start, end), binary in launches:
-        launch_kernel_from_bytes(binary, [weight, out_flat[start:end]])
+        # Each binary writes exactly tokens_per_launch output rows regardless of
+        # how many real tokens are in this launch (the final launch may be partial).
+        # Allocate a full-sized buffer so the binary never overruns a shorter slice,
+        # then copy only the real rows into the output tensor.
+        buf = torch.empty((tokens_per_launch, d_model), dtype=weight.dtype, device="spyre")
+        launch_kernel_from_bytes(binary, [weight, buf])
+        out_flat[start:end] = buf[: end - start]
     return out_flat.reshape(*indices.shape, d_model)
 
 

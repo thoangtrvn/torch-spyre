@@ -33,20 +33,26 @@ def _load_helper():
 def test_build_launches_single_launch_small():
     h = _load_helper()
     # d_model=64 -> 1 stick/token; 4 tokens -> 1 launch, slice (0,4)
-    launches = h.build_embedding_launches(vocab=1000, d_model=64, element_bits=16, flat_idx=[3, 1, 2, 0])
+    launches, tokens_per_launch = h.build_embedding_launches(vocab=1000, d_model=64, element_bits=16, flat_idx=[3, 1, 2, 0])
     assert len(launches) == 1
     (start, end), binary = launches[0]
     assert (start, end) == (0, 4)
     assert isinstance(binary, bytes) and len(binary) % 128 == 0
+    # tokens_per_launch == num_cores * K: N=4 <= ebr_count(8) -> K=4, num_cores=1 -> 4
+    assert tokens_per_launch == 4
 
 def test_build_launches_multipass_covers_all_tokens():
     h = _load_helper()
     # 300 tokens, ceiling 256 (32 cores x 8) -> 2 launches covering [0,300)
-    launches = h.build_embedding_launches(vocab=128000, d_model=2048, element_bits=16, flat_idx=list(range(300)))
+    launches, tokens_per_launch = h.build_embedding_launches(vocab=128000, d_model=2048, element_bits=16, flat_idx=list(range(300)))
     slices = [s for s, _ in launches]
     assert slices[0][0] == 0 and slices[-1][1] == 300
     for i in range(len(slices) - 1):
         assert slices[i][1] == slices[i + 1][0]  # no gaps/overlaps
+    # tokens_per_launch is the binary's output size: 32 cores * 8 tokens/core = 256
+    # (this is the key invariant: the final launch [256,300) writes into 256-row buf,
+    # not a 44-row slice, preventing the hardware overrun bug)
+    assert tokens_per_launch == 256
 
 def test_build_launches_rejects_out_of_vocab():
     import pytest
