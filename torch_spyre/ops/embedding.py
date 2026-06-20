@@ -51,6 +51,10 @@ def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     # corrupting multi-launch output.  CPU staging avoids this entirely: each
     # launch's buffer is copied down and placed into the correct CPU rows; a single
     # .to(device) at the end moves the fully-assembled tensor to the device.
+    # Performance: this costs one D2H copy per launch plus one H2D at the end.
+    # Acceptable for embedding (output is small, <=1 MB/launch). Do NOT revert to a
+    # device-side out[start:end] = ... slice-assign to "save" the copies — that
+    # silently reintroduces the offset-corruption bug above (hardware-confirmed).
     out_cpu = torch.empty((len(flat_idx), d_model), dtype=weight.dtype)
     for (start, end), binary in launches:
         # Each binary writes exactly tokens_per_launch output rows regardless of
