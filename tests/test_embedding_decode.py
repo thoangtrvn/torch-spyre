@@ -21,9 +21,7 @@ collision row. Passes immediately when the helper's geometry is correct.
 
 Run with:
 
-    PYTHONPATH=/Users/tmhoangt/Codes.IBM/AIU/spyre-knowledgebase/codegen \\
-        /Users/tmhoangt/Codes.IBM/AIU/spyre-knowledgebase/mcp-server/.venv/bin/python \\
-        -m pytest tests/test_embedding_decode.py -v
+    PYTHONPATH=<codegen_dir> python -m pytest tests/test_embedding_decode.py -v
 """
 import importlib.util, os
 HELPER = os.path.join(os.path.dirname(__file__), "..", "torch_spyre", "ops", "_embedding_host.py")
@@ -35,15 +33,18 @@ def _load_helper():
 def test_multicore_binary_has_split_patch_rows_no_collision():
     from sentient_codegen.gen.rcudd1a.flit_formats import PATCH_INIT_HEADER_FLIT
     h = _load_helper()
-    # 4 tokens, d_model=64 -> 4 tokens fit one launch; force 2 cores via 8 tokens
+    # per-core capacity K = min(ebr_count=8, N); N > ebr_count(8) → num_cores≥2;
+    # 9 tokens → num_cores=2 (genuine multi-core binary)
     launches = h.build_embedding_launches(vocab=1000, d_model=64, element_bits=16,
-                                          flat_idx=[7, 6, 5, 4, 3, 2, 1, 0])
+                                          flat_idx=list(range(9)))
     (start, end), binary = launches[0]
     slices_seen = set()
-    for r in range(len(binary) // 128):
+    for r in range(len(binary) // 128):  # PatchInit rows are 128 bytes on 1p0
         hdr = PATCH_INIT_HEADER_FLIT.decode(int.from_bytes(binary[r*128:r*128+16], "little"))
         if hdr.get("patch_flag"):
             slices_seen.add(hdr["target_slices"])
+    # guard: 0x40 must appear to prove the binary is genuinely multi-core
+    assert 0x40 in slices_seen, "expected L3SU-output rows (0x40) — input not actually multi-core?"
     # multi-core embedding: L3SU output (0x40) + L3LU source (0x80), never combined 0xC0
     assert 0xC0 not in slices_seen, "forbidden L3SU+L3LU collision row"
     assert 0x80 in slices_seen, "missing L3LU source rows"
