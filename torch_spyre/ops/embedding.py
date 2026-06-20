@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import torch
 
-from ._embedding_host import build_embedding_launches, EmbeddingHostError  # noqa: F401
+from torch_spyre._C import launch_kernel_from_bytes
+from ._embedding_host import build_embedding_launches, EmbeddingHostError  # EmbeddingHostError re-exported so callers can catch the op's host-side failure mode
+
+__all__ = ["embedding", "EmbeddingHostError"]
 
 _DTYPE_BITS = {torch.float16: 16}  # DL16 on 1p0; extend per generation
 
@@ -43,7 +46,6 @@ def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     launches = build_embedding_launches(vocab, d_model, element_bits, flat_idx)
 
     out_flat = torch.empty((len(flat_idx), d_model), dtype=weight.dtype, device="spyre")
-    from torch_spyre._C import launch_kernel_from_bytes
     for (start, end), binary in launches:
         launch_kernel_from_bytes(binary, [weight, out_flat[start:end]])
     return out_flat.reshape(*indices.shape, d_model)
