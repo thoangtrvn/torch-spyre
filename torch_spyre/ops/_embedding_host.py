@@ -50,7 +50,6 @@ def build_embedding_launches(
 
     gen = get_generation(target)
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
-    elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 for DL16
     # sticks_per_token is folded into the schedule via tile_n=d_model; here we only
     # need the launch geometry. K = tokens/core, capped by ebr_count.
     N = len(flat_idx)
@@ -66,9 +65,6 @@ def build_embedding_launches(
     )
     if scheduled.address_spec is None:
         raise EmbeddingHostError("schedule('embedding') produced no address_spec")
-    if scheduled.address_spec.vocab_size and vocab > 0:
-        # vocab bound check happens in compute_embedding_addresses; this is belt-and-suspenders
-        pass
     # Bounds: indices must be in [0, vocab). compute_embedding_addresses also checks
     # against spec.vocab_size, but the spec is built without vocab; enforce here.
     for idx in flat_idx:
