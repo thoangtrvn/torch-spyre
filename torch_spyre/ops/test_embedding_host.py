@@ -13,7 +13,7 @@ def test_multistick_no_longer_fenced():
         vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
     assert launches, "expected at least one launch binary"
     # C=2 → tokens_per_core=min(8, 16//2)=8 → ceiling 256 for 32 cores; here N=4 small.
-    assert tokens_per_launch >= 4
+    assert tokens_per_launch == 4  # d=4096→spt=64, C=2, K=min(8,8)=8→K=min(8,4)=4, cores=1
 
 
 def test_ceiling_drops_when_lar_binds():

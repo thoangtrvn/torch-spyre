@@ -80,6 +80,8 @@ def build_embedding_launches(
             f"({lar_count}). Max supported sticks_per_token={lar_count * L3_BURST_MAX} "
             f"(d_model≈{lar_count * L3_BURST_MAX * elements_per_stick})."
         )
+    # sticks_per_token is forwarded to the scheduler via tile_n=d_model;
+    # here we only need the launch geometry.
     K = min(tokens_per_core, N)
     num_cores = min(max_cores, math.ceil(N / K))
     tokens_per_launch = num_cores * K  # tile_m = total tokens (load-bearing tiling rule)
