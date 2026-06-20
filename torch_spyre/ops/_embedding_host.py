@@ -5,6 +5,10 @@ by calling the hardware-verified sentient_codegen embedding path. Imports ONLY
 sentient_codegen + stdlib (NO torch / torch_spyre) so it is unit-testable on a
 host without the spyre C extension. The torch/device wrapper lives in
 torch_spyre/ops/embedding.py.
+
+Supports multi-stick d_model: the per-launch token capacity is derived from the
+L3LU register file (EBR count and LAR count) and the number of load chunks C
+required per token row (ceil(sticks_per_token / L3_BURST_MAX)).
 """
 from __future__ import annotations
 
@@ -57,20 +61,28 @@ def build_embedding_launches(
 
     gen = get_generation(target)
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
+    lar_count = gen.get_unit_spec("L3LU").registers["LAR"].count  # 16 on 1p0
     elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit (DL16)
-    if d_model > elements_per_stick:
-        raise NotImplementedError(
-            f"embedding: only single-stick d_model (<= {elements_per_stick} at "
-            f"{element_bits}-bit) is hardware-verified; d_model={d_model} needs "
-            f"{-(-d_model // elements_per_stick)} sticks/token (multi-stick gather is "
-            f"the next codegen effort, not yet supported)."
-        )
-    # sticks_per_token is folded into the schedule via tile_n=d_model; here we only
-    # need the launch geometry. K = tokens/core, capped by ebr_count.
+    L3_BURST_MAX = 32  # L3.BURST_MAX — sticks per ld.hbm burst
+
+    # Per-launch capacity (single source of truth, matches the codegen scheduler):
+    #   spt = sticks per token row; C = load instructions per token row.
+    #   A token consumes 1 EBR (base) + C EAR (chunk offsets) + C LAR (deposits),
+    #   so tokens_per_core is bounded by EBR (8) and by LAR // C.
+    sticks_per_token = math.ceil(d_model * element_bits / 8 / gen.hw.stick_bytes)
+    C = math.ceil(sticks_per_token / L3_BURST_MAX)
     N = len(flat_idx)
-    K = min(ebr_count, N)
+    tokens_per_core = min(ebr_count, lar_count // C)
+    if tokens_per_core < 1:
+        raise NotImplementedError(
+            f"embedding: d_model={d_model} → sticks_per_token={sticks_per_token}, "
+            f"C={C} chunks/token; one token's row exceeds the L3LU LAR file "
+            f"({lar_count}). Max supported sticks_per_token={lar_count * L3_BURST_MAX} "
+            f"(d_model≈{lar_count * L3_BURST_MAX * elements_per_stick})."
+        )
+    K = min(tokens_per_core, N)
     num_cores = min(max_cores, math.ceil(N / K))
-    tokens_per_launch = num_cores * K  # tile_m = total tokens (the load-bearing tiling rule)
+    tokens_per_launch = num_cores * K  # tile_m = total tokens (load-bearing tiling rule)
 
     scheduled = schedule(
         "embedding",
