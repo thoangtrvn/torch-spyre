@@ -7,8 +7,9 @@ host without the spyre C extension. The torch/device wrapper lives in
 torch_spyre/ops/embedding.py.
 
 Supports multi-stick d_model: the per-launch token capacity is derived from the
-L3LU register file (EBR count and LAR count) and the number of load chunks C
-required per token row (ceil(sticks_per_token / L3_BURST_MAX)).
+L3LU register file. Plane-major model (PM-T3): tokens_per_core = floor(EBR / spt),
+where spt = sticks_per_token. EBR (8) is the binding limit (tighter than LAR 16).
+Max d_model per launch = EBR * elements_per_stick = 512 at 16-bit.
 """
 from __future__ import annotations
 
@@ -63,14 +64,13 @@ def build_embedding_launches(
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
     lar_count = gen.get_unit_spec("L3LU").registers["LAR"].count  # 16 on 1p0
     elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit (DL16)
-    L3_BURST_MAX = 32  # L3.BURST_MAX — sticks per ld.hbm burst
 
-    # Per-launch capacity (single source of truth, matches the codegen scheduler):
-    #   spt = sticks per token row; C = load instructions per token row.
-    #   A token consumes 1 EBR (base) + C EAR (chunk offsets) + C LAR (deposits),
-    #   so tokens_per_core is bounded by EBR (8) and by LAR // C.
+    # Per-launch capacity (plane-major model, matches the codegen scheduler PM-T3):
+    #   spt = sticks per token row (= planes per token).
+    #   Each (token, plane) = 1 EBR deposit + 1 LAR deposit.
+    #   tokens_per_core = floor(ebr_count / spt) — EBR (8) binds tighter than LAR (16).
+    #   Max d_model per launch: ebr_count * elements_per_stick = 8 * 64 = 512 at 16-bit.
     sticks_per_token = math.ceil(d_model * element_bits / 8 / gen.hw.stick_bytes)
-    C = math.ceil(sticks_per_token / L3_BURST_MAX)
     N = len(flat_idx)
 
     # HARDWARE-BLOCKED (2026-06-21): multi-stick embedding (sticks_per_token > 1)
@@ -96,13 +96,19 @@ def build_embedding_launches(
             f"is hardware-verified. The per-token pipeline-layout fix is the "
             f"remaining blocker (separate codegen effort)."
         )
-    tokens_per_core = min(ebr_count, lar_count // C)
+    # Plane-major ceiling: floor(ebr_count / spt). EBR (8) binds tighter than LAR (16).
+    # For spt=1: tokens_per_core = min(8, 16) = 8 (unchanged from old model).
+    # For spt > ebr_count: ceiling < 1 → one token's planes exceed EBR file; needs a
+    # different gather model (multi-launch over planes, not yet implemented).
+    tokens_per_core = min(ebr_count // sticks_per_token, lar_count // sticks_per_token)
     if tokens_per_core < 1:
         raise NotImplementedError(
-            f"embedding: d_model={d_model} → sticks_per_token={sticks_per_token}, "
-            f"C={C} chunks/token; one token's row exceeds the L3LU LAR file "
-            f"({lar_count}). Max supported sticks_per_token={lar_count * L3_BURST_MAX} "
-            f"(d_model≈{lar_count * L3_BURST_MAX * elements_per_stick})."
+            f"embedding: d_model={d_model} → sticks_per_token={sticks_per_token}; "
+            f"one token's planes ({sticks_per_token}) exceed the L3LU EBR file "
+            f"({ebr_count}). Max d_model per launch = "
+            f"{ebr_count * elements_per_stick} at {element_bits}-bit. "
+            f"Multi-plane launch (d_model > {ebr_count * elements_per_stick}) "
+            f"needs a different gather model — not yet implemented."
         )
     # sticks_per_token is forwarded to the scheduler via tile_n=d_model;
     # here we only need the launch geometry.
