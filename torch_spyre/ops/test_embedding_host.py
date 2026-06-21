@@ -6,25 +6,27 @@ import pytest
 from torch_spyre.ops._embedding_host import build_embedding_launches
 
 
-def test_multistick_no_longer_fenced():
-    """d_model=4096 (spt=64, C=2) must plan launches, not raise NotImplementedError."""
+def test_multistick_hardware_blocked():
+    """d_model>elements_per_stick (multi-stick) is HARDWARE-BLOCKED on AIU 1.0.
+
+    The >1-stick-per-token gather deposit produces wrong output on silicon
+    (hardware-confirmed: d=128 max_diff=9; d=2048 device hang). Until that
+    embedding-specific deposit defect is fixed, the host helper must reject
+    multi-stick loudly rather than ship a wrong/hanging binary. (The codegen
+    capacity math and wide-row pointwise dataflow are separately verified; this
+    fence is specifically for the embedding deposit defect.)
+    """
     idx = list(range(4))
-    launches, tokens_per_launch = build_embedding_launches(
-        vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
-    assert launches, "expected at least one launch binary"
-    # C=2 → tokens_per_core=min(8, 16//2)=8 → ceiling 256 for 32 cores; here N=4 small.
-    assert tokens_per_launch == 4  # d=4096→spt=64, C=2, K=min(8,8)=8→K=min(8,4)=4, cores=1
+    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
+        build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
 
 
-def test_ceiling_drops_when_lar_binds():
-    """d_model=8192 (spt=128, C=4) → tokens_per_core=min(8,16//4)=4."""
-    N = 300
-    idx = [i % 100 for i in range(N)]
-    launches, tokens_per_launch = build_embedding_launches(
-        vocab=100, d_model=8192, element_bits=16, flat_idx=idx)
-    # tokens_per_core capped at 4 by LAR; with 32 cores tokens_per_launch=128.
-    assert tokens_per_launch == 128
-    assert len(launches) == math.ceil(N / 128)
+def test_two_stick_also_blocked():
+    """Even the smallest multi-stick case (d=128, spt=2) is blocked — the deposit
+    defect is in the basic >1-stick gather, not only wide/chunked rows."""
+    idx = list(range(8))
+    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
+        build_embedding_launches(vocab=1000, d_model=128, element_bits=16, flat_idx=idx)
 
 
 def test_single_stick_unchanged():

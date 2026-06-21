@@ -72,6 +72,28 @@ def build_embedding_launches(
     sticks_per_token = math.ceil(d_model * element_bits / 8 / gen.hw.stick_bytes)
     C = math.ceil(sticks_per_token / L3_BURST_MAX)
     N = len(flat_idx)
+
+    # HARDWARE-BLOCKED (2026-06-20): multi-stick embedding (sticks_per_token > 1)
+    # produces WRONG OUTPUT on AIU 1.0 silicon and hangs the device for wide rows.
+    # The embedding codegen (gather generator, EAR/LAR seeding, IBUFF/budget guards)
+    # is offline-complete and decode-verified, AND the underlying wide-row pointwise
+    # dataflow is now hardware-verified (identity d=2048/d=8192 max_diff=0). BUT a
+    # distinct embedding-specific defect remains in the >1-stick-per-token gather
+    # DEPOSIT: hardware-confirmed embedding d=128 (2 sticks/tok) → max_diff=9 (wrong
+    # output), embedding d=2048 (32 sticks/tok) → device hang (ComputeHardwareError
+    # 0x7b1b). Until that deposit defect is root-caused and fixed, reject multi-stick
+    # loudly rather than ship a wrong/hanging binary. Single-stick (d_model ==
+    # elements_per_stick, e.g. 64 at DL16) is hardware-verified and remains supported.
+    if sticks_per_token > 1:
+        raise NotImplementedError(
+            f"embedding: d_model={d_model} needs sticks_per_token={sticks_per_token} "
+            f"(>1). Multi-stick embedding is HARDWARE-BLOCKED on AIU 1.0: the "
+            f">1-stick-per-token gather deposit produces wrong output on silicon "
+            f"(d=128 max_diff=9) and hangs for wide rows (d=2048). Only single-stick "
+            f"d_model <= {elements_per_stick} ({element_bits}-bit) is hardware-verified. "
+            f"Codegen + wide-row pointwise dataflow are fixed/verified; the embedding "
+            f"deposit defect is the remaining blocker (separate debugging effort)."
+        )
     tokens_per_core = min(ebr_count, lar_count // C)
     if tokens_per_core < 1:
         raise NotImplementedError(
