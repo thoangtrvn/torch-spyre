@@ -212,25 +212,25 @@ def test_ibr_d64_spt1_unchanged():
 def test_build_ibr_address_table():
     """IBR-T5: build_ibr_address_table produces correct int32 HBM stick addresses.
 
-    For the 3-tensor layout:
-      XLAT[0] = ibr_table  (segment 0)
-      XLAT[1] = weight_rc  (segment 1)
+    Silicon-proven 3-tensor layout (IBR-T7):
+      XLAT[0] = weight_rc  (segment 0)
+      XLAT[1] = ibr_table  (segment 1)
       XLAT[2] = output_buf (segment 2)
 
-    IBR[t] = (1<<seg_bits) + flat_indices[t] * spt
-    where seg_bits=27 for rcudd1a, spt=d_model//64.
+    IBR[t] = (0<<seg_bits) + flat_indices[t] * spt = flat_indices[t] * spt
+    where seg_bits=27 for rcudd1a, spt=d_model//64, weight at segment 0.
 
     Verified by construction:
       d_model=768, spt=12, seg_bits=27, flat_idx=[3,7]
-      IBR[0] = (1<<27) + 3*12 = 134217728 + 36 = 134217764
-      IBR[1] = (1<<27) + 7*12 = 134217728 + 84 = 134217812
+      IBR[0] = (0<<27) + 3*12 = 0 + 36 = 36
+      IBR[1] = (0<<27) + 7*12 = 0 + 84 = 84
     """
     from torch_spyre.ops._embedding_host import build_ibr_address_table
 
     seg_bits = 27
     spt = 12
     flat_idx = [3, 7]
-    weight_segment = 1  # XLAT[1]
+    weight_segment = 0  # XLAT[0] — silicon-proven IBR-T7 layout
 
     table = build_ibr_address_table(flat_idx, spt, segment=weight_segment,
                                      seg_bits=seg_bits)
@@ -241,9 +241,9 @@ def test_build_ibr_address_table():
         f"Expected int32, got {table.dtype}"
     )
 
-    # Verify entries
-    expected_0 = (1 << seg_bits) + 3 * spt
-    expected_1 = (1 << seg_bits) + 7 * spt
+    # Verify entries: IBR[t] = (0<<seg_bits) + idx*spt = idx*spt
+    expected_0 = (0 << seg_bits) + 3 * spt   # = 36
+    expected_1 = (0 << seg_bits) + 7 * spt   # = 84
     assert table[0, 0] == expected_0, (
         f"IBR[0]: expected {expected_0}, got {table[0, 0]}"
     )

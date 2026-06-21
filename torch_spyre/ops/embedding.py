@@ -23,10 +23,14 @@ PATH SELECTION:
     launch args: [weight(f16, vocab×d_model), buf(f16, tokens×d_model)]
     weight stickified plane-major (existing behavior, unchanged).
 
-  d_model > 512 (spt > 8): IBR indirect gather path (Task 5).
-    launch args: [ibr_table(int32, 1×32), weight_rc(f16, vocab*spt×64), buf(f16)]
+  d_model > 512 (spt > 8): IBR indirect gather path (hardware-verified IBR-T7).
+    launch args: [weight_rc(f16, vocab*spt×64), ibr_table(int32, 1×32), buf(f16)]
+    XLAT[0]=weight_rc (seg0), XLAT[1]=ibr_table (seg1), XLAT[2]=buf (seg2).
     weight_rc = weight.reshape(vocab*spt, 64) — row-contiguous layout (see below).
     ibr_table = int32 IBR address table (see _embedding_host.build_ibr_address_table).
+    IBR[t] = (0<<seg_bits) + idx*spt = idx*spt (weight at segment 0).
+    buf shape: (tokens_per_launch*spt, 64) row-contiguous; reshape after D2H to
+    (tokens_per_launch, spt, 64).reshape(tokens_per_launch, d_model).
 
 ROW-CONTIGUOUS WEIGHT RESHAPE (IBR path):
   A (vocab, d_model) weight is stickified PLANE-MAJOR on device: plane s of all
@@ -118,6 +122,8 @@ def _embedding_ibr(
 ) -> torch.Tensor:
     """IBR-path embedding for d_model > 512.
 
+    SILICON-PROVEN RECIPE (IBR-T7: both tokens max_diff=0):
+
     WEIGHT LAYOUT:
       weight (on device, plane-major) is brought back to CPU, reshaped to
       (vocab*spt, 64) — row-contiguous — and re-moved to device.  This costs
@@ -129,21 +135,26 @@ def _embedding_ibr(
       Constraint: d_model must be a multiple of elements_per_stick.  The planning
       step (build_embedding_launches) validates this and raises ValueError if not.
 
-    3-TENSOR LAUNCH LAYOUT:
-      XLAT[0] = ibr_table  (int32, 1×32)
-      XLAT[1] = weight_rc  (f16,   vocab*spt×64, row-contiguous)
-      XLAT[2] = buf        (f16,   tokens×d_model)
+    3-TENSOR LAUNCH LAYOUT (XLAT segment assignment = input tensor list order):
+      XLAT[0] = weight_rc  (f16,   vocab*spt×64, row-contiguous) — segment 0
+      XLAT[1] = ibr_table  (int32, 1×32)                         — segment 1
+      XLAT[2] = buf        (f16,   tokens_per_launch*spt×64,
+                                   row-contiguous)                — segment 2
 
     IBR TABLE:
-      ibr_table[0, t] = (1 << seg_bits) + flat_idx_slice[t] * spt
+      ibr_table[0, t] = (0 << seg_bits) + flat_idx_slice[t] * spt = flat_idx[t]*spt
+      weight is at segment 0, so the segment term is 0.
       Built per-launch from the slice of flat_idx for that launch.
       Uses torch.from_numpy on the numpy int32 array returned by
-      build_ibr_address_table.
+      build_ibr_address_table(slice_indices, spt, segment=0, seg_bits).
 
-    OUTPUT ASSEMBLY:
-      Same CPU-staging pattern as the EBR path: D2H per launch, then one
-      H2D at the end.  The device-side slice-assign offset bug applies to
-      the IBR path too (spyre hardware).
+    OUTPUT BUFFER + ASSEMBLY:
+      buf is row-contiguous (tokens_per_launch*spt, 64): L3SU deposits spt
+      sticks per token sequentially (no plane-major transposition).
+      After D2H: buf.cpu().reshape(n_launch, spt, 64).reshape(n_launch, d_model)
+      gives token-major (n_launch, d_model) — token t at rows [t*spt..(t+1)*spt).
+      Only real rows [:n_real] are copied to out_cpu.
+      Same CPU-staging pattern as the EBR path (one H2D at end).
     """
     eps = _ELEMENTS_PER_STICK[element_bits]   # 64 at 16-bit
     spt = d_model // eps                       # sticks per token row
@@ -177,8 +188,9 @@ def _embedding_ibr(
     gen = get_generation("rcudd1a")   # TODO: make target configurable per generation
     seg_bits = gen.hw.segment_size_bits
 
-    # Weight is at XLAT[1] (segment 1).
-    weight_segment = 1
+    # Weight is at XLAT[0] (segment 0) — silicon-proven IBR-T7 layout.
+    # ibr_table is at XLAT[1] (segment 1), so IBR[t] = 0<<seg_bits + idx*spt = idx*spt.
+    weight_segment = 0
 
     out_cpu = torch.empty((len(flat_idx), d_model), dtype=weight.dtype)
     for (start, end), binary in launches:
@@ -191,20 +203,27 @@ def _embedding_ibr(
         if len(slice_indices) < n_launch:
             slice_indices = slice_indices + [flat_idx[0]] * (n_launch - len(slice_indices))
 
+        # segment=0: weight at XLAT[0], so IBR[t] = (0<<seg_bits) + idx*spt = idx*spt.
         ibr_np = build_ibr_address_table(
             slice_indices, spt, segment=weight_segment, seg_bits=seg_bits,
         )
         ibr_t = torch.from_numpy(ibr_np)  # int32, shape (1, 32)
         ibr_dev = ibr_t.to(weight.device)
 
-        # Output buffer: tokens_per_launch × d_model.
-        buf = torch.empty((n_launch, d_model), dtype=weight.dtype, device=weight.device)
+        # Output buffer: row-contiguous (n_launch*spt, 64).
+        # L3SU stores spt sticks per token contiguously; no plane-major transposition.
+        # After D2H: reshape (n_launch*spt, 64) → (n_launch, spt, 64) → (n_launch, d_model).
+        buf = torch.empty((n_launch * spt, 64), dtype=weight.dtype, device=weight.device)
 
-        # Launch: [ibr_table, weight_rc, output_buf]
-        # XLAT[0]=ibr_dev, XLAT[1]=weight_rc, XLAT[2]=buf
-        launch_kernel_from_bytes(binary, [ibr_dev, weight_rc, buf])
+        # Launch: [weight_rc, ibr_table, output_buf]
+        # XLAT[0]=weight_rc (seg0), XLAT[1]=ibr_dev (seg1), XLAT[2]=buf (seg2).
+        launch_kernel_from_bytes(binary, [weight_rc, ibr_dev, buf])
 
-        out_cpu[start:end] = buf[:n_real].cpu()
+        # Extract real token rows from the row-contiguous buf.
+        # buf row (t*spt+s) = token t plane s; reshape to (n_launch, spt, 64) then
+        # flatten last two dims to get (n_launch, d_model).
+        buf_rows = buf.cpu().reshape(n_launch, spt, 64).reshape(n_launch, d_model)
+        out_cpu[start:end] = buf_rows[:n_real]
 
     return out_cpu.to(weight.device).reshape(*indices.shape, d_model)
 
