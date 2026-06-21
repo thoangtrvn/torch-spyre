@@ -6,27 +6,33 @@ import pytest
 from torch_spyre.ops._embedding_host import build_embedding_launches, _tokens_per_core
 
 
-def test_multistick_hardware_blocked():
-    """d_model>elements_per_stick (multi-stick) is HARDWARE-BLOCKED on AIU 1.0.
+def test_multistick_beyond_ebr_ceiling_raises():
+    """d_model=4096 (spt=64) exceeds the L3LU EBR file (8) — still rejected.
 
-    The >1-stick-per-token gather deposit produces wrong output on silicon
-    (hardware-confirmed: d=128 max_diff=9; d=2048 device hang). Until that
-    embedding-specific deposit defect is fixed, the host helper must reject
-    multi-stick loudly rather than ship a wrong/hanging binary. (The codegen
-    capacity math and wide-row pointwise dataflow are separately verified; this
-    fence is specifically for the embedding deposit defect.)
+    Multi-stick embedding is HARDWARE-VERIFIED as of PM-T6 (max_diff=0 for
+    spt up to the EBR ceiling), but a single token's planes must fit the EBR
+    file: spt=64 > ebr_count=8, so the planner raises on the EBR ceiling (not
+    the old multi-stick fence). Max d_model per launch = 8*64 = 512 at 16-bit;
+    d>512 needs a multi-plane-launch gather model, not yet implemented.
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
+    with pytest.raises(NotImplementedError, match="EBR file|gather model"):
         build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
 
 
-def test_two_stick_also_blocked():
-    """Even the smallest multi-stick case (d=128, spt=2) is blocked — the deposit
-    defect is in the basic >1-stick gather, not only wide/chunked rows."""
+def test_two_stick_now_supported():
+    """The smallest multi-stick case (d=128, spt=2) is HARDWARE-VERIFIED (PM-T6).
+
+    Plane-major source + plane-major output scatter confirmed on silicon
+    (max_diff=0). spt=2 → floor(8/2)=4 tokens/core; 8 tokens → 2 launches of
+    4 tokens each (within the per-core cap). The planner must now PLAN, not raise.
+    """
     idx = list(range(8))
-    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
-        build_embedding_launches(vocab=1000, d_model=128, element_bits=16, flat_idx=idx)
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=1000, d_model=128, element_bits=16, flat_idx=idx)
+    # spt=2 → tokens_per_core = floor(8/2) = 4. 8 tokens → 2 cores × 4 = 8/launch.
+    assert tokens_per_launch == min(32, math.ceil(8 / 4)) * 4  # 2 cores × 4 = 8
+    assert len(launches) >= 1
 
 
 def test_single_stick_unchanged():
@@ -44,16 +50,16 @@ def test_single_stick_unchanged():
 # PM-Task 3: host ceiling tests
 # ---------------------------------------------------------------------------
 
-def test_pm3_d1024_raises_not_implemented():
-    """d_model=1024 (spt=16) raises NotImplementedError on the multi-stick fence.
+def test_pm3_d1024_raises_on_ebr_ceiling():
+    """d_model=1024 (spt=16) raises NotImplementedError on the EBR-file ceiling.
 
-    PM-T3: spt=16 > 1, so the hardware fence fires before the EBR ceiling check.
-    The match confirms it is the multi-stick hardware fence, not an unrelated error.
-    (If the fence were removed, the EBR ceiling — _tokens_per_core(8,16,16)==0 — would
-    also raise NotImplementedError, so this path is double-gated.)
+    With the multi-stick fence removed (PM-T6, hardware-verified), spt=16 still
+    exceeds ebr_count=8, so _tokens_per_core(8,16,16)==0 and the planner raises
+    on the EBR ceiling. The match confirms it is the EBR-file ceiling, not the
+    old multi-stick fence and not an unrelated error.
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
+    with pytest.raises(NotImplementedError, match="EBR file|gather model"):
         build_embedding_launches(vocab=128, d_model=1024, element_bits=16, flat_idx=idx)
 
 

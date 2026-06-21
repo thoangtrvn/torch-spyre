@@ -93,29 +93,21 @@ def build_embedding_launches(
     sticks_per_token = math.ceil(d_model * element_bits / 8 / gen.hw.stick_bytes)
     N = len(flat_idx)
 
-    # HARDWARE-BLOCKED (2026-06-21): multi-stick embedding (sticks_per_token > 1)
-    # produces SCRAMBLED output on AIU 1.0 silicon (hardware-confirmed: d=128
-    # 2-stick token → values from wrong (token,stick) positions; d=2048 → device
-    # hang). Root cause (diagnosed): embedding's copy/output pipeline
-    # (LXLU→SFP→LXSU→L3SU) is the FLAT pointwise dataflow, which walks LX as one
-    # contiguous sticks_per_core run with a single stride — but the L3LU gather
-    # DEPOSITS per-token with the source stride baked into EBR/EAR, so the two LX
-    # layout views disagree for spt>1. spt=1 (d_model==elements_per_stick) works
-    # only because 1 stick == 1 token makes both views coincide. The real fix is a
-    # per-token / spt-stick-granular pipeline matching the gather deposit layout
-    # (its own codegen effort). Scratchpad-overlap (separate input/output regions)
-    # and wide-row pointwise N-tiling are FIXED + verified, but are not sufficient.
-    # Reject multi-stick loudly rather than ship scrambled/hanging output.
-    if sticks_per_token > 1:
-        raise NotImplementedError(
-            f"embedding: d_model={d_model} needs sticks_per_token={sticks_per_token} "
-            f"(>1). Multi-stick embedding is HARDWARE-BLOCKED on AIU 1.0: the "
-            f"copy/output pipeline walks LX contiguously while the gather deposits "
-            f"per-token, scrambling output for spt>1 (d=128 hardware-confirmed). "
-            f"Only single-stick d_model <= {elements_per_stick} ({element_bits}-bit) "
-            f"is hardware-verified. The per-token pipeline-layout fix is the "
-            f"remaining blocker (separate codegen effort)."
-        )
+    # Multi-stick embedding (sticks_per_token > 1) is HARDWARE-VERIFIED on AIU 1.0
+    # as of PM-T6 (2026-06-21). The bug had four facets, all fixed and confirmed
+    # on silicon (max_diff=0): (1) plane-major SOURCE addressing — token idx,
+    # plane s reads HBM stick idx + s*vocab (was idx*spt); (2) per-(token,plane)
+    # distinct-EBR ld.hbm gather (no .u — the patched EBR carries the full source
+    # stick, so auto-increment on a shared EAR0 added a spurious +s drift);
+    # (3) plane-major OUTPUT scatter — the (N, d_model) output is itself stickified
+    # plane-major, so token t plane s is stored to output stick s*N + t (the L3SU
+    # output EAR is seeded plane-major; was a contiguous store that transposed
+    # tokens<->planes for multi-token launches); (4) wide-row pointwise N-tiling.
+    # Hardware ladder (pm_t6_hw_verify.py): 2-tok spt=2, 4-tok spt=2, 2-tok spt=4
+    # (d=256), and multi-core 2c×2tok all PASS max_diff=0. The remaining limit is
+    # purely the EBR-file ceiling below (d_model > ebr_count*elements_per_stick),
+    # not a correctness defect.
+    #
     # Plane-major ceiling: floor(ebr_count / spt). EBR (8) binds tighter than LAR (16).
     # For spt=1: tokens_per_core = min(8, 16) = 8 (unchanged from old model).
     # For spt > ebr_count: ceiling < 1 → one token's planes exceed EBR file; needs a
