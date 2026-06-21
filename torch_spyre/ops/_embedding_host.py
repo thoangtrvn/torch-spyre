@@ -153,5 +153,6 @@ def build_embedding_launches(
 
     launches = plan_and_build_embedding_binaries(
         scheduled, flat_idx, gen, num_cores=num_cores, tokens_per_core=K,
+        vocab=vocab,
     )
     return launches, tokens_per_launch
