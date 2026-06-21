@@ -6,10 +6,23 @@ sentient_codegen + stdlib (NO torch / torch_spyre) so it is unit-testable on a
 host without the spyre C extension. The torch/device wrapper lives in
 torch_spyre/ops/embedding.py.
 
-Supports multi-stick d_model: the per-launch token capacity is derived from the
-L3LU register file. Plane-major model (PM-T3): tokens_per_core = floor(EBR / spt),
-where spt = sticks_per_token. EBR (8) is the binding limit (tighter than LAR 16).
-Max d_model per launch = EBR * elements_per_stick = 512 at 16-bit.
+Supports multi-stick d_model:
+  - d_model <= 512 (spt <= 8): EBR path (plane-major, hardware-verified PM-T6).
+    tokens_per_core = floor(EBR / spt), EBR=8 is the binding limit (tighter
+    than LAR 16). Max d_model per EBR launch = EBR * elements_per_stick = 512.
+  - d_model > 512 (spt > 8): IBR path (row-contiguous weight, LDIM indirect
+    gather). Per-launch token ceiling = 32 (IBR file size), not EBR-8.
+    Tokens > 32 loop/multi-launch identical to EBR-path token chunking.
+
+IBR PATH WEIGHT CONVENTION:
+  The EBR path passes (vocab, d_model) weight directly — stickified plane-major.
+  The IBR path requires row-contiguous layout: token t's spt sticks at positions
+  [t*spt, (t+1)*spt). The host achieves this by reshaping (vocab, d_model) →
+  (vocab*spt, 64) before the H2D copy.  A (M, 64) tensor stickifies one-stick-
+  per-row (SpyreTensorLayout([M, 64], float16) → stride_map=[64, 1]), giving the
+  row-contiguous layout LDIM needs.  d_model must be a multiple of 64 (elements
+  per stick at 16-bit); non-multiples must be padded to the next multiple before
+  calling (most LLM d_model values are multiples of 64 or 128).
 """
 from __future__ import annotations
 
@@ -18,6 +31,63 @@ import math
 
 class EmbeddingHostError(RuntimeError):
     """Raised when sentient_codegen is unreachable or embedding cannot be built."""
+
+
+# IBR file size (hardware constant: LDIM populate reads 32 × 32-bit entries).
+# This is the per-launch token ceiling for the IBR path.
+_IBR_FILE_SIZE = 32
+
+# EBR path d_model ceiling (inclusive): tokens with d_model <= this value use
+# the EBR plane-major gather path (hardware-verified PM-T6).  d_model > this
+# value uses the IBR indirect gather path.
+_EBR_D_MODEL_MAX = 512
+
+
+def build_ibr_address_table(
+    indices: list[int],
+    spt: int,
+    segment: int,
+    seg_bits: int,
+) -> "object":  # returns numpy.ndarray[int32] or a list of int (if numpy absent)
+    """Build a (1, 32) int32 IBR address table for an IBR-path launch.
+
+    The LDIM populate instruction reads one 128-byte HBM flit (32 × 32-bit
+    integers) into the hardware IBR register file.  Entry t is the absolute
+    HBM stick address of token indices[t]'s base row in the source tensor:
+
+        IBR[t] = (segment << seg_bits) + indices[t] * spt
+
+    where:
+      - ``segment`` is the XLAT segment index of the weight tensor (1 in the
+        standard 3-tensor layout: ibr_table=0, weight=1, output=2).
+      - ``seg_bits`` is the segment-size-bits constant from the generation
+        (27 for rcudd1a; from ``gen.hw.segment_size_bits``).
+      - ``spt`` = sticks_per_token = ceil(d_model / elements_per_stick).
+      - Unused entries (len(indices) .. 31) are 0.
+
+    Returns a numpy.ndarray of shape (1, 32) and dtype int32.  Importable
+    from here (torch_spyre.ops._embedding_host) so tests can use it without
+    needing embedding.py's torch import.
+
+    Reuse for KV block tables: a KV block-table lookup uses the same IBR
+    construction — given block indices and sticks-per-block (spt), the same
+    function returns absolute stick addresses for the IBR populate.
+
+    Raises:
+        ValueError: if ``len(indices) > _IBR_FILE_SIZE``, ``spt < 1``, or
+                    ``segment < 0``.
+    """
+    try:
+        from sentient_codegen.encoder.embedding_dispatch import (
+            build_ibr_address_table as _cg_build,
+        )
+    except ImportError as e:
+        raise EmbeddingHostError(
+            "sentient_codegen not importable — source env.sh so codegen is "
+            "on PYTHONPATH (required for build_ibr_address_table)."
+        ) from e
+
+    return _cg_build(indices, spt, segment=segment, seg_bits=seg_bits)
 
 
 def _tokens_per_core(ebr_count: int, lar_count: int, sticks_per_token: int) -> int:
@@ -38,6 +108,43 @@ def _tokens_per_core(ebr_count: int, lar_count: int, sticks_per_token: int) -> i
     test_embedding_host.py to keep the coverage non-tautological.
     """
     return min(ebr_count // sticks_per_token, lar_count // sticks_per_token)
+
+
+def _build_embedding_launches_ibr(
+    d_model: int,
+    element_bits: int,
+    flat_idx: list[int],
+    gen,
+) -> tuple[list[tuple[tuple[int, int], bytes]], int]:
+    """Build IBR-path launches for d_model > _EBR_D_MODEL_MAX.
+
+    Per-launch token ceiling = _IBR_FILE_SIZE=32 (IBR file size).
+    Tokens > 32 are split into multiple launches (identical to EBR-path chunking).
+
+    Returns (launches, tokens_per_launch) where tokens_per_launch <= 32.
+
+    This is a private helper called by build_embedding_launches.  It is factored
+    here so plan_and_build_embedding_ibr_binaries can be called directly for
+    advanced use cases (e.g. pre-built IBR table reuse).
+    """
+    try:
+        from sentient_codegen.encoder.embedding_dispatch import (
+            plan_and_build_embedding_ibr_binaries,
+        )
+    except ImportError as e:
+        raise EmbeddingHostError(
+            "sentient_codegen not importable — source env.sh so codegen is "
+            "on PYTHONPATH (required for IBR embedding dispatch)."
+        ) from e
+
+    tokens_per_launch = min(_IBR_FILE_SIZE, len(flat_idx))
+    launches = plan_and_build_embedding_ibr_binaries(
+        flat_idx, d_model, gen,
+        element_bits=element_bits,
+        tokens_per_launch=tokens_per_launch,
+        out_segment=2,  # 3-tensor layout: ibr=0, weight=1, output=2
+    )
+    return launches, tokens_per_launch
 
 
 def build_embedding_launches(
@@ -80,48 +187,55 @@ def build_embedding_launches(
     if not flat_idx:
         return [], 0
 
+    # Bounds check: indices must be in [0, vocab).
+    for idx in flat_idx:
+        if idx < 0 or idx >= vocab:
+            raise ValueError(f"token index {idx} out of range [0, vocab={vocab})")
+
     gen = get_generation(target)
     ebr_count = gen.get_unit_spec("L3LU").registers["EBR"].count  # 8 on 1p0
     lar_count = gen.get_unit_spec("L3LU").registers["LAR"].count  # 16 on 1p0
     elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit (DL16)
 
-    # Per-launch capacity (plane-major model, matches the codegen scheduler PM-T3):
-    #   spt = sticks per token row (= planes per token).
-    #   Each (token, plane) = 1 EBR deposit + 1 LAR deposit.
-    #   tokens_per_core = floor(ebr_count / spt) — EBR (8) binds tighter than LAR (16).
-    #   Max d_model per launch: ebr_count * elements_per_stick = 8 * 64 = 512 at 16-bit.
     sticks_per_token = math.ceil(d_model * element_bits / 8 / gen.hw.stick_bytes)
     N = len(flat_idx)
 
-    # Multi-stick embedding (sticks_per_token > 1) is HARDWARE-VERIFIED on AIU 1.0
-    # as of PM-T6 (2026-06-21). The bug had four facets, all fixed and confirmed
-    # on silicon (max_diff=0): (1) plane-major SOURCE addressing — token idx,
-    # plane s reads HBM stick idx + s*vocab (was idx*spt); (2) per-(token,plane)
-    # distinct-EBR ld.hbm gather (no .u — the patched EBR carries the full source
-    # stick, so auto-increment on a shared EAR0 added a spurious +s drift);
-    # (3) plane-major OUTPUT scatter — the (N, d_model) output is itself stickified
-    # plane-major, so token t plane s is stored to output stick s*N + t (the L3SU
-    # output EAR is seeded plane-major; was a contiguous store that transposed
-    # tokens<->planes for multi-token launches); (4) wide-row pointwise N-tiling.
-    # Hardware ladder (pm_t6_hw_verify.py): 2-tok spt=2, 4-tok spt=2, 2-tok spt=4
-    # (d=256), and multi-core 2c×2tok all PASS max_diff=0. The remaining limit is
-    # purely the EBR-file ceiling below (d_model > ebr_count*elements_per_stick),
-    # not a correctness defect.
+    # PATH SELECTION: d_model <= _EBR_D_MODEL_MAX (512) → EBR path (PM-T6, proven).
+    #                 d_model >  _EBR_D_MODEL_MAX (512) → IBR path (Task 5).
     #
-    # Plane-major ceiling: floor(ebr_count / spt). EBR (8) binds tighter than LAR (16).
-    # For spt=1: tokens_per_core = min(8, 16) = 8 (unchanged from old model).
-    # For spt > ebr_count: ceiling < 1 → one token's planes exceed EBR file; needs a
-    # different gather model (multi-launch over planes, not yet implemented).
+    # EBR path (d_model <= 512, spt <= 8):
+    #   Multi-stick embedding is HARDWARE-VERIFIED on AIU 1.0 as of PM-T6 (2026-06-21).
+    #   All four plane-major bugs fixed and confirmed on silicon (max_diff=0):
+    #   (1) plane-major SOURCE addressing, (2) per-(token,plane) distinct-EBR gather,
+    #   (3) plane-major OUTPUT scatter, (4) wide-row pointwise N-tiling.
+    #   Hardware ladder: 2-tok spt=2, 4-tok spt=2, 2-tok spt=4 (d=256), multi-core
+    #   2c×2tok all PASS max_diff=0.
+    #   tokens_per_core = floor(ebr_count / spt). EBR (8) binds tighter than LAR (16).
+    #   For spt=1: tokens_per_core = min(8, 16) = 8 (unchanged).
+    #
+    # IBR path (d_model > 512, spt > 8):
+    #   Replaces the EBR-8 ceiling with the IBR-file ceiling (32 tokens/launch).
+    #   Single-core launch; multi-launch for >32 tokens (same as EBR chunking).
+    #   Weight must be passed row-contiguous (reshaped in embedding.py).
+    #   Offline-validated (ibr_probe_emulator_check.py, Task 4).
+    #   Device verification: ibr_t5_device.py (pending controller run, Task 7).
+    if d_model > _EBR_D_MODEL_MAX:
+        # IBR path: dispatch to indirect gather.
+        return _build_embedding_launches_ibr(d_model, element_bits, flat_idx, gen)
+
+    # EBR path: plane-major gather (d_model <= 512).
     tokens_per_core = _tokens_per_core(ebr_count, lar_count, sticks_per_token)
     if tokens_per_core < 1:
+        # This branch is unreachable for d_model <= 512 (spt <= 8 <= ebr_count=8),
+        # but kept as a safety net for non-standard hardware with smaller EBR files.
         raise NotImplementedError(
             f"embedding: d_model={d_model} → sticks_per_token={sticks_per_token}; "
             f"one token's planes ({sticks_per_token}) exceed the L3LU EBR file "
-            f"({ebr_count}). Max d_model per launch = "
+            f"({ebr_count}). Max d_model per EBR launch = "
             f"{ebr_count * elements_per_stick} at {element_bits}-bit. "
-            f"Multi-plane launch (d_model > {ebr_count * elements_per_stick}) "
-            f"needs a different gather model — not yet implemented."
+            f"Use d_model > {_EBR_D_MODEL_MAX} to trigger the IBR path."
         )
+
     # sticks_per_token is forwarded to the scheduler via tile_n=d_model;
     # here we only need the launch geometry.
     K = min(tokens_per_core, N)
@@ -137,11 +251,6 @@ def build_embedding_launches(
     )
     if scheduled.address_spec is None:
         raise EmbeddingHostError("schedule('embedding') produced no address_spec")
-    # Bounds: indices must be in [0, vocab). compute_embedding_addresses also checks
-    # against spec.vocab_size, but the spec is built without vocab; enforce here.
-    for idx in flat_idx:
-        if idx < 0 or idx >= vocab:
-            raise ValueError(f"token index {idx} out of range [0, vocab={vocab})")
 
     launches = plan_and_build_embedding_binaries(
         scheduled, flat_idx, gen, num_cores=num_cores, tokens_per_core=K,

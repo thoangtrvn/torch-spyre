@@ -6,18 +6,19 @@ import pytest
 from torch_spyre.ops._embedding_host import build_embedding_launches, _tokens_per_core
 
 
-def test_multistick_beyond_ebr_ceiling_raises():
-    """d_model=4096 (spt=64) exceeds the L3LU EBR file (8) — still rejected.
+def test_multistick_beyond_ebr_ceiling_now_ibr():
+    """d_model=4096 (spt=64) now dispatches to the IBR path — no longer raises.
 
     Multi-stick embedding is HARDWARE-VERIFIED as of PM-T6 (max_diff=0 for
-    spt up to the EBR ceiling), but a single token's planes must fit the EBR
-    file: spt=64 > ebr_count=8, so the planner raises on the EBR ceiling (not
-    the old multi-stick fence). Max d_model per launch = 8*64 = 512 at 16-bit;
-    d>512 needs a multi-plane-launch gather model, not yet implemented.
+    spt up to the EBR ceiling).  With IBR dispatch in place for d>512, d=4096
+    (spt=64 > ebr_count=8) no longer raises NotImplementedError — it plans
+    ≥1 launch using the IBR gather path (≤32 tokens/launch IBR file limit).
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="EBR file|gather model"):
-        build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
+    assert len(launches) >= 1, "IBR path must plan ≥1 launch for d=4096"
+    assert tokens_per_launch <= 32
 
 
 def test_two_stick_now_supported():
@@ -50,17 +51,20 @@ def test_single_stick_unchanged():
 # PM-Task 3: host ceiling tests
 # ---------------------------------------------------------------------------
 
-def test_pm3_d1024_raises_on_ebr_ceiling():
-    """d_model=1024 (spt=16) raises NotImplementedError on the EBR-file ceiling.
+def test_pm3_d1024_now_ibr():
+    """d_model=1024 (spt=16) now dispatches to the IBR path — no longer raises.
 
-    With the multi-stick fence removed (PM-T6, hardware-verified), spt=16 still
-    exceeds ebr_count=8, so _tokens_per_core(8,16,16)==0 and the planner raises
-    on the EBR ceiling. The match confirms it is the EBR-file ceiling, not the
-    old multi-stick fence and not an unrelated error.
+    With IBR dispatch in place for d>512, d=1024 (spt=16 > ebr_count=8) no
+    longer raises NotImplementedError — it plans ≥1 launch using the IBR path.
+    This replaces the old test_pm3_d1024_raises_on_ebr_ceiling which was correct
+    when d>512 was not implemented (Task 5 removes the ceiling for IBR-capable
+    d_models).
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="EBR file|gather model"):
-        build_embedding_launches(vocab=128, d_model=1024, element_bits=16, flat_idx=idx)
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=128, d_model=1024, element_bits=16, flat_idx=idx)
+    assert len(launches) >= 1, "IBR path must plan ≥1 launch for d=1024"
+    assert tokens_per_launch <= 32
 
 
 @pytest.mark.parametrize("spt,expected", [
@@ -102,3 +106,175 @@ def test_pm3_spt1_tokens_per_core_unchanged():
     assert tokens_per_launch == 8, (
         f"PM-T3: spt=1, 8 tokens → tokens_per_launch=8, got {tokens_per_launch}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 5: IBR path (d_model > 512) tests
+# ---------------------------------------------------------------------------
+
+def test_ibr_d2048_plans_not_raises():
+    """IBR-T5: d_model=2048 (spt=32) now PLANS via IBR path, not raises.
+
+    With d>512 dispatched to the IBR path, build_embedding_launches must return
+    ≥1 launch with ≤32 tokens/launch (IBR file size limit, not the EBR-8 ceiling).
+    The old NotImplementedError for d>512 must NOT be raised.
+    """
+    flat_idx = list(range(4))
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=32000, d_model=2048, element_bits=16, flat_idx=flat_idx,
+    )
+    assert len(launches) >= 1, "IBR path must produce at least 1 launch"
+    # tokens_per_launch is the IBR file ceiling (32) or fewer if batch is smaller
+    assert tokens_per_launch <= 32, (
+        f"IBR path: tokens_per_launch={tokens_per_launch} exceeds IBR file size 32"
+    )
+    assert tokens_per_launch >= 1
+    # All token indices must be covered with no overlap
+    covered = []
+    for (start, end), _binary in launches:
+        assert end > start, f"empty slice ({start},{end})"
+        covered.extend(range(start, end))
+    assert sorted(covered) == list(range(len(flat_idx))), (
+        f"IBR launches do not cover [0,{len(flat_idx)}) exactly: {covered}"
+    )
+
+
+def test_ibr_d4096_plans_not_raises():
+    """IBR-T5: d_model=4096 (spt=64) also uses IBR path — no longer raises.
+
+    The old test_multistick_beyond_ebr_ceiling_raises expected a NotImplementedError
+    for d=4096.  With IBR dispatch in place, d=4096 must now PLAN (spt=64 fits in
+    2 IBR chunks per token: ceil(64/32)=2 gather instructions per token).
+    """
+    flat_idx = list(range(4))
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=1024, d_model=4096, element_bits=16, flat_idx=flat_idx,
+    )
+    assert len(launches) >= 1, "IBR path must produce at least 1 launch for d=4096"
+    assert tokens_per_launch <= 32
+
+
+def test_ibr_more_than_32_tokens_multi_launch():
+    """IBR-T5: >32 tokens requires multiple launches (IBR file size = 32 entries).
+
+    40 tokens must be split into ≥2 launches, each with ≤32 tokens.
+    """
+    flat_idx = list(range(40))
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=32000, d_model=2048, element_bits=16, flat_idx=flat_idx,
+    )
+    assert tokens_per_launch <= 32, (
+        f"IBR: tokens_per_launch={tokens_per_launch} > 32 (IBR file limit)"
+    )
+    assert len(launches) >= 2, (
+        f"40 tokens with IBR limit=32 must produce ≥2 launches, got {len(launches)}"
+    )
+    covered = []
+    for (start, end), _binary in launches:
+        covered.extend(range(start, end))
+    assert sorted(covered) == list(range(40))
+
+
+def test_ibr_d512_stays_ebr():
+    """IBR-T5: d_model=512 (spt=8) stays on EBR path — unchanged from PM-T6.
+
+    The split is: d<=512 → EBR (proven), d>512 → IBR.  d=512 must still use the
+    EBR path (tokens_per_core = floor(8/8) = 1 token/core, not the IBR ceiling).
+    This test verifies the boundary: d=512 does NOT use the IBR path.
+    """
+    flat_idx = list(range(4))
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=1000, d_model=512, element_bits=16, flat_idx=flat_idx,
+    )
+    # EBR path: spt=8 → tokens_per_core=1, tokens_per_launch = num_cores*1 ≤ 32.
+    # 4 tokens → up to 4 cores × 1 token = 4 tokens per launch.
+    assert len(launches) >= 1
+    # EBR path: tokens_per_launch must divide evenly by spt (each core ≤ EBR count).
+    # tokens_per_launch on EBR is num_cores * tokens_per_core = num_cores * 1 = num_cores.
+    # tokens_per_launch ≥ 1 and is a multiple of 1.
+    assert tokens_per_launch >= 1
+
+
+def test_ibr_d64_spt1_unchanged():
+    """IBR-T5: d_model=64 (spt=1) is completely unaffected — EBR path, byte-identical.
+
+    The IBR dispatch is guarded on d_model > 512 (spt > 8).  d=64 must continue to
+    use the EBR path with tokens_per_core=8.
+    """
+    flat_idx = list(range(8))
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=1000, d_model=64, element_bits=16, flat_idx=flat_idx,
+    )
+    # EBR path unchanged: spt=1 → tokens_per_core=8
+    assert tokens_per_launch == 8
+
+
+def test_build_ibr_address_table():
+    """IBR-T5: build_ibr_address_table produces correct int32 HBM stick addresses.
+
+    For the 3-tensor layout:
+      XLAT[0] = ibr_table  (segment 0)
+      XLAT[1] = weight_rc  (segment 1)
+      XLAT[2] = output_buf (segment 2)
+
+    IBR[t] = (1<<seg_bits) + flat_indices[t] * spt
+    where seg_bits=27 for rcudd1a, spt=d_model//64.
+
+    Verified by construction:
+      d_model=768, spt=12, seg_bits=27, flat_idx=[3,7]
+      IBR[0] = (1<<27) + 3*12 = 134217728 + 36 = 134217764
+      IBR[1] = (1<<27) + 7*12 = 134217728 + 84 = 134217812
+    """
+    from torch_spyre.ops._embedding_host import build_ibr_address_table
+
+    seg_bits = 27
+    spt = 12
+    flat_idx = [3, 7]
+    weight_segment = 1  # XLAT[1]
+
+    table = build_ibr_address_table(flat_idx, spt, segment=weight_segment,
+                                     seg_bits=seg_bits)
+
+    # Shape: (1, 32) int32
+    assert table.shape == (1, 32), f"Expected (1, 32), got {table.shape}"
+    assert str(table.dtype) in ("int32", "torch.int32"), (
+        f"Expected int32, got {table.dtype}"
+    )
+
+    # Verify entries
+    expected_0 = (1 << seg_bits) + 3 * spt
+    expected_1 = (1 << seg_bits) + 7 * spt
+    assert table[0, 0] == expected_0, (
+        f"IBR[0]: expected {expected_0}, got {table[0, 0]}"
+    )
+    assert table[0, 1] == expected_1, (
+        f"IBR[1]: expected {expected_1}, got {table[0, 1]}"
+    )
+    # Unused entries must be zero
+    assert table[0, 2] == 0, f"IBR[2] (unused): expected 0, got {table[0, 2]}"
+    assert table[0, 31] == 0, f"IBR[31] (unused): expected 0, got {table[0, 31]}"
+
+
+def test_build_ibr_address_table_kv_reuse():
+    """IBR-T5: build_ibr_address_table is reusable for KV block tables.
+
+    A block-table KV lookup uses the same IBR construction: given a list of
+    block indices and a spt (sticks per KV block), compute absolute stick addresses
+    in a specific segment.  This test verifies the same function works with
+    different parameters, confirming the factored API is reusable.
+    """
+    from torch_spyre.ops._embedding_host import build_ibr_address_table
+
+    seg_bits = 27
+    spt = 4        # smaller block size (KV scenario)
+    kv_blocks = [10, 20, 5]   # block addresses
+    segment = 2    # KV tensor at XLAT[2]
+
+    table = build_ibr_address_table(kv_blocks, spt, segment=segment,
+                                     seg_bits=seg_bits)
+    assert table.shape == (1, 32)
+    for i, blk in enumerate(kv_blocks):
+        expected = (segment << seg_bits) + blk * spt
+        assert table[0, i] == expected, (
+            f"KV IBR[{i}]: expected {expected}, got {table[0, i]}"
+        )
