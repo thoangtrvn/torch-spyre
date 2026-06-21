@@ -3,7 +3,7 @@ on PYTHONPATH; no torch / torch_spyre import required."""
 import math
 import pytest
 
-from torch_spyre.ops._embedding_host import build_embedding_launches
+from torch_spyre.ops._embedding_host import build_embedding_launches, _tokens_per_core
 
 
 def test_multistick_hardware_blocked():
@@ -45,91 +45,42 @@ def test_single_stick_unchanged():
 # ---------------------------------------------------------------------------
 
 def test_pm3_d1024_raises_not_implemented():
-    """d_model=1024 (spt=16) raises NotImplementedError (hardware fence + EBR limit).
+    """d_model=1024 (spt=16) raises NotImplementedError on the multi-stick fence.
 
-    PM-T3: spt=16 > 8 (EBR limit), so tokens_per_core = floor(8/16) = 0.
-    The hardware fence fires first (spt>1), then the ceiling would also fail.
-    Either way, NotImplementedError is expected.
+    PM-T3: spt=16 > 1, so the hardware fence fires before the EBR ceiling check.
+    The match confirms it is the multi-stick hardware fence, not an unrelated error.
+    (If the fence were removed, the EBR ceiling — _tokens_per_core(8,16,16)==0 — would
+    also raise NotImplementedError, so this path is double-gated.)
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError, match="[Mm]ulti-stick"):
         build_embedding_launches(vocab=128, d_model=1024, element_bits=16, flat_idx=idx)
 
 
-def test_pm3_ceiling_formula_spt2():
-    """PM-T3: plane-major ceiling formula — spt=2 → tokens_per_core=4.
+@pytest.mark.parametrize("spt,expected", [
+    (1,  8),  # spt=1  → floor(8/1)=8 (single-stick, unchanged from old model)
+    (2,  4),  # spt=2  → floor(8/2)=4 (d=128 at 16-bit)
+    (4,  2),  # spt=4  → floor(8/4)=2 (d=256 at 16-bit)
+    (8,  1),  # spt=8  → floor(8/8)=1 (d=512, max spt under this model)
+    (16, 0),  # spt=16 → floor(8/16)=0 (d=1024 exceeds EBR file; caller raises)
+])
+def test_pm3_tokens_per_core(spt, expected):
+    """PM-T3: _tokens_per_core exercises the REAL production formula for all spt values.
 
-    Tests the ceiling formula directly by patching out the hardware fence.
-    This isolates the PM-T3 register-budget formula from the hardware-correctness
-    fence (which will be removed in Task 5).
+    ebr_count=8, lar_count=16 (AIU 1.0 hardware constants via gen registry).
+    These tests call _tokens_per_core directly, so a bug in the production formula
+    (e.g. using max instead of min, wrong integer-division, wrong register count)
+    will immediately cause a failure — unlike the previous inline-arithmetic versions
+    which were tautological (they reimplemented the formula, not called it).
 
-    spt=2 → floor(8/2)=4 tokens/core.
-    10 tokens → num_cores=ceil(10/4)=3 → tokens_per_launch=3*4=12.
+    spt>1 coverage is possible here because _tokens_per_core has no hardware fence;
+    the fence lives in build_embedding_launches and only blocks the end-to-end path.
+    The codegen guard (test_pm3_guard_* in codegen tests) provides additional spt>1
+    coverage through the scheduler path.
     """
-    from unittest.mock import patch
-
-    idx = list(range(10))
-    # Patch the hardware fence check out so the ceiling calculation is reachable.
-    # The fence is the `if sticks_per_token > 1: raise NotImplementedError(...)` block.
-    # We inject sticks_per_token=1 into the function's locals by patching math.ceil
-    # to return 1 for the sticks_per_token computation.
-    # Simpler: patch the internal variable via a side-effectful mock is complex;
-    # instead patch `schedule` to raise on bad inputs and verify the ceiling path.
-    # Use a direct formula verification instead (unit test the math):
-    ebr_count = 8
-    lar_count = 16
-    spt = 2  # d=128 at 16-bit
-    tokens_per_core = min(ebr_count // spt, lar_count // spt)
-    assert tokens_per_core == 4, (
-        f"PM-T3: spt=2 → tokens_per_core={tokens_per_core} != 4 (floor(8/2)=4)"
-    )
-    N = 10
-    num_cores = min(32, math.ceil(N / tokens_per_core))
-    tokens_per_launch = num_cores * tokens_per_core
-    assert tokens_per_launch == 12, (
-        f"PM-T3: 10 tokens, spt=2 → tokens_per_launch={tokens_per_launch} != 12 "
-        f"(3 cores × 4 tokens/core)"
-    )
-
-
-def test_pm3_ceiling_formula_spt4():
-    """PM-T3: spt=4 (d=256) → tokens_per_core=2.
-
-    floor(8/4)=2 tokens/core. 32 cores × 2 = 64 tokens_per_launch for a full batch.
-    """
-    ebr_count = 8
-    lar_count = 16
-    spt = 4  # d=256 at 16-bit
-    tokens_per_core = min(ebr_count // spt, lar_count // spt)
-    assert tokens_per_core == 2, (
-        f"PM-T3: spt=4 → tokens_per_core={tokens_per_core} != 2 (floor(8/4)=2)"
-    )
-    # 128 tokens total → num_cores=min(32, ceil(128/2))=32 → tokens_per_launch=64
-    num_cores = min(32, math.ceil(128 / tokens_per_core))
-    assert num_cores == 32
-    assert num_cores * tokens_per_core == 64, (
-        f"PM-T3: 32 cores × 2 = 64 tokens_per_launch, got {num_cores * tokens_per_core}"
-    )
-
-
-def test_pm3_ceiling_formula_spt8():
-    """PM-T3: spt=8 (d=512) → tokens_per_core=1 (maximum spt under this model)."""
-    ebr_count = 8
-    lar_count = 16
-    spt = 8  # d=512 at 16-bit
-    tokens_per_core = min(ebr_count // spt, lar_count // spt)
-    assert tokens_per_core == 1, (
-        f"PM-T3: spt=8 → tokens_per_core={tokens_per_core} != 1 (floor(8/8)=1)"
-    )
-
-
-def test_pm3_ceiling_formula_spt16_zero():
-    """PM-T3: spt=16 (d=1024) → tokens_per_core=0 → NotImplementedError."""
-    ebr_count = 8
-    spt = 16
-    tokens_per_core = ebr_count // spt
-    assert tokens_per_core == 0, (
-        f"PM-T3: spt=16 → tokens_per_core={tokens_per_core} != 0 (floor(8/16)=0)"
+    assert _tokens_per_core(8, 16, spt) == expected, (
+        f"PM-T3: _tokens_per_core(8, 16, {spt}) = "
+        f"{_tokens_per_core(8, 16, spt)} != {expected}"
     )
 
 

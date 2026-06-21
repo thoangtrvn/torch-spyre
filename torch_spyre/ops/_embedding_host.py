@@ -20,6 +20,26 @@ class EmbeddingHostError(RuntimeError):
     """Raised when sentient_codegen is unreachable or embedding cannot be built."""
 
 
+def _tokens_per_core(ebr_count: int, lar_count: int, sticks_per_token: int) -> int:
+    """Plane-major register-budget ceiling for tokens per core.
+
+    Returns floor(min(ebr_count, lar_count) / sticks_per_token).  EBR (8) is
+    the binding limit on AIU 1.0 (tighter than LAR 16), so for standard
+    hardware ebr_count=8, lar_count=16:
+
+      spt=1  → 8 tokens/core  (single-stick, unchanged from old model)
+      spt=2  → 4 tokens/core  (d=128 at 16-bit)
+      spt=4  → 2 tokens/core  (d=256 at 16-bit)
+      spt=8  → 1 token/core   (d=512 at 16-bit, maximum spt under this model)
+      spt=16 → 0              (d=1024 exceeds EBR file; caller raises)
+
+    This is the canonical formula for the PM-T3 plane-major model.  It is
+    called by build_embedding_launches and tested directly in
+    test_embedding_host.py to keep the coverage non-tautological.
+    """
+    return min(ebr_count // sticks_per_token, lar_count // sticks_per_token)
+
+
 def build_embedding_launches(
     vocab: int,
     d_model: int,
@@ -100,7 +120,7 @@ def build_embedding_launches(
     # For spt=1: tokens_per_core = min(8, 16) = 8 (unchanged from old model).
     # For spt > ebr_count: ceiling < 1 → one token's planes exceed EBR file; needs a
     # different gather model (multi-launch over planes, not yet implemented).
-    tokens_per_core = min(ebr_count // sticks_per_token, lar_count // sticks_per_token)
+    tokens_per_core = _tokens_per_core(ebr_count, lar_count, sticks_per_token)
     if tokens_per_core < 1:
         raise NotImplementedError(
             f"embedding: d_model={d_model} → sticks_per_token={sticks_per_token}; "
