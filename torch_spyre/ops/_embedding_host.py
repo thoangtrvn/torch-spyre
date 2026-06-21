@@ -73,26 +73,28 @@ def build_embedding_launches(
     C = math.ceil(sticks_per_token / L3_BURST_MAX)
     N = len(flat_idx)
 
-    # HARDWARE-BLOCKED (2026-06-20): multi-stick embedding (sticks_per_token > 1)
-    # produces WRONG OUTPUT on AIU 1.0 silicon and hangs the device for wide rows.
-    # The embedding codegen (gather generator, EAR/LAR seeding, IBUFF/budget guards)
-    # is offline-complete and decode-verified, AND the underlying wide-row pointwise
-    # dataflow is now hardware-verified (identity d=2048/d=8192 max_diff=0). BUT a
-    # distinct embedding-specific defect remains in the >1-stick-per-token gather
-    # DEPOSIT: hardware-confirmed embedding d=128 (2 sticks/tok) → max_diff=9 (wrong
-    # output), embedding d=2048 (32 sticks/tok) → device hang (ComputeHardwareError
-    # 0x7b1b). Until that deposit defect is root-caused and fixed, reject multi-stick
-    # loudly rather than ship a wrong/hanging binary. Single-stick (d_model ==
-    # elements_per_stick, e.g. 64 at DL16) is hardware-verified and remains supported.
+    # HARDWARE-BLOCKED (2026-06-21): multi-stick embedding (sticks_per_token > 1)
+    # produces SCRAMBLED output on AIU 1.0 silicon (hardware-confirmed: d=128
+    # 2-stick token → values from wrong (token,stick) positions; d=2048 → device
+    # hang). Root cause (diagnosed): embedding's copy/output pipeline
+    # (LXLU→SFP→LXSU→L3SU) is the FLAT pointwise dataflow, which walks LX as one
+    # contiguous sticks_per_core run with a single stride — but the L3LU gather
+    # DEPOSITS per-token with the source stride baked into EBR/EAR, so the two LX
+    # layout views disagree for spt>1. spt=1 (d_model==elements_per_stick) works
+    # only because 1 stick == 1 token makes both views coincide. The real fix is a
+    # per-token / spt-stick-granular pipeline matching the gather deposit layout
+    # (its own codegen effort). Scratchpad-overlap (separate input/output regions)
+    # and wide-row pointwise N-tiling are FIXED + verified, but are not sufficient.
+    # Reject multi-stick loudly rather than ship scrambled/hanging output.
     if sticks_per_token > 1:
         raise NotImplementedError(
             f"embedding: d_model={d_model} needs sticks_per_token={sticks_per_token} "
             f"(>1). Multi-stick embedding is HARDWARE-BLOCKED on AIU 1.0: the "
-            f">1-stick-per-token gather deposit produces wrong output on silicon "
-            f"(d=128 max_diff=9) and hangs for wide rows (d=2048). Only single-stick "
-            f"d_model <= {elements_per_stick} ({element_bits}-bit) is hardware-verified. "
-            f"Codegen + wide-row pointwise dataflow are fixed/verified; the embedding "
-            f"deposit defect is the remaining blocker (separate debugging effort)."
+            f"copy/output pipeline walks LX contiguously while the gather deposits "
+            f"per-token, scrambling output for spt>1 (d=128 hardware-confirmed). "
+            f"Only single-stick d_model <= {elements_per_stick} ({element_bits}-bit) "
+            f"is hardware-verified. The per-token pipeline-layout fix is the "
+            f"remaining blocker (separate codegen effort)."
         )
     tokens_per_core = min(ebr_count, lar_count // C)
     if tokens_per_core < 1:
