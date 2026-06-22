@@ -42,6 +42,18 @@ _IBR_FILE_SIZE = 32
 # value uses the IBR indirect gather path.
 _EBR_D_MODEL_MAX = 512
 
+# IBR single-chunk d_model ceiling (inclusive): the IBR gather reads a token row
+# in ceil(spt/32) burst chunks, where spt = d_model / elements_per_stick.  A
+# single LDIM burst covers at most 32 sticks (BURST field max), so d_model up to
+# 32 * elements_per_stick = 2048 (at 16-bit) needs only ONE chunk per token (C=1).
+# The C=1 path is HARDWARE-VERIFIED (IBR T7: real aten.embedding d=768 and d=2048,
+# max_diff=0 on silicon).  The MULTI-chunk path (C>1, d_model > 2048) — which emits
+# multiple LDIM gathers per token with addlarimm advances between chunks — is NOT
+# yet hardware-verified: it HANGS the device on AIU 1.0 (IBR T7: d=4096 spt=64 C=2
+# timed out while d=2048 returned in 6.3s).  Until the chunked-read path is fixed
+# and verified, d_model > this value raises rather than hanging the device.
+_IBR_SINGLE_CHUNK_D_MODEL_MAX = 2048
+
 
 def build_ibr_address_table(
     indices: list[int],
@@ -136,6 +148,24 @@ def _build_embedding_launches_ibr(
             "sentient_codegen not importable — source env.sh so codegen is "
             "on PYTHONPATH (required for IBR embedding dispatch)."
         ) from e
+
+    # Multi-chunk guard: the IBR gather reads a token row in ceil(spt/32) burst
+    # chunks (BURST field max = 32 sticks).  The single-chunk path (C=1) is
+    # hardware-verified; the multi-chunk path (C>1) HANGS the device on AIU 1.0
+    # (IBR T7) and is not yet fixed.  Fail loud rather than hang.  Derive the
+    # ceiling from elements_per_stick so it stays generation-correct.
+    elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit
+    spt = math.ceil(d_model / elements_per_stick)
+    chunks_per_token = math.ceil(spt / _IBR_FILE_SIZE)            # C = ceil(spt/32)
+    if chunks_per_token > 1:
+        max_d = _IBR_FILE_SIZE * elements_per_stick               # 2048 at 16-bit
+        raise NotImplementedError(
+            f"embedding: d_model={d_model} needs sticks_per_token={spt} → "
+            f"chunks_per_token={chunks_per_token} (>1).  The multi-chunk IBR gather "
+            f"path is not yet hardware-verified (it hangs the device on AIU 1.0). "
+            f"Single-chunk IBR (d_model <= {max_d} at {element_bits}-bit) is "
+            f"hardware-verified; the chunked-read path is a tracked follow-on."
+        )
 
     tokens_per_launch = min(_IBR_FILE_SIZE, len(flat_idx))
     launches = plan_and_build_embedding_ibr_binaries(

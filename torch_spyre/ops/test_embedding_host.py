@@ -6,19 +6,18 @@ import pytest
 from torch_spyre.ops._embedding_host import build_embedding_launches, _tokens_per_core
 
 
-def test_multistick_beyond_ebr_ceiling_now_ibr():
-    """d_model=4096 (spt=64) now dispatches to the IBR path — no longer raises.
+def test_multistick_d4096_multichunk_raises():
+    """d_model=4096 (spt=64 → C=2 chunks/token) raises on the multi-chunk guard.
 
-    Multi-stick embedding is HARDWARE-VERIFIED as of PM-T6 (max_diff=0 for
-    spt up to the EBR ceiling).  With IBR dispatch in place for d>512, d=4096
-    (spt=64 > ebr_count=8) no longer raises NotImplementedError — it plans
-    ≥1 launch using the IBR gather path (≤32 tokens/launch IBR file limit).
+    The single-chunk IBR gather (C=1, d_model <= 2048) is hardware-verified
+    (IBR T7: real aten.embedding d=768/d=2048, max_diff=0). The MULTI-chunk path
+    (C>1) hangs the device on AIU 1.0 (IBR T7: d=4096 spt=64 C=2 timed out), so the
+    planner raises NotImplementedError rather than building a hanging binary until
+    the chunked-read path is fixed and verified.
     """
     idx = list(range(4))
-    launches, tokens_per_launch = build_embedding_launches(
-        vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
-    assert len(launches) >= 1, "IBR path must plan ≥1 launch for d=4096"
-    assert tokens_per_launch <= 32
+    with pytest.raises(NotImplementedError, match="multi-chunk|chunks_per_token"):
+        build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
 
 
 def test_two_stick_now_supported():
@@ -139,19 +138,19 @@ def test_ibr_d2048_plans_not_raises():
     )
 
 
-def test_ibr_d4096_plans_not_raises():
-    """IBR-T5: d_model=4096 (spt=64) also uses IBR path — no longer raises.
+def test_ibr_d4096_multichunk_raises():
+    """IBR-T7: d_model=4096 (spt=64 → C=2 chunks/token) raises on the multi-chunk guard.
 
-    The old test_multistick_beyond_ebr_ceiling_raises expected a NotImplementedError
-    for d=4096.  With IBR dispatch in place, d=4096 must now PLAN (spt=64 fits in
-    2 IBR chunks per token: ceil(64/32)=2 gather instructions per token).
+    The chunked-read path (C=ceil(spt/32)>1: 2 gather instructions per token with
+    addlarimm advances between chunks) hangs the device on AIU 1.0 (IBR T7). Until
+    fixed+verified, it raises NotImplementedError rather than building a hanging
+    binary. Single-chunk (d_model <= 2048, C=1) is the hardware-verified ceiling.
     """
     flat_idx = list(range(4))
-    launches, tokens_per_launch = build_embedding_launches(
-        vocab=1024, d_model=4096, element_bits=16, flat_idx=flat_idx,
-    )
-    assert len(launches) >= 1, "IBR path must produce at least 1 launch for d=4096"
-    assert tokens_per_launch <= 32
+    with pytest.raises(NotImplementedError, match="multi-chunk|chunks_per_token"):
+        build_embedding_launches(
+            vocab=1024, d_model=4096, element_bits=16, flat_idx=flat_idx,
+        )
 
 
 def test_ibr_more_than_32_tokens_multi_launch():
