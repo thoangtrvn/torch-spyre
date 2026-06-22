@@ -277,3 +277,239 @@ def test_build_ibr_address_table_kv_reuse():
         assert table[0, i] == expected, (
             f"KV IBR[{i}]: expected {expected}, got {table[0, i]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Loop T5: build-once cache + per-call loop-count patch
+# ---------------------------------------------------------------------------
+
+def test_loop_t5_ibr_cached_binary_built_once_for_same_d_model():
+    """Loop-T5: the IBR cached binary is built ONCE per (d_model, element_bits).
+
+    Calling build_embedding_launches for d=2048 with 8 tokens and then again
+    with 16 tokens must return a build counter of 1 (built once), not 2.
+
+    This test uses the _ibr_binary_cache module-level dict (imported directly
+    from _embedding_host) as an observable proxy for 'built once'.
+    """
+    from torch_spyre.ops._embedding_host import (
+        build_embedding_launches,
+        _ibr_binary_cache,
+    )
+
+    # Clear the cache before the test to ensure a clean slate
+    _ibr_binary_cache.clear()
+
+    vocab = 32000
+    d_model = 2048
+    element_bits = 16
+
+    flat_idx_8 = list(range(8))
+    flat_idx_16 = list(range(16))
+
+    launches_8, tpl_8 = build_embedding_launches(
+        vocab=vocab, d_model=d_model, element_bits=element_bits,
+        flat_idx=flat_idx_8,
+    )
+    assert len(launches_8) >= 1
+
+    # Cache must have exactly one entry now
+    assert len(_ibr_binary_cache) == 1, (
+        f"Expected 1 cache entry after first IBR call, got {len(_ibr_binary_cache)}"
+    )
+
+    launches_16, tpl_16 = build_embedding_launches(
+        vocab=vocab, d_model=d_model, element_bits=element_bits,
+        flat_idx=flat_idx_16,
+    )
+    assert len(launches_16) >= 1
+
+    # Cache must STILL have exactly one entry (no rebuild for same d_model)
+    assert len(_ibr_binary_cache) == 1, (
+        f"Expected cache to stay at 1 entry after second IBR call (same d_model), "
+        f"got {len(_ibr_binary_cache)} — binary was rebuilt instead of reused"
+    )
+
+
+def test_loop_t5_ibr_per_call_binaries_differ_only_in_loop_count_imm():
+    """Loop-T5: per-call binaries for different token counts differ ONLY in the IMM field.
+
+    With a cached base binary and per-call loop-count patch:
+      - 8-token launch binary decoded inst[3] IMM == 8
+      - 16-token launch binary decoded inst[3] IMM == 16
+      - Both binaries are byte-identical except the 4 bytes of the IMM word.
+
+    This confirms option (A) from the task design: build once + per-call byte-patch.
+    """
+    import struct
+    from torch_spyre.ops._embedding_host import (
+        build_embedding_launches,
+        _ibr_binary_cache,
+    )
+    from sentient_codegen.emulator.loader import load_init_packet_bytes
+    from sentient_codegen.gen.registry import get_generation
+    from sentient_codegen.encoder.embedding_dispatch import _JCR_CNT_BYTE_OFFSET
+
+    gen = get_generation("rcudd1a")
+
+    # Clear cache before test
+    _ibr_binary_cache.clear()
+
+    vocab = 32000
+    d_model = 2048
+    element_bits = 16
+
+    # Build 8-token launch
+    launches_8, _ = build_embedding_launches(
+        vocab=vocab, d_model=d_model, element_bits=element_bits,
+        flat_idx=list(range(8)),
+    )
+    assert len(launches_8) == 1, f"8 tokens must produce 1 launch, got {len(launches_8)}"
+    _, binary_8 = launches_8[0]
+
+    # Build 16-token launch (using the same cached base)
+    launches_16, _ = build_embedding_launches(
+        vocab=vocab, d_model=d_model, element_bits=element_bits,
+        flat_idx=list(range(16)),
+    )
+    assert len(launches_16) == 1, f"16 tokens must produce 1 launch, got {len(launches_16)}"
+    _, binary_16 = launches_16[0]
+
+    # Both binaries must have the same length (same flit count)
+    assert len(binary_8) == len(binary_16), (
+        f"Binary lengths differ: {len(binary_8)} vs {len(binary_16)}"
+    )
+
+    # Decode both and verify IMM differs
+    decoded_8 = load_init_packet_bytes(binary_8, gen)
+    decoded_16 = load_init_packet_bytes(binary_16, gen)
+    l3lu_8 = decoded_8.unit_states.get("L3LU")
+    l3lu_16 = decoded_16.unit_states.get("L3LU")
+    assert l3lu_8 is not None and l3lu_16 is not None
+
+    imm_8 = l3lu_8.instructions[3].get("IMM")
+    imm_16 = l3lu_16.instructions[3].get("IMM")
+    assert imm_8 == 8, f"8-token binary inst[3] IMM must be 8, got {imm_8}"
+    assert imm_16 == 16, f"16-token binary inst[3] IMM must be 16, got {imm_16}"
+
+    # Byte-compare: only the 4 bytes at _JCR_CNT_BYTE_OFFSET must differ
+    diffs = [i for i in range(len(binary_8)) if binary_8[i] != binary_16[i]]
+    patch_range = {_JCR_CNT_BYTE_OFFSET, _JCR_CNT_BYTE_OFFSET + 1,
+                   _JCR_CNT_BYTE_OFFSET + 2, _JCR_CNT_BYTE_OFFSET + 3}
+    assert set(diffs).issubset(patch_range), (
+        f"Binaries differ at bytes outside the IMM patch word: "
+        f"{[hex(d) for d in diffs if d not in patch_range]}"
+    )
+    assert len(diffs) > 0, "8- and 16-token binaries are identical — patch not applied"
+
+
+def test_loop_t5_ibr_multi_launch_reuses_same_cached_binary():
+    """Loop-T5: >32 tokens across multiple launches all share the same cached binary.
+
+    40 tokens → 2 launches (32 + 8). Both binaries must come from the same
+    cached base (same bytes except for the loop-count IMM patch in each launch).
+    The cache must still have exactly 1 entry after building all launches.
+    """
+    from torch_spyre.ops._embedding_host import (
+        build_embedding_launches,
+        _ibr_binary_cache,
+    )
+    from sentient_codegen.emulator.loader import load_init_packet_bytes
+    from sentient_codegen.gen.registry import get_generation
+
+    gen = get_generation("rcudd1a")
+
+    # Clear cache
+    _ibr_binary_cache.clear()
+
+    vocab = 32000
+    d_model = 2048
+    element_bits = 16
+
+    launches_40, tpl = build_embedding_launches(
+        vocab=vocab, d_model=d_model, element_bits=element_bits,
+        flat_idx=list(range(40)),
+    )
+    assert len(launches_40) == 2, (
+        f"40 tokens (IBR limit=32) must produce 2 launches, got {len(launches_40)}"
+    )
+    assert tpl == 32, f"tokens_per_launch must be 32, got {tpl}"
+
+    # Cache must still have only 1 entry
+    assert len(_ibr_binary_cache) == 1, (
+        f"Expected 1 cache entry after 40-token IBR call, got {len(_ibr_binary_cache)}"
+    )
+
+    _, binary_l1 = launches_40[0]  # launch 1: 32 tokens → IMM=32
+    _, binary_l2 = launches_40[1]  # launch 2: 8 tokens  → IMM=8
+
+    # Verify IMM values
+    decoded_l1 = load_init_packet_bytes(binary_l1, gen)
+    decoded_l2 = load_init_packet_bytes(binary_l2, gen)
+    imm_l1 = decoded_l1.unit_states["L3LU"].instructions[3].get("IMM")
+    imm_l2 = decoded_l2.unit_states["L3LU"].instructions[3].get("IMM")
+
+    assert imm_l1 == 32, f"Launch 1 (32 tokens) IMM must be 32, got {imm_l1}"
+    assert imm_l2 == 8, f"Launch 2 (8 tokens) IMM must be 8, got {imm_l2}"
+
+
+def test_loop_t5_ebr_path_unaffected_by_ibr_cache():
+    """Loop-T5: d<=512 (EBR path) is completely unaffected by IBR caching.
+
+    Adding an IBR cache must NOT change d=64 or d=512 behavior.
+    """
+    from torch_spyre.ops._embedding_host import (
+        build_embedding_launches,
+        _ibr_binary_cache,
+    )
+
+    _ibr_binary_cache.clear()
+
+    # d=64 EBR path
+    launches_64, tpl_64 = build_embedding_launches(
+        vocab=1000, d_model=64, element_bits=16, flat_idx=list(range(8)),
+    )
+    assert len(launches_64) >= 1
+    assert tpl_64 == 8, f"EBR d=64 tokens_per_launch must be 8, got {tpl_64}"
+
+    # Cache must be empty (EBR path does not use the IBR cache)
+    assert len(_ibr_binary_cache) == 0, (
+        f"EBR path must not populate IBR cache, got {len(_ibr_binary_cache)} entries"
+    )
+
+    # d=512 EBR path
+    launches_512, _ = build_embedding_launches(
+        vocab=1000, d_model=512, element_bits=16, flat_idx=list(range(4)),
+    )
+    assert len(launches_512) >= 1
+    assert len(_ibr_binary_cache) == 0, (
+        "EBR d=512 path must not populate IBR cache"
+    )
+
+
+def test_loop_t5_different_d_models_separate_cache_entries():
+    """Loop-T5: different d_model values have separate cache entries.
+
+    d=768 and d=2048 are different shapes; the cached binary differs (different
+    spt, different binary structure). Both must be cached independently.
+    """
+    from torch_spyre.ops._embedding_host import (
+        build_embedding_launches,
+        _ibr_binary_cache,
+    )
+
+    _ibr_binary_cache.clear()
+
+    build_embedding_launches(
+        vocab=32000, d_model=768, element_bits=16, flat_idx=list(range(4)),
+    )
+    assert len(_ibr_binary_cache) == 1, (
+        f"Expected 1 entry after d=768, got {len(_ibr_binary_cache)}"
+    )
+
+    build_embedding_launches(
+        vocab=32000, d_model=2048, element_bits=16, flat_idx=list(range(4)),
+    )
+    assert len(_ibr_binary_cache) == 2, (
+        f"Expected 2 entries after d=768 + d=2048, got {len(_ibr_binary_cache)}"
+    )
