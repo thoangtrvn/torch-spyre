@@ -37,22 +37,6 @@ class EmbeddingHostError(RuntimeError):
 # This is the per-launch token ceiling for the IBR path.
 _IBR_FILE_SIZE = 32
 
-# Module-level cache for looped IBR binaries.
-#
-# Key: (d_model: int, element_bits: int)
-# Value: (cached_binary: bytes, patch_info: tuple[int, int, int])
-#   where patch_info = (byte_offset, bit_lo, bit_hi) for patch_loop_count.
-#
-# The cached binary is built ONCE per (d_model, element_bits) at
-# CACHED_TOKENS=32 (the full IBR file ceiling).  Per call, only the
-# JCR_cnt jimmcopy IMM field is patched (4-byte surgery, ~microseconds)
-# instead of rebuilding the entire init packet (seconds).  The weight
-# reshape is also hoisted: see _ibr_weight_cache in embedding.py.
-#
-# Tests can clear this cache (``_ibr_binary_cache.clear()``) before
-# asserting build-once behavior.
-_ibr_binary_cache: dict = {}
-
 # EBR path d_model ceiling (inclusive): tokens with d_model <= this value use
 # the EBR plane-major gather path (hardware-verified PM-T6).  d_model > this
 # value uses the IBR indirect gather path.
@@ -149,25 +133,15 @@ def _build_embedding_launches_ibr(
     Per-launch token ceiling = _IBR_FILE_SIZE=32 (IBR file size).
     Tokens > 32 are split into multiple launches (identical to EBR-path chunking).
 
-    Returns (launches, tokens_per_launch) where tokens_per_launch == _IBR_FILE_SIZE=32.
+    Returns (launches, tokens_per_launch) where tokens_per_launch <= 32.
 
-    CACHING DESIGN:
-      The looped embedding_ibr binary is built ONCE per (d_model, element_bits)
-      and stored in the module-level ``_ibr_binary_cache``.  Per call, only the
-      JCR_cnt jimmcopy IMM field is patched (4-byte surgery, microseconds) to set
-      the actual loop count (real tokens in that launch).  The binary is built at
-      CACHED_TOKENS=32; the non-L3LU units (LXLU/SFP/LXSU/L3SU) always operate on
-      the 32-token geometry; the caller reads only the first real_tokens rows of the
-      output buffer.
-
-    This is a private helper called by build_embedding_launches.
+    This is a private helper called by build_embedding_launches.  It is factored
+    here so plan_and_build_embedding_ibr_binaries can be called directly for
+    advanced use cases (e.g. pre-built IBR table reuse).
     """
     try:
         from sentient_codegen.encoder.embedding_dispatch import (
-            build_looped_ibr_binary_cached,
-            patch_loop_count,
-            plan_embedding_passes,
-            CACHED_TOKENS,
+            plan_and_build_embedding_ibr_binaries,
         )
     except ImportError as e:
         raise EmbeddingHostError(
@@ -193,35 +167,13 @@ def _build_embedding_launches_ibr(
             f"hardware-verified; the chunked-read path is a tracked follow-on."
         )
 
-    # Build-once: retrieve the cached binary or build it on first call.
-    cache_key = (d_model, element_bits)
-    if cache_key not in _ibr_binary_cache:
-        # Build the looped binary at CACHED_TOKENS=32 (one-time cost, seconds).
-        # Subsequent calls for the same (d_model, element_bits) reuse this binary.
-        cached_binary, patch_info = build_looped_ibr_binary_cached(
-            d_model, gen, element_bits=element_bits, out_segment=2,
-        )
-        _ibr_binary_cache[cache_key] = (cached_binary, patch_info)
-
-    cached_binary, patch_info = _ibr_binary_cache[cache_key]
-
-    # tokens_per_launch is always CACHED_TOKENS=32 (the non-L3LU units encode
-    # the 32-token geometry; partial final launches are padded by IBR-table zeros).
-    tokens_per_launch = CACHED_TOKENS
-
-    # Plan the launch slices (each slice is <= tokens_per_launch tokens).
-    passes = plan_embedding_passes(
-        len(flat_idx), num_cores=1, tokens_per_launch=tokens_per_launch,
+    tokens_per_launch = min(_IBR_FILE_SIZE, len(flat_idx))
+    launches = plan_and_build_embedding_ibr_binaries(
+        flat_idx, d_model, gen,
+        element_bits=element_bits,
+        tokens_per_launch=tokens_per_launch,
+        out_segment=2,  # 3-tensor layout: ibr=0, weight=1, output=2
     )
-
-    launches: list[tuple[tuple[int, int], bytes]] = []
-    for start, end in passes:
-        n_real = end - start
-        # Patch the cached binary with the actual token count for this launch.
-        # This is a 4-byte surgery on the JCR_cnt jimmcopy IMM field (~microseconds).
-        patched = patch_loop_count(cached_binary, n_real)
-        launches.append(((start, end), patched))
-
     return launches, tokens_per_launch
 
 

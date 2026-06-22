@@ -68,21 +68,6 @@ _DTYPE_BITS = {torch.float16: 16}  # DL16 on 1p0; extend per generation
 # elements per stick at each element width (128 bytes / element_bytes).
 _ELEMENTS_PER_STICK = {16: 64}  # float16: 128 / 2 = 64
 
-# Module-level cache for row-contiguous reshaped weights (IBR path).
-#
-# Key: (weight_id: int, weight_version: int)
-#   weight_id = id(weight) — the Python object id of the weight tensor.
-#   weight_version = weight._version — PyTorch version counter, incremented
-#     on in-place operations.  Combining id + version avoids stale cache hits
-#     when a weight tensor is freed and a new tensor reuses the same address.
-# Value: weight_rc (device tensor, float16, shape (vocab*spt, 64))
-#
-# The reshape (vocab, d_model) → (vocab*spt, 64) + D2H + H2D costs ~seconds
-# for large vocabularies.  Caching it by (id, version) means the IBR path only
-# pays this cost ONCE per unique weight tensor (i.e. once per model load), not
-# once per forward-pass call.
-_ibr_weight_cache: dict = {}
-
 
 @torch.library.custom_op("spyre::embedding", mutates_args=(), device_types="spyre")
 def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
@@ -175,28 +160,24 @@ def _embedding_ibr(
     spt = d_model // eps                       # sticks per token row
 
     # Plan the launches (validates d_model % eps == 0).
-    # _build_embedding_launches_ibr caches the binary per (d_model, element_bits)
-    # and patches only the JCR_cnt IMM field per launch — no recompile per call.
     launches, tokens_per_launch = build_embedding_launches(
         vocab, d_model, element_bits, flat_idx,
     )
 
     # Row-contiguous weight: reshape (vocab, d_model) → (vocab*spt, 64).
-    # CACHE: the reshape (D2H + reshape + H2D) costs ~seconds for large vocabs.
-    # Cache by (id(weight), weight._version) to pay this cost only once per unique
-    # weight tensor (i.e. once per model load).  weight._version increments on
-    # in-place mutations, so stale hits from freed/reused addresses are avoided.
-    weight_key = (id(weight), weight._version)
-    if weight_key not in _ibr_weight_cache:
-        # Pull to CPU, reshape to (vocab*spt, 64), move back to device.
-        # SpyreTensorLayout([vocab*spt, 64], float16) → stride_map=[64, 1]:
-        # one stick per row, sequential rows = row-contiguous layout for LDIM.
-        weight_cpu = weight.cpu().reshape(vocab * spt, eps)
-        _ibr_weight_cache[weight_key] = weight_cpu.to(weight.device)
-    weight_rc = _ibr_weight_cache[weight_key]
+    # The reshape is done on CPU to ensure the reshaped view is contiguous
+    # before the H2D copy (which applies the per-generation format conversion).
+    # weight is currently on device; pull to CPU for reshape.
+    weight_cpu = weight.cpu().reshape(vocab * spt, eps)
+    weight_rc = weight_cpu.to(weight.device)  # H2D with row-contiguous layout
 
     # IBR seg_bits from the generation: always 27 for rcudd1a.
-    # Import from the gen registry rather than hard-coding 27.
+    # Build per-launch IBR tables from the flat_idx slice.
+    # The seg_bits value is embedded in the binary (EBR0 constants), so we read
+    # it from the first launch's binary is not easy — use the known constant.
+    # We derive seg_bits from the binary's L3SU EBR0 (out_segment=2, so
+    # L3SU EBR0 = 2 << seg_bits; if L3SU EBR0 = 2*134217728 = 268435456, seg_bits=27).
+    # Rather than parsing the binary, import from the gen registry:
     try:
         from sentient_codegen.gen.registry import get_generation
     except ImportError as e:
@@ -211,21 +192,16 @@ def _embedding_ibr(
     # ibr_table is at XLAT[1] (segment 1), so IBR[t] = 0<<seg_bits + idx*spt = idx*spt.
     weight_segment = 0
 
-    # n_launch = tokens_per_launch = CACHED_TOKENS = 32 (fixed geometry from
-    # the cached binary; the hardware writes 32 rows per launch regardless of
-    # n_real — only the L3LU gather loop count is patched to n_real, so the
-    # hardware gathers n_real rows then stops; output rows [n_real..31] are
-    # written but ignored by the caller).
-    n_launch = tokens_per_launch
-
     out_cpu = torch.empty((len(flat_idx), d_model), dtype=weight.dtype)
     for (start, end), binary in launches:
         n_real = end - start
+        n_launch = tokens_per_launch
 
-        # Build per-launch IBR table for real indices [start, end).
-        # Entries [n_real..31] are 0 (don't-care: L3LU loop exits after n_real
-        # iterations; these sticks are never read by the hardware).
+        # Build per-launch IBR table for slice [start, end) padded to tokens_per_launch.
+        # Pad with flat_idx[0] (valid gather, output ignored).
         slice_indices = list(flat_idx[start:end])
+        if len(slice_indices) < n_launch:
+            slice_indices = slice_indices + [flat_idx[0]] * (n_launch - len(slice_indices))
 
         # segment=0: weight at XLAT[0], so IBR[t] = (0<<seg_bits) + idx*spt = idx*spt.
         ibr_np = build_ibr_address_table(
