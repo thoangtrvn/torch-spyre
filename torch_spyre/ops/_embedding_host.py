@@ -37,6 +37,18 @@ class EmbeddingHostError(RuntimeError):
 # This is the per-launch token ceiling for the IBR path.
 _IBR_FILE_SIZE = 32
 
+# Build-once cache for the cacheable looped IBR binary + its token-count patch
+# model, keyed by (target, d_model, element_bits, out_segment).  The binary depends
+# ONLY on geometry (token indices live in the separate IBR-table tensor, NOT in the
+# binary — verified: plan_and_build_embedding_ibr_binaries never passes slice_indices
+# to schedule/compile), so one cached entry serves every batch and token count at
+# that geometry.  Per call, the launch binary is produced by patching the loop count
+# (~microseconds) instead of re-scheduling + re-compiling (~2.6 ms/call) — the win
+# that made nn.Embedding(d=2048) timeouts go away.  Module-level (process-lifetime)
+# cache: entries are immutable bytes + a small patch model; no eviction needed (one
+# entry per distinct (d_model, element_bits) the model uses, typically 1-2).
+_IBR_LOOPED_CACHE: dict = {}
+
 # EBR path d_model ceiling (inclusive): tokens with d_model <= this value use
 # the EBR plane-major gather path (hardware-verified PM-T6).  d_model > this
 # value uses the IBR indirect gather path.
@@ -141,7 +153,8 @@ def _build_embedding_launches_ibr(
     """
     try:
         from sentient_codegen.encoder.embedding_dispatch import (
-            plan_and_build_embedding_ibr_binaries,
+            build_looped_ibr_binary_cached,
+            plan_and_build_embedding_ibr_binaries_cached,
         )
     except ImportError as e:
         raise EmbeddingHostError(
@@ -168,11 +181,31 @@ def _build_embedding_launches_ibr(
         )
 
     tokens_per_launch = min(_IBR_FILE_SIZE, len(flat_idx))
-    launches = plan_and_build_embedding_ibr_binaries(
+
+    # Build-ONCE + patch: the cacheable looped binary depends only on geometry, so
+    # build it once per (target, d_model, element_bits, out_segment) and patch the
+    # loop count per launch (~µs) instead of re-compiling per call (~2.6 ms).  Each
+    # patched launch binary is byte-identical to a native looped build at that
+    # launch's token count (hardware-verified: build-once+patch probe + the
+    # token1-empty .u-walk fix).  Indices are NOT in the binary (they ride the
+    # separate IBR-table tensor), so the cache is correct across batches/counts.
+    out_segment = 2  # 3-tensor layout: weight=XLAT[0], ibr=XLAT[1], output=XLAT[2]
+    cache_key = (gen.senarch, d_model, element_bits, out_segment)
+    entry = _IBR_LOOPED_CACHE.get(cache_key)
+    if entry is None:
+        entry = build_looped_ibr_binary_cached(
+            d_model, gen, element_bits=element_bits, out_segment=out_segment,
+        )
+        _IBR_LOOPED_CACHE[cache_key] = entry
+    cached_binary, patch_model = entry
+
+    launches = plan_and_build_embedding_ibr_binaries_cached(
         flat_idx, d_model, gen,
         element_bits=element_bits,
         tokens_per_launch=tokens_per_launch,
-        out_segment=2,  # 3-tensor layout: ibr=0, weight=1, output=2
+        out_segment=out_segment,
+        cached_binary=cached_binary,
+        patch_model=patch_model,
     )
     return launches, tokens_per_launch
 
