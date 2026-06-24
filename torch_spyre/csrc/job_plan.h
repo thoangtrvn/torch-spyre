@@ -293,8 +293,7 @@ class JobPlanStepH2D final : public JobPlanStep {
       : host_address_(host_address),
         device_address_(std::move(device_address)) {}
 
-  void construct(LaunchContext& ctx,
-                 const SpyreStream& stream) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -321,8 +320,7 @@ class JobPlanStepD2H final : public JobPlanStep {
       : device_address_(std::move(device_address)),
         host_address_(host_address) {}
 
-  void construct(LaunchContext& ctx,
-                 const SpyreStream& stream) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -354,8 +352,7 @@ class JobPlanStepCompute final : public JobPlanStep {
         bind_io_addresses_(bind_io_addresses),
         bootstrap_addr_(bootstrap_addr) {}
 
-  void construct(LaunchContext& ctx,
-                 const SpyreStream& stream) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
@@ -401,8 +398,7 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         input_buffer_(input_buffer),
         ishape_(ishape) {}
 
-  void construct(LaunchContext& ctx,
-                 const SpyreStream& stream) const override;
+  void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
   void write(std::ostream& os) const override;
 
