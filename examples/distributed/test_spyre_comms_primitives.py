@@ -222,6 +222,39 @@ def _run_allreduce(name, elements, dtype, algo_env=None):
     expected.fill_(float(expected_sum))
     ok = torch.allclose(result, expected, atol=1e-3)
 
+    if not ok:
+        diff = (result - expected).abs()
+        max_diff = diff.max().item()
+        # Find first mismatched index
+        mismatches = diff.gt(1e-3).nonzero(as_tuple=True)[0]
+        first_bad = mismatches[0].item() if len(mismatches) > 0 else -1
+        # Sample around the first bad index
+        lo = max(0, first_bad - 2)
+        hi = min(len(result), first_bad + 6)
+        print(
+            f"[{rank}/{size}] {name} MISMATCH: "
+            f"first_bad_idx={first_bad} "
+            f"num_bad={len(mismatches)} "
+            f"max_diff={max_diff} "
+            f"result[{lo}:{hi}]={result[lo:hi].tolist()} "
+            f"expected[{lo}:{hi}]={expected[lo:hi].tolist()}",
+            flush=True,
+        )
+        # Also check chunk boundaries for ring allreduce
+        chunk_size = elements // size
+        for c in range(size):
+            cstart = c * chunk_size
+            cend = (c + 1) * chunk_size
+            cdiff = diff[cstart:cend].max().item()
+            if cdiff > 1e-3:
+                print(
+                    f"[{rank}/{size}] {name} chunk{c} [{cstart}:{cend}] "
+                    f"max_diff={cdiff} "
+                    f"result[{cstart}:{cstart + 4}]={result[cstart : cstart + 4].tolist()} "
+                    f"expected[{cstart}:{cstart + 4}]={expected[cstart : cstart + 4].tolist()}",
+                    flush=True,
+                )
+
     _report(
         name, ok, f"elements={elements}, dtype={dtype}, expected_sum={expected_sum}"
     )

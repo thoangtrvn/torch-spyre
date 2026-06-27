@@ -159,7 +159,7 @@ use_new_system = os.environ.get("NEW_SYSTEM_SETUP", "0") == "1"
 if use_new_system:
     LIBRARIES = ["flex", "util"]
 else:
-    LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+    LIBRARIES = ["flex"]
 if use_spyre_ccl:
     LIBRARIES.append("spyre_comms")
 

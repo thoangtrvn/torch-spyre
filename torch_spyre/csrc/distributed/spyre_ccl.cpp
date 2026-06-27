@@ -15,7 +15,6 @@
  */
 #include "spyre_ccl.hpp"
 
-#include <cstdio>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -403,11 +402,8 @@ void SpyreCCLBackend::check_vector_tensor(
 c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllgatherOptions& opts) {
-  fprintf(stderr,
-          "[DEBUG allgather] ENTER SpyreCCLBackend::allgather, "
-          "outputTensors.size=%zu, inputTensors.size=%zu\n",
-          outputTensors.size(), inputTensors.size());
-  fflush(stderr);
+  DEBUGINFO("allgather: outputTensors.size=", outputTensors.size(),
+            "inputTensors.size=", inputTensors.size());
   if (static_cast<int>(outputTensors.size()) != 1) {
     std::string _err_msg =
         "[" + getBackendName() +
@@ -426,12 +422,6 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   }
   check_vector_tensor(inputTensors, 1, 1);
 
-  fprintf(stderr,
-          "[DEBUG allgather] ENTER SpyreCCLBackend::allgather, "
-          "outputTensors.size=%zu, inputTensors.size=%zu\n",
-          outputTensors.size(), inputTensors.size());
-  fflush(stderr);
-
   spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
 
   std::vector<spyre_comms::BufferDesc> output_bufs;
@@ -439,23 +429,19 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     output_bufs.push_back(prepare_buffer_desc(outputTensor));
   }
 
-  fprintf(stderr,
-          "[DEBUG allgather] Calling group_context_->allgather, "
-          "output_bufs.size=%zu, rank=%d, size=%d\n",
-          output_bufs.size(), group_context_->getRank(),
-          group_context_->getSize());
-  fflush(stderr);
+  DEBUGINFO("allgather: calling group_context_->allgather,",
+            "output_bufs.size=", output_bufs.size(),
+            "rank=", group_context_->getRank(),
+            "size=", group_context_->getSize());
 
   auto ws = group_context_->allgather(output_bufs, input_buf);
 
-  fprintf(stderr, "[DEBUG allgather] allgather returned, starting ws\n");
-  fflush(stderr);
+  DEBUGINFO("allgather: ws returned, starting");
 
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
 
-  fprintf(stderr, "[DEBUG allgather] ws started, returning Work\n");
-  fflush(stderr);
+  DEBUGINFO("allgather: ws started, returning Work");
 
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws));
@@ -481,10 +467,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
   }
 
   spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
-  fprintf(stderr,
-          "[DEBUG allreduce] buf.host_ptr=%p buf.device_addr=%p "
-          "is_host_only=%d\n",
-          buf.host_ptr, buf.device_addr, buf.is_host_only);
+  DEBUGINFO("allreduce: buf.host_ptr=", buf.host_ptr,
+            "buf.device_addr=", buf.device_addr,
+            "is_host_only=", buf.is_host_only);
 
   auto ws =
       group_context_->allreduce(buf, convert_reduce_op_type(opts.reduceOp));
@@ -616,7 +601,10 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
   auto ws = group_context_->send(buf, dstRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
-  seq_.fetch_add(1, std::memory_order_relaxed);
+  // P2P operations must NOT increment the collective sequence counter.
+  // Only ranks participating in send/recv call this method, so incrementing
+  // would desynchronize the counter across ranks, causing "Detected mismatch
+  // between collectives on ranks" errors on the next collective call.
   return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws));
 }
 
@@ -629,7 +617,8 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
   auto ws = group_context_->recv(buf, srcRank, tag);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
-  seq_.fetch_add(1, std::memory_order_relaxed);
+  // P2P operations must NOT increment the collective sequence counter.
+  // See comment in send() above.
   return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws));
 }
 
