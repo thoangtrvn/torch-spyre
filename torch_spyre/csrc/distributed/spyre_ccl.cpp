@@ -15,9 +15,12 @@
  */
 #include "spyre_ccl.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <unordered_map>
 #include <utility>
@@ -42,15 +45,56 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
   /*
    * Start the communication library
    * Pass it the shared runtime library handle, and default stream.
+   *
+   * initialize_library()/finalize_library() are reference counted inside the
+   * comms library, so it is safe for every ProcessGroup to call this pair; the
+   * device is only torn down when the last group finalizes.
    */
   spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
                                   spyre::getDefaultStreamRuntimeHandle());
-  group_context_ = spyre_comms::get_world_context();
-  if (nullptr == group_context_) {
+  std::shared_ptr<spyre_comms::Context> world_context =
+      spyre_comms::get_world_context();
+  if (nullptr == world_context) {
+    // Balance the init refcount we just took: because this constructor throws,
+    // the destructor (which calls finalize_library()) will NOT run.
+    spyre_comms::finalize_library();
     std::string _err_msg =
         "[" + getBackendName() + "]: Failed to capture the world context";
     throw std::runtime_error(_err_msg);
   }
+
+  /*
+   * A3: WORLD-ONLY support.
+   *
+   * The comms library exposes only a single world context (no sub-group
+   * constructor). For the default (world) ProcessGroup, the c10d rank/size
+   * passed here match the world context's rank/size. A ProcessGroup created
+   * via new_group() with a strict subset of ranks would otherwise silently
+   * reduce across the ENTIRE world (wrong participant set → wrong results and
+   * hangs). Detect that case from the store/rank/size args and fail cleanly
+   * instead of silently doing the wrong thing.
+   */
+  const bool is_world_group =
+      (static_cast<spyre_comms::process_id_t>(size) ==
+       world_context->getSize()) &&
+      (static_cast<spyre_comms::process_id_t>(rank) ==
+       world_context->getRank());
+  if (!is_world_group) {
+    // EXTENSION POINT: when the comms library gains a sub-group context
+    // factory, replace this throw with something like
+    //   group_context_ = spyre_comms::create_context(group_ranks, store);
+    // (deriving group_ranks from `store`), and drop the throw. Everything
+    // below already works against an arbitrary Context.
+    //
+    // Balance the init refcount taken above before throwing (see the null
+    // check above for why the destructor will not run).
+    spyre_comms::finalize_library();
+    throw SpyreCCLNotSupportedException(
+        getBackendName(),
+        "subgroup process groups (only the world group is supported; "
+        "new_group() with a subset of ranks is not yet implemented)");
+  }
+  group_context_ = std::move(world_context);
 
   // Use the dedicated comm stream so collectives run independently
   // of the compute stream, enabling compute/communication overlap.
@@ -355,7 +399,41 @@ void SpyreCCLBackend::check_single_tensor(const at::Tensor& tensor) {
   if (tensor.is_sparse()) {
     TORCH_CHECK(false, "The tensor has to be dense");
   }
-  // Add check for spyre device tensor
+  // Must be a Spyre (PrivateUse1) device tensor. prepare_buffer_desc()
+  // reinterprets the storage's DataPtr context as a spyre::SharedOwnerCtx; a
+  // CPU/other-device tensor would make that a garbage reinterpret and produce
+  // an invalid device address. Reject it here with a clear error instead.
+  if (tensor.device().type() != c10::DeviceType::PrivateUse1) {
+    TORCH_CHECK(false, "[", getBackendName(),
+                "]: collective tensors must be on the Spyre device; got ",
+                tensor.device().str());
+  }
+}
+
+/**
+ * @brief Order the dedicated comm stream after the caller's current compute
+ * stream.
+ *
+ * The collective runs asynchronously on comm_stream_, which is independent of
+ * the stream that produced the input tensor. Without ordering, the collective
+ * could DMA the input before the producing compute has finished writing it,
+ * yielding wrong results (e.g. a TP all_reduce right after a matmul).
+ *
+ * Current implementation is a host-side fence: it blocks the host until the
+ * caller's current stream is idle, guaranteeing the input is fully written
+ * before the collective is launched. The output side is ordered by
+ * SpyreCCLWork::wait()/synchronize(), which host-blocks on the comm stream so
+ * that any downstream compute the caller launches after wait() sees the result.
+ *
+ * TODO(perf): replace this host-side fence with a device-side event wait
+ * (record a flex::RuntimeEvent on the caller's compute stream and
+ * comm_stream_->waitForEvent(event)) once torch-spyre exposes the current
+ * stream's flex::RuntimeStream* handle. That preserves host-side overlap; the
+ * fence here serializes the producer on the host. Note the existing
+ * flex::RuntimeEvent is itself a host-side (P0) primitive today.
+ */
+void SpyreCCLBackend::order_after_caller_stream(const at::Tensor& ref_tensor) {
+  spyre::getCurrentStream(ref_tensor.device()).synchronize();
 }
 
 /**
@@ -404,6 +482,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<at::Tensor>& inputTensors, const AllgatherOptions& opts) {
   DEBUGINFO("allgather: outputTensors.size=", outputTensors.size(),
             "inputTensors.size=", inputTensors.size());
+  abort_guard("allgather");
   if (static_cast<int>(outputTensors.size()) != 1) {
     std::string _err_msg =
         "[" + getBackendName() +
@@ -417,10 +496,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
         "[" + getBackendName() +
         "]: Incorrect output list size. The list size should be exactly " +
         std::to_string(group_context_->getSize()) +
-        " Actual: " + std::to_string(outputTensors.size());
+        " Actual: " + std::to_string(outputTensors[0].size());
     TORCH_CHECK(false, _err_msg);
   }
   check_vector_tensor(inputTensors, 1, 1);
+  check_vector_tensor(outputTensors[0], 1,
+                      static_cast<int>(group_context_->getSize()));
 
   spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
 
@@ -438,13 +519,21 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
 
   DEBUGINFO("allgather: ws returned, starting");
 
+  // Ensure the producing compute on the caller's stream has landed before the
+  // collective DMAs the input (A5).
+  order_after_caller_stream(inputTensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
 
   DEBUGINFO("allgather: ws started, returning Work");
 
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws));
+  // Keep the input + all output tensors alive for the async op; complete the
+  // Future with the gathered outputs (A6/A7).
+  std::vector<at::Tensor> hold = outputTensors[0];
+  hold.push_back(inputTensors[0]);
+  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws),
+                                           std::move(hold), outputTensors[0]);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
@@ -457,6 +546,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     std::vector<at::Tensor>& tensors, const AllreduceOptions& opts) {
+  abort_guard("allreduce");
   check_vector_tensor(tensors, 1, 1);
 
   if (opts.reduceOp != ReduceOp::SUM) {
@@ -473,10 +563,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
 
   auto ws =
       group_context_->allreduce(buf, convert_reduce_op_type(opts.reduceOp));
+  order_after_caller_stream(tensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws),
+                                           tensors, tensors);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(
@@ -499,6 +591,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall_base(
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
+  abort_guard("barrier");
   auto ws = group_context_->barrier();
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
@@ -508,20 +601,26 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
     std::vector<at::Tensor>& tensors, const BroadcastOptions& opts) {
+  abort_guard("broadcast");
   check_vector_tensor(tensors, 1, 1);
 
   spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
   auto ws = group_context_->broadcast(buf, opts.rootRank);
+  // On the root the buffer is the source and must be fully written before the
+  // broadcast reads it; on non-roots this is a cheap no-op fence (A5).
+  order_after_caller_stream(tensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws),
+                                           tensors, tensors);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const GatherOptions& opts) {
+  abort_guard("gather");
   if (opts.rootRank == group_context_->getRank()) {
     if (static_cast<int>(outputTensors.size()) != 1) {
       std::string _err_msg =
@@ -536,7 +635,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
           "[" + getBackendName() +
           "]: Incorrect output list size. The list size should be exactly " +
           std::to_string(group_context_->getSize()) +
-          " Actual: " + std::to_string(outputTensors.size());
+          " Actual: " + std::to_string(outputTensors[0].size());
       TORCH_CHECK(false, _err_msg);
     }
   }
@@ -545,21 +644,30 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
   spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
 
   std::vector<spyre_comms::BufferDesc> output_bufs;
+  std::vector<at::Tensor> hold = {inputTensors[0]};
+  std::vector<at::Tensor> result;
   if (opts.rootRank == group_context_->getRank()) {
     for (auto& outputTensor : outputTensors[0]) {
       output_bufs.push_back(prepare_buffer_desc(outputTensor));
     }
+    hold.insert(hold.end(), outputTensors[0].begin(), outputTensors[0].end());
+    result = outputTensors[0];
+  } else {
+    result = {inputTensors[0]};
   }
 
   auto ws = group_context_->gather(output_bufs, input_buf, opts.rootRank);
+  order_after_caller_stream(inputTensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws),
+                                           std::move(hold), std::move(result));
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
     std::vector<at::Tensor>& tensors, const ReduceOptions& opts) {
+  abort_guard("reduce");
   check_vector_tensor(tensors, 1, 1);
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
@@ -572,10 +680,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
 
   auto ws = group_context_->reduce(buf, convert_reduce_op_type(opts.reduceOp),
                                    opts.rootRank);
+  order_after_caller_stream(tensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE, std::move(ws),
+                                           tensors, tensors);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce_scatter(
@@ -594,32 +704,40 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::scatter(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
                                                int dstRank, int tag) {
+  abort_guard("send");
   check_vector_tensor(tensors, 1, 1);
 
   spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
   auto ws = group_context_->send(buf, dstRank, tag);
+  // The send buffer must be fully written before the DMA reads it (A5).
+  order_after_caller_stream(tensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   // P2P operations must NOT increment the collective sequence counter.
   // Only ranks participating in send/recv call this method, so incrementing
   // would desynchronize the counter across ranks, causing "Detected mismatch
   // between collectives on ranks" errors on the next collective call.
-  return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws), tensors,
+                                           tensors);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
                                                int srcRank, int tag) {
+  abort_guard("recv");
   check_vector_tensor(tensors, 1, 1);
 
   spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
   auto ws = group_context_->recv(buf, srcRank, tag);
+  // Order after any in-flight compute still using the destination buffer (A5).
+  order_after_caller_stream(tensors[0]);
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   // P2P operations must NOT increment the collective sequence counter.
   // See comment in send() above.
-  return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws), tensors,
+                                           tensors);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recvAnysource(
@@ -634,23 +752,93 @@ c10::intrusive_ptr<Backend> SpyreCCLBackend::createSpyreCCLBackend(
   return c10::make_intrusive<SpyreCCLBackend>(store, rank, size);
 }
 
+void SpyreCCLBackend::abort_guard(const char* op) {
+  if (aborted_.load(std::memory_order_acquire)) {
+    TORCH_CHECK(false, "[", getBackendName(), "]: backend has been aborted; ",
+                op, " may not be launched");
+  }
+}
+
+void SpyreCCLBackend::abort() {
+  // There is no spyre_comms-level primitive to cancel a WorkSchedule that is
+  // already running on the hardware, so abort() cannot forcibly interrupt an
+  // in-flight collective. What it can do safely is stop new collectives from
+  // being launched (abort_guard checks this flag) so a failing group tears
+  // down instead of issuing more work. True mid-flight cancellation needs a
+  // new comms API (reported to the runtime owners).
+  aborted_.store(true, std::memory_order_release);
+  DEBUGINFO("# [Spyre CCL]: abort() requested for ", getBackendName());
+}
+
+void SpyreCCLBackend::shutdown() {
+  DEBUGINFO("# [Spyre CCL]: shutdown() requested for ", getBackendName());
+  abort();
+}
+
 /***********************************************
  * Wrapper Work for the Sypre Collective Library
  ***********************************************/
 SpyreCCLWork::SpyreCCLWork(OpType opType,
-                           std::unique_ptr<spyre_comms::WorkSchedule> ws)
+                           std::unique_ptr<spyre_comms::WorkSchedule> ws,
+                           std::vector<at::Tensor> hold_tensors,
+                           std::vector<at::Tensor> result_tensors)
     : Work(-1, opType),
       future_(c10::make_intrusive<at::ivalue::Future>(
           c10::ListType::create(c10::TensorType::get()))),
-      work_schedule_(std::move(ws)) {}
+      work_schedule_(std::move(ws)),
+      hold_tensors_(std::move(hold_tensors)),
+      result_tensors_(std::move(result_tensors)) {}
+
+SpyreCCLWork::~SpyreCCLWork() {
+  // If the Work is destroyed while the transfer is still reading/writing the
+  // held tensors' device memory, releasing hold_tensors_ would free storage
+  // out from under an in-flight DMA (use-after-free). Drain the schedule first.
+  //
+  // Key this on the schedule's real state (query()), not completed_: a wait()
+  // that hit its timeout marks completed_ = true while the DMA is still live,
+  // so completed_ alone is not sufficient to prove it is safe to free.
+  // (Caveat: if the peer is dead this drain can block during teardown — the
+  // lesser evil vs. memory corruption. A comms-level cancel would let us abort
+  // instead of drain.)
+  if (work_schedule_ && !work_schedule_->query()) {
+    try {
+      work_schedule_->synchronize();
+    } catch (...) {
+      // Destructors must not throw; a failed transfer is surfaced via wait().
+    }
+  }
+}
+
+void SpyreCCLWork::finish_success() {
+  c10::List<at::Tensor> outputs;
+  outputs.reserve(result_tensors_.size());
+  for (const auto& t : result_tensors_) {
+    outputs.push_back(t);
+  }
+  future_->markCompleted(c10::IValue(std::move(outputs)));
+}
+
+void SpyreCCLWork::finish_error(const std::string& msg) {
+  future_->setError(std::make_exception_ptr(std::runtime_error(msg)));
+}
 
 bool SpyreCCLWork::isCompleted() {
-  if (completed_) return true;
+  if (completed_.load(std::memory_order_acquire)) return true;
   if (work_schedule_ && work_schedule_->query()) {
-    completed_ = true;
-    future_->markCompleted();
+    bool expected = false;
+    if (completed_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      // Reflect the real terminal state: only complete the Future on genuine
+      // success; on DONE_ERROR propagate the failure (A7).
+      if (work_schedule_->getState() ==
+          spyre_comms::WorkScheduleState::State::DONE_ERROR) {
+        finish_error("[SpyreCCL]: collective completed with DONE_ERROR");
+      } else {
+        finish_success();
+      }
+    }
   }
-  return completed_;
+  return completed_.load(std::memory_order_acquire);
 }
 
 bool SpyreCCLWork::isSuccess() const {
@@ -660,12 +848,50 @@ bool SpyreCCLWork::isSuccess() const {
 }
 
 bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
-  if (completed_) return isSuccess();
-  if (!work_schedule_) return true;
-  work_schedule_->wait();
-  completed_ = true;
-  future_->markCompleted();
-  return isSuccess();
+  if (!completed_.load(std::memory_order_acquire) && work_schedule_) {
+    // kUnsetTimeout (or a non-positive value) means "block indefinitely".
+    if (timeout == kUnsetTimeout || timeout.count() <= 0) {
+      work_schedule_->wait();
+    } else {
+      // The underlying WorkSchedule::wait() has no deadline, so poll query()
+      // until the timeout elapses. This bounds the wait so a dead peer cannot
+      // hang the caller forever (P1). TODO: replace with a native timed wait
+      // once spyre_comms exposes one.
+      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      while (!work_schedule_->query()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          bool expected = false;
+          if (completed_.compare_exchange_strong(expected, true,
+                                                 std::memory_order_acq_rel)) {
+            finish_error("[SpyreCCL]: collective timed out after " +
+                         std::to_string(timeout.count()) + " ms");
+          }
+          throw std::runtime_error(
+              "[SpyreCCL]: collective wait timed out after " +
+              std::to_string(timeout.count()) + " ms");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+
+    bool expected = false;
+    if (completed_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      if (work_schedule_->getState() ==
+          spyre_comms::WorkScheduleState::State::DONE_ERROR) {
+        finish_error("[SpyreCCL]: collective completed with DONE_ERROR");
+      } else {
+        finish_success();
+      }
+    }
+  }
+
+  // c10d contract: wait() surfaces failures by throwing, not by returning
+  // false. A false return is reserved for a timeout that did not complete.
+  if (!isSuccess()) {
+    throw std::runtime_error("[SpyreCCL]: collective completed with an error");
+  }
+  return true;
 }
 
 c10::intrusive_ptr<c10::ivalue::Future> SpyreCCLWork::getFuture() {
