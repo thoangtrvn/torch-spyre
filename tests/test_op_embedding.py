@@ -72,16 +72,20 @@ def _chunks(d_model: int) -> int:
 # n_tokens kept small so products stay DL16-exact; vocab downsized for the large-d
 # cases so the test table fits memory while preserving the spt/C codegen path
 # (the path depends on d_model, not vocab).
+# needs_multichunk_fix flips to False across the board: the C>=2 multi-chunk IBR
+# gather is HW-verified as of 2026-07-09 (d=4096 C=2 and d=5120 C=3 both max_diff=0.0;
+# see codegen commit "embedding: HW-verified multi-chunk (C>1) IBR gather"). All target
+# LLM d_models now supported.
 _EMBED_SHAPES = [
-    # --- supported today (C=1, d_model<=2048) ---
+    # --- C=1, d_model<=2048 ---
     ("gpt2_d768",          4096,  768,   8,  False),
     ("d1024",              4096,  1024,  8,  False),
     ("d2048_boundary",     4096,  2048,  4,  False),
-    # --- blocked today (C>=2, d_model>2048) — flip xfail->pass when L3 fix lands ---
-    ("gptoss_d2880",       8192,  2880,  4,  True),
-    ("qwen_d3584",         8192,  3584,  4,  True),
-    ("llama31_d4096",      8192,  4096,  2,  True),
-    ("ministral14b_d5120", 8192,  5120,  2,  True),   # C=3 + LX burst>64
+    # --- C>=2, d_model>2048 (HW-verified 2026-07-09) ---
+    ("gptoss_d2880",       8192,  2880,  4,  False),
+    ("qwen_d3584",         8192,  3584,  4,  False),
+    ("llama31_d4096",      8192,  4096,  2,  False),
+    ("ministral14b_d5120", 8192,  5120,  2,  False),   # C=3 (spt%32=16 epilogue)
 ]
 
 
