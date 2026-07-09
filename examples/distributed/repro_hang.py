@@ -62,6 +62,16 @@ def main():
         default=1,
         help="Number of allreduce iterations (default 1 — minimal repro).",
     )
+    parser.add_argument(
+        "--warmup-mb",
+        type=float,
+        default=0.0,
+        help="If > 0, run one small all_reduce of this size BEFORE the main "
+        "size, in the SAME process. Exercises the warmup-then-big pattern: "
+        "the per-process HDMA pool/state is first touched by a small "
+        "collective, then a large one — the sequence that defeats any "
+        "fix depending on first-batch pool sizing.",
+    )
     args = parser.parse_args()
 
     dist.init_process_group(backend=C10D_BACKEND)
@@ -81,6 +91,25 @@ def main():
     _log(rank, "device tensor ready")
 
     expected = float(size * (size + 1) // 2)
+
+    # Optional warmup: a SMALL all_reduce first, in this same process, so the
+    # per-process HDMA pool/state is initialized by a small collective before
+    # the large one runs. This is the sequence that defeats any fix relying on
+    # first-batch pool sizing (the pool latches on the first HDMA batch and is
+    # never re-grown). A size-independent fix must survive this.
+    if args.warmup_mb > 0:
+        warmup_elements = int(args.warmup_mb * 1024 * 1024 / 2)
+        wt = torch.zeros(warmup_elements, dtype=torch.float16)
+        wt.fill_(float(rank + 1))
+        wt = wt.to(DEVICE)
+        torch.spyre.synchronize()
+        _log(rank, f"warmup: BEFORE all_reduce ({args.warmup_mb}MB)")
+        dist.all_reduce(wt)
+        torch.spyre.synchronize()
+        wgot = wt[0].item()
+        _log(rank, f"warmup: AFTER synchronize result[0]={wgot} expected={expected} "
+                   f"{'OK' if abs(wgot - expected) < 1e-2 else 'WRONG'}")
+        del wt
 
     all_ok = True
     for i in range(args.iters):
