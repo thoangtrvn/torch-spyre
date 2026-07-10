@@ -76,16 +76,23 @@ def _chunks(d_model: int) -> int:
 # gather is HW-verified as of 2026-07-09 (d=4096 C=2 and d=5120 C=3 both max_diff=0.0;
 # see codegen commit "embedding: HW-verified multi-chunk (C>1) IBR gather"). All target
 # LLM d_models now supported.
+# The codegen gather path depends ONLY on d_model (spt=ceil(d/64), C=ceil(spt/32)),
+# NOT on vocab — so one shape per distinct d_model covers every model with that hidden
+# size. The comments list the real embedding/LLM models each d_model represents.
 _EMBED_SHAPES = [
-    # --- C=1, d_model<=2048 ---
-    ("gpt2_d768",          4096,  768,   8,  False),
-    ("d1024",              4096,  1024,  8,  False),
-    ("d2048_boundary",     4096,  2048,  4,  False),
-    # --- C>=2, d_model>2048 (HW-verified 2026-07-09) ---
-    ("gptoss_d2880",       8192,  2880,  4,  False),
-    ("qwen_d3584",         8192,  3584,  4,  False),
-    ("llama31_d4096",      8192,  4096,  2,  False),
-    ("ministral14b_d5120", 8192,  5120,  2,  False),   # C=3 (spt%32=16 epilogue)
+    # --- C=1, d_model<=2048 (single-chunk gather) ---
+    ("d384_spt6",    4096,  384,  8, False),  # all-MiniLM-L6-v2; Granite-Embedding-*-multilingual
+    ("d768_spt12",   4096,  768,  8, False),  # gpt2; BGE-base-en-v1.5; all-mpnet-base-v2;
+                                              # ModernBERT-embed-base; GTE-ModernBERT-base; (EmbeddingGemma 300M, gemma hidden)
+    ("d1024_spt16",  4096, 1024,  8, False),  # Qwen3-Embedding-0.6B; BGE-M3
+    ("d1536_spt24",  4096, 1536,  4, False),  # GTE-Qwen2-1.5B
+    ("d2048_boundary", 4096, 2048, 4, False), # C=1 ceiling
+    # --- C>=2, d_model>2048 (multi-chunk gather, HW-verified 2026-07-09) ---
+    ("gptoss_d2880",       8192, 2880, 4, False),   # GPT-OSS 20B
+    ("qwen_d3584",         8192, 3584, 4, False),    # Qwen2.5-VL 7B
+    ("d4096_spt64_C2",     8192, 4096, 2, False),    # Llama-3.1; Mistral; E5-Mistral-7B;
+                                                     # SFR-Embedding-Mistral; Linq-Embed-Mistral
+    ("ministral14b_d5120", 8192, 5120, 2, False),    # C=3 (spt%32=16 epilogue)
 ]
 
 
@@ -187,8 +194,11 @@ def test_embedding_path_classification():
     arithmetic check that runs without hardware, so the shape contract is validated
     even in CI. If these change, the codegen dispatch thresholds must be revisited.
     """
-    assert _spt(768) == 12 and _chunks(768) == 1
+    assert _spt(384) == 6 and _chunks(384) == 1        # all-MiniLM-L6-v2, Granite-Embedding
+    assert _spt(768) == 12 and _chunks(768) == 1       # BGE-base, mpnet, ModernBERT-embed
+    assert _spt(1024) == 16 and _chunks(1024) == 1     # Qwen3-Embedding-0.6B, BGE-M3
+    assert _spt(1536) == 24 and _chunks(1536) == 1     # GTE-Qwen2-1.5B
     assert _spt(2048) == 32 and _chunks(2048) == 1     # C=1 ceiling
     assert _spt(2880) == 45 and _chunks(2880) == 2     # first C=2
-    assert _spt(4096) == 64 and _chunks(4096) == 2
+    assert _spt(4096) == 64 and _chunks(4096) == 2     # Mistral-family embedders
     assert _spt(5120) == 80 and _chunks(5120) == 3     # C=3
