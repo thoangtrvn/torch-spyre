@@ -81,18 +81,21 @@ def _chunks(d_model: int) -> int:
 # size. The comments list the real embedding/LLM models each d_model represents.
 _EMBED_SHAPES = [
     # --- C=1, d_model<=2048 (single-chunk gather) ---
-    ("d384_spt6",    4096,  384,  8, False),  # all-MiniLM-L6-v2; Granite-Embedding-*-multilingual
-    ("d768_spt12",   4096,  768,  8, False),  # gpt2; BGE-base-en-v1.5; all-mpnet-base-v2;
-                                              # ModernBERT-embed-base; GTE-ModernBERT-base; (EmbeddingGemma 300M, gemma hidden)
+    ("d384_spt6",    4096,  384,  8, False),  # all-MiniLM-L6-v2; Granite-Embedding-*-multilingual (EBR path, d<=512)
+    ("d512_ebr_ceil", 4096, 512,  8, False),  # Pythia 70M; EBR/IBR boundary (_EBR_D_MODEL_MAX=512)
+    ("d768_spt12",   4096,  768,  8, False),  # gpt2; GPT-Neo 125M; BGE-base-en-v1.5; all-mpnet-base-v2;
+                                              # ModernBERT-embed-base; GTE-ModernBERT-base; (EmbeddingGemma 300M)
     ("d1024_spt16",  4096, 1024,  8, False),  # Qwen3-Embedding-0.6B; BGE-M3
-    ("d1536_spt24",  4096, 1536,  4, False),  # GTE-Qwen2-1.5B
-    ("d2048_boundary", 4096, 2048, 4, False), # C=1 ceiling
+    ("d1536_spt24",  4096, 1536,  4, False),  # GTE-Qwen2-1.5B; Qwen2.5-1.5B
+    ("d2048_boundary", 4096, 2048, 4, False), # C=1 ceiling. Granite 3.3 2B / 4.0 1B; SmolLM3 3B;
+                                              # TinyLlama; OLMo(2) 1B; Falcon3 1B
     # --- C>=2, d_model>2048 (multi-chunk gather, HW-verified 2026-07-09) ---
-    ("gptoss_d2880",       8192, 2880, 4, False),   # GPT-OSS 20B
-    ("qwen_d3584",         8192, 3584, 4, False),    # Qwen2.5-VL 7B
-    ("d4096_spt64_C2",     8192, 4096, 2, False),    # Llama-3.1; Mistral; E5-Mistral-7B;
-                                                     # SFR-Embedding-Mistral; Linq-Embed-Mistral
-    ("ministral14b_d5120", 8192, 5120, 2, False),    # C=3 (spt%32=16 epilogue)
+    ("gptoss_d2880",       8192, 2880, 4, False),   # GPT-OSS 20B (spt=45, epilogue 13)
+    ("phi_d3072_C2",       8192, 3072, 4, False),   # Phi-4-mini; Phi-3.5-mini; Llama-3.2-3B (spt=48, epilogue 16)
+    ("qwen_d3584",         8192, 3584, 4, False),    # Qwen2.5-VL 7B; Qwen2.5 7B
+    ("d4096_spt64_C2",     8192, 4096, 2, False),    # Llama-3.1; Mistral 7B; Granite 3.3 8B; Yi 1.5 6B;
+                                                     # Ministral-8B; E5/SFR/Linq-Embed-Mistral
+    ("mistral_small_d5120", 8192, 5120, 2, False),   # Mistral Small 3 24B; Ministral-3 14B (C=3, spt%32=16 epilogue)
 ]
 
 
@@ -195,10 +198,13 @@ def test_embedding_path_classification():
     even in CI. If these change, the codegen dispatch thresholds must be revisited.
     """
     assert _spt(384) == 6 and _chunks(384) == 1        # all-MiniLM-L6-v2, Granite-Embedding
-    assert _spt(768) == 12 and _chunks(768) == 1       # BGE-base, mpnet, ModernBERT-embed
+    assert _spt(512) == 8 and _chunks(512) == 1        # Pythia 70M; EBR/IBR boundary
+    assert _spt(768) == 12 and _chunks(768) == 1       # BGE-base, mpnet, ModernBERT-embed, gpt2, gpt-neo
     assert _spt(1024) == 16 and _chunks(1024) == 1     # Qwen3-Embedding-0.6B, BGE-M3
-    assert _spt(1536) == 24 and _chunks(1536) == 1     # GTE-Qwen2-1.5B
-    assert _spt(2048) == 32 and _chunks(2048) == 1     # C=1 ceiling
+    assert _spt(1536) == 24 and _chunks(1536) == 1     # GTE-Qwen2-1.5B, Qwen2.5-1.5B
+    assert _spt(2048) == 32 and _chunks(2048) == 1     # C=1 ceiling (many 1-3B LLMs)
     assert _spt(2880) == 45 and _chunks(2880) == 2     # first C=2
-    assert _spt(4096) == 64 and _chunks(4096) == 2     # Mistral-family embedders
-    assert _spt(5120) == 80 and _chunks(5120) == 3     # C=3
+    assert _spt(3072) == 48 and _chunks(3072) == 2     # Phi-4-mini, Phi-3.5-mini, Llama-3.2-3B
+    assert _spt(3584) == 56 and _chunks(3584) == 2     # Qwen 7B
+    assert _spt(4096) == 64 and _chunks(4096) == 2     # Mistral/Llama-8B family
+    assert _spt(5120) == 80 and _chunks(5120) == 3     # C=3 (Mistral Small 24B)
