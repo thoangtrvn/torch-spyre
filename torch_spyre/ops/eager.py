@@ -191,6 +191,28 @@ def spyre__copy_from(self, dst, non_blocking=False):
         _C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
+        # FAIL LOUD on an on-device dtype conversion. A differently-typed dst on the
+        # SAME spyre device means someone asked for an on-device dtype cast (e.g.
+        # `.float()` / `.to(dtype)`, which lands here via the composite _to_copy →
+        # _copy_from). copy_from_d2d is the identity (clone) kernel: it does a raw
+        # element copy and CANNOT convert the per-element type. A spyre tensor is
+        # stored in the device format (DL16 for 1p0), so a mismatched-dtype clone
+        # reinterprets the bytes and returns GARBAGE, silently — the same
+        # silent-wrong class as an unimplemented op returning uninitialized memory.
+        # It must ERROR, not misread. A real on-device conversion needs a DEDICATED
+        # conversion kernel (SFP ICVT / a codegen convert op). Until then, convert on
+        # CPU: move first, then cast — `x.cpu().float()`, NOT `x.float()` on device.
+        if self.dtype != dst.dtype:
+            raise NotImplementedError(
+                f"Spyre: on-device dtype conversion {self.dtype} -> {dst.dtype} "
+                f"is NOT supported. The device→device copy is the identity (clone) "
+                f"kernel (copy_from_d2d) — a raw element copy that CANNOT convert the "
+                f"element type, so it would return garbage (the device stores DL16/"
+                f"device-format). A real conversion needs a dedicated kernel (SFP "
+                f"ICVT / codegen convert op), not yet implemented. Convert on CPU: "
+                f"move first, then cast — `x.cpu().to({dst.dtype})`, not "
+                f"`x.to({dst.dtype})` on device."
+            )
         torch.ops.spyre.copy_from_d2d(self, dst)
         return dst
     else:

@@ -102,39 +102,89 @@ def _known_answer_table(vocab: int, d_model: int) -> torch.Tensor:
     return t
 
 
-def _run_embedding(vocab: int, d_model: int, n_tokens: int):
-    """torch.nn.Embedding forward on spyre vs CPU reference. Returns max_diff."""
-    table = _known_answer_table(vocab, d_model)
+# Three entry points a real model can reach the embedding gather through. They take
+# different dispatch routes, so each must be exercised:
+#   aten        — torch.ops.aten.embedding directly (the op the fork registers a
+#                 spyre kernel on).
+#   nn_eager    — torch.nn.Embedding.forward with no compile (eager dispatch → the
+#                 same registered aten kernel, but via the module + F.embedding).
+#   nn_compiled — torch.compile(nn.Embedding) (Inductor graph capture + lowering;
+#                 the path a compiled model actually uses).
+_ENTRY_POINTS = ("aten", "nn_eager", "nn_compiled")
+
+
+def _make_idx(vocab: int, n_tokens: int) -> torch.Tensor:
     # Spread token ids across the vocab so per-token addressing is exercised.
-    idx = torch.tensor([(vocab - 1 - (k * 7) % vocab) for k in range(n_tokens)],
-                       dtype=torch.int64)
-    out_dev = torch.ops.aten.embedding(table.to("spyre"), idx.to("spyre")).cpu()
+    return torch.tensor([(vocab - 1 - (k * 7) % vocab) for k in range(n_tokens)],
+                        dtype=torch.int64)
+
+
+def _make_nn_embedding(table: torch.Tensor) -> torch.nn.Embedding:
+    """nn.Embedding whose weight IS the known-answer table (fp16)."""
+    vocab, d_model = table.shape
+    emb = torch.nn.Embedding(vocab, d_model, dtype=torch.float16)
+    with torch.no_grad():
+        emb.weight.copy_(table)
+    return emb
+
+
+def _run_embedding(vocab: int, d_model: int, n_tokens: int, entry: str = "aten"):
+    """Embedding forward on spyre via `entry` vs CPU reference. Returns max_diff."""
+    table = _known_answer_table(vocab, d_model)
+    idx = _make_idx(vocab, n_tokens)
     out_ref = table[idx]  # CPU reference gather
+
+    if entry == "aten":
+        out_dev = torch.ops.aten.embedding(table.to("spyre"), idx.to("spyre")).cpu()
+    elif entry == "nn_eager":
+        emb = _make_nn_embedding(table).to("spyre")
+        out_dev = emb(idx.to("spyre")).cpu()
+    elif entry == "nn_compiled":
+        emb = _make_nn_embedding(table).to("spyre")
+        torch._dynamo.reset()
+        compiled = torch.compile(emb)
+        out_dev = compiled(idx.to("spyre")).cpu()
+    else:
+        raise ValueError(f"unknown entry point: {entry!r}")
+
     return (out_dev - out_ref).abs().max().item()
 
 
 @requires_hw
+@pytest.mark.parametrize("entry", _ENTRY_POINTS)
 @pytest.mark.parametrize(
     "shape_id,vocab,d_model,n_tokens,needs_multichunk",
     _EMBED_SHAPES,
     ids=[s[0] for s in _EMBED_SHAPES],
 )
-def test_embedding_shape(shape_id, vocab, d_model, n_tokens, needs_multichunk):
-    """aten.embedding on device matches CPU (max_diff==0) for each model d_model.
+def test_embedding_shape(shape_id, vocab, d_model, n_tokens, needs_multichunk, entry):
+    """Embedding on device matches CPU (max_diff==0) for each model d_model, via
+    all three entry points (aten op, nn.Embedding eager, nn.Embedding compiled).
 
-    C>=2 (d_model>2048) shapes are xfail until the L3 multi-chunk IBR gather fix
-    lands (they currently NotImplementedError-guard or hang). Remove the xfail
-    below when the fix is HW-verified.
+    Entry-point routing (HW-observed 2026-07-09):
+      aten / nn_eager  -> torch.ops.aten.embedding -> the fork's registered IBR
+                          gather kernel. Both HW-verified (C=1 and C>=2 multi-chunk).
+      nn_compiled      -> Inductor traces the gather into a generic fused Triton
+                          kernel (NOT the custom aten.embedding op), which codegen
+                          classifies as an unsupported fused pointwise op and fails
+                          loud (UnsupportedPointwiseOpError, the Part-A guard). This
+                          is a SEPARATE lowering path from the custom IBR op — routing
+                          the compiled gather to the IBR kernel (or supporting the
+                          fused kernel in codegen) is a distinct follow-on.
+
+    needs_multichunk is retained for documentation of the C>=2 shapes; the multi-chunk
+    gather is HW-verified so no shape is xfail on the aten/eager paths.
     """
-    if needs_multichunk:
+    if entry == "nn_compiled":
         pytest.xfail(
-            f"{shape_id}: d_model={d_model} spt={_spt(d_model)} C={_chunks(d_model)} "
-            f">1 — L3 multi-chunk IBR gather not yet HW-verified (hangs AIU 1.0). "
-            f"Tracked: codegen .git/sdd/EMBEDDING_HW_REALSCALE_2026-07-09.md."
+            "torch.compile(nn.Embedding) lowers the gather to a generic fused Triton "
+            "kernel, not the custom aten.embedding IBR op → codegen fails loud "
+            "(UnsupportedPointwiseOpError). Separate path from the HW-verified IBR "
+            "gather; tracked as a compiled-embedding-lowering follow-on."
         )
-    max_diff = _run_embedding(vocab, d_model, n_tokens)
+    max_diff = _run_embedding(vocab, d_model, n_tokens, entry=entry)
     assert max_diff == 0.0, (
-        f"{shape_id} (vocab={vocab} d_model={d_model} n={n_tokens}, "
+        f"{shape_id}/{entry} (vocab={vocab} d_model={d_model} n={n_tokens}, "
         f"spt={_spt(d_model)} C={_chunks(d_model)}): max_diff={max_diff} != 0"
     )
 
