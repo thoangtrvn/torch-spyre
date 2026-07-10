@@ -72,6 +72,9 @@ _BINARY_OPS = [
 ]
 
 # (id, M, N, capacity_boundary)
+# NOTE: add/mul are HW-verified for the SINGLE-STICK-per-core path (s1x64). The
+# multi-stick shapes (N>=768 → >=12 sticks/row → burst LXLU) exercise the looped-LDI
+# burst path, a documented deferred divergence (not yet byte-matched/HW-verified).
 _SHAPES = [
     ("s1x64",        1,    64,   False),
     ("gpt2_128x768", 128,  768,  False),
@@ -79,6 +82,9 @@ _SHAPES = [
     ("seq512x4096",  512,  4096, False),
     ("maxseq_2048x4096", 2048, 4096, True),   # LX capacity boundary
 ]
+
+# Single-stick shapes (N == elements_per_stick) where add/mul are HW-verified.
+_SINGLE_STICK_SHAPES = {"s1x64"}
 
 # Tolerance: unary transcendentals (tanh/sigmoid/sqrt) go through DL16 + a device
 # approximation, so allow a small tol; exact integer ops (relu/neg/abs/add/mul/sub/
@@ -93,18 +99,17 @@ def _check(op_id, out_dev, out_ref):
     assert md <= tol, f"{op_id}: max_diff={md} > tol={tol}"
 
 
-# HW STATUS (2026-07-09, HW-measured): pointwise on the torch path is BROKEN at
-# every shape — the whole family is xfail until the torch→codegen→launch path is
-# fixed. Two root causes, both HW-confirmed:
-#   1. torch/eager+compile pointwise returns UNINITIALIZED output (-0.0013 constant;
-#      relu returns its input unchanged) → op not computed / output not bound.
-#   2. even the injected codegen pointwise_add binary computes 2*a (ignores the 2nd
-#      operand) → an operand-wiring bug in the binary.
-# See codegen .git/sdd/POINTWISE_TORCH_PATH_BROKEN_2026-07-09.md. When the torch path
-# computes correctly, remove _POINTWISE_TORCH_BROKEN and the small shapes must pass
-# (max_diff==0 for the exact ops); the >8192-stick shapes stay xfail on the separate
-# LX-capacity/chunk_large_tensors gap (boundary=True).
-_POINTWISE_TORCH_BROKEN = True
+# HW STATUS (2026-07-10, HW-measured): per-op support, not a blanket flag.
+#   SUPPORTED (torch.compile HW-verified, max_diff==0): binary add, mul. These
+#   byte-match the deeptools golden op_add load layout (3-LBR-block + REUSE two-FMA);
+#   see codegen commit "add/mul WORK ON HW" + .git/sdd/POINTWISE_TORCH_PATH_BROKEN_
+#   2026-07-09.md.
+#   NOT YET SUPPORTED (Part-A fail-loud — codegen raises UnsupportedPointwiseOpError,
+#   no verified SFP binary): all unary (relu/neg/abs/tanh/sigmoid/sqrt) and binary
+#   sub/maximum. Marked xfail until their SFP binaries are built + HW-verified.
+#   The >8192-stick shapes (boundary=True) stay xfail on the LX-capacity /
+#   chunk-large-tensors gap regardless of op.
+_SUPPORTED_OPS = {"add", "mul"}
 
 
 @requires_hw
@@ -112,10 +117,10 @@ _POINTWISE_TORCH_BROKEN = True
 @pytest.mark.parametrize("op_id,fn", _UNARY_OPS, ids=[o[0] for o in _UNARY_OPS])
 def test_pointwise_unary(op_id, fn, shape_id, M, N, boundary):
     """Unary pointwise op on device matches CPU across real transformer shapes."""
-    if _POINTWISE_TORCH_BROKEN:
+    if op_id not in _SUPPORTED_OPS:
         pytest.xfail(
-            "pointwise torch path returns uninitialized/unchanged output on HW "
-            "(op not computed) — .git/sdd/POINTWISE_TORCH_PATH_BROKEN_2026-07-09.md."
+            f"{op_id}: no HW-verified SFP binary yet — codegen fails loud "
+            "(UnsupportedPointwiseOpError, Part A). Build+verify its binary to enable."
         )
     if boundary:
         pytest.xfail(
@@ -132,12 +137,20 @@ def test_pointwise_unary(op_id, fn, shape_id, M, N, boundary):
 @pytest.mark.parametrize("shape_id,M,N,boundary", _SHAPES, ids=[s[0] for s in _SHAPES])
 @pytest.mark.parametrize("op_id,fn", _BINARY_OPS, ids=[o[0] for o in _BINARY_OPS])
 def test_pointwise_binary(op_id, fn, shape_id, M, N, boundary):
-    """Binary pointwise op on device matches CPU across real transformer shapes."""
-    if _POINTWISE_TORCH_BROKEN:
+    """Binary pointwise op on device matches CPU across real transformer shapes.
+
+    add/mul are HW-verified (byte-match the deeptools golden op_add layout).
+    sub/maximum fail loud until their SFP binaries are built (Part A guard).
+    """
+    if op_id not in _SUPPORTED_OPS:
         pytest.xfail(
-            "pointwise torch path broken on HW: returns uninitialized output; and the "
-            "injected pointwise_add binary computes 2*a (ignores operand b). "
-            ".git/sdd/POINTWISE_TORCH_PATH_BROKEN_2026-07-09.md."
+            f"{op_id}: no HW-verified SFP binary yet — codegen fails loud "
+            "(UnsupportedPointwiseOpError, Part A). sub/maximum tracked as follow-ons."
+        )
+    if shape_id not in _SINGLE_STICK_SHAPES:
+        pytest.xfail(
+            f"{op_id} {shape_id}: multi-stick burst LXLU path not yet HW-verified "
+            "(single-stick add/mul are; burst looped-LDI is a deferred divergence)."
         )
     if boundary:
         pytest.xfail(
