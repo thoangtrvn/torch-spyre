@@ -501,6 +501,41 @@ def spyre_topk(
     )
 
 
+@register_spyre_decomposition([torch.ops.aten.embedding.default])
+def spyre_embedding(
+    weight: torch.Tensor,
+    indices: torch.Tensor,
+    padding_idx: int = -1,
+    scale_grad_by_freq: bool = False,
+    sparse: bool = False,
+) -> torch.Tensor:
+    """Keep aten.embedding OPAQUE under torch.compile — route it to the custom
+    spyre::embedding IBR-gather op instead of letting Inductor decompose it into a
+    generic indexed-load (gather) Triton kernel.
+
+    Without this, torch.compile lowers aten.embedding to `tt.load` at a
+    per-token-computed pointer (addptr + bounds tt.assert + negative-index select),
+    a fused kernel with NO float compute that codegen classifies as
+    pointwise_unsupported and fails loud. The custom op (torch_spyre/ops/embedding.py)
+    is the HW-verified IBR gather (all target LLM d_models, C=1 and C>=2 multi-chunk);
+    routing here makes the compiled path reuse it. register_fake on the custom op
+    supplies the output shape for FakeTensor tracing, so the op stays opaque (a fusion
+    barrier — correct for bring-up; fusing the gather with its consumer is a later
+    optimization).
+
+    NOTE: intentionally NOT added to _TRITON_INCOMPATIBLE_DECOMPOSITIONS. Ops in that
+    set (gelu/softplus/layer_norm) are EXCLUDED on the active triton_path so they fall
+    back to standard aten; embedding must do the OPPOSITE — survive on the triton path
+    so the opaque spyre::embedding op replaces the gather. padding_idx is
+    forward-irrelevant (backward-only); the training flags are rejected by the op.
+    """
+    if scale_grad_by_freq:
+        raise NotImplementedError("spyre embedding: scale_grad_by_freq unsupported")
+    if sparse:
+        raise NotImplementedError("spyre embedding: sparse unsupported")
+    return torch.ops.spyre.embedding(weight, indices)
+
+
 @register_spyre_decomposition([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,

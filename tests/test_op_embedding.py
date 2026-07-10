@@ -163,25 +163,18 @@ def test_embedding_shape(shape_id, vocab, d_model, n_tokens, needs_multichunk, e
 
     Entry-point routing (HW-observed 2026-07-09):
       aten / nn_eager  -> torch.ops.aten.embedding -> the fork's registered IBR
-                          gather kernel. Both HW-verified (C=1 and C>=2 multi-chunk).
-      nn_compiled      -> Inductor traces the gather into a generic fused Triton
-                          kernel (NOT the custom aten.embedding op), which codegen
-                          classifies as an unsupported fused pointwise op and fails
-                          loud (UnsupportedPointwiseOpError, the Part-A guard). This
-                          is a SEPARATE lowering path from the custom IBR op — routing
-                          the compiled gather to the IBR kernel (or supporting the
-                          fused kernel in codegen) is a distinct follow-on.
+                          gather kernel.
+      nn_compiled      -> a spyre decomposition (torch_spyre/_inductor/decompositions.py
+                          spyre_embedding) keeps aten.embedding OPAQUE under
+                          torch.compile and routes it to the same custom spyre::embedding
+                          IBR op, instead of letting Inductor decompose it to a generic
+                          gather Triton kernel (which codegen fails loud on). All three
+                          entry points converge on the one HW-verified IBR gather.
+    All HW-verified across C=1 and C>=2 (multi-chunk) for every target LLM d_model.
 
     needs_multichunk is retained for documentation of the C>=2 shapes; the multi-chunk
-    gather is HW-verified so no shape is xfail on the aten/eager paths.
+    gather is HW-verified so no shape is xfail.
     """
-    if entry == "nn_compiled":
-        pytest.xfail(
-            "torch.compile(nn.Embedding) lowers the gather to a generic fused Triton "
-            "kernel, not the custom aten.embedding IBR op → codegen fails loud "
-            "(UnsupportedPointwiseOpError). Separate path from the HW-verified IBR "
-            "gather; tracked as a compiled-embedding-lowering follow-on."
-        )
     max_diff = _run_embedding(vocab, d_model, n_tokens, entry=entry)
     assert max_diff == 0.0, (
         f"{shape_id}/{entry} (vocab={vocab} d_model={d_model} n={n_tokens}, "
