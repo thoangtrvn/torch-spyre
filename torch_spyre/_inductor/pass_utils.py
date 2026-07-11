@@ -44,7 +44,7 @@ from .codegen.superdsc import (
     _should_use_k_fast_mapping,
 )
 from .constants import BATCH_MATMUL_OP, ELIDED_COPY_BACK_ATTR
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreFillFallback
 from .logging_utils import get_inductor_logger
 from .loop_info import copy_op_metadata
 from .views import compute_coordinates, matching_dim
@@ -1106,11 +1106,10 @@ def lower_pad_sequence(
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
     Only one dimension may differ between ``padded_size`` and the original shape.
 
-    Uses torch.ops.aten.constant_pad_nd which lowers to a 4-op IR sequence:
-      1. ComputedBuffer - output buffer allocation (FixedLayout)
-      2. SpyreConstantFallback - fill constant (FixedLayout)
-      3. ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
-      4. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    Uses torch.ops.aten.constant_pad_nd which lowers to a 2-op IR sequence:
+      1. SpyreFillFallback - output buffer allocated and filled via FillDMA
+         (FixedLayout placeholder)
+      2. ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
 
     constant_pad_nd is called with align_to_stick=True to ensure the padding region
     is filled with stick-aligned offsets. This is required because the dim is
@@ -1185,21 +1184,15 @@ def lower_pad_sequence(
 
     assert new_ops[0] == padded_buf
 
-    # Verify structure: constant_pad_nd lowers to 4 operations
-    #   op0: ComputedBuffer - output buffer allocation (FixedLayout)
-    #   op1: SpyreConstantFallback - fill constant (FixedLayout)
-    #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
-    #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    # Verify structure: constant_pad_nd lowers to 2 operations
+    #   op0: SpyreFillFallback - allocate + FillDMA the padded buffer (FixedLayout)
+    #   op1: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
     assert (
-        len(new_ops) == 4
-        and isinstance(new_ops[0], ComputedBuffer)
+        len(new_ops) == 2
+        and isinstance(new_ops[0], SpyreFillFallback)
         and isinstance(new_ops[0].get_layout(), FixedLayout)
-        and isinstance(new_ops[1], SpyreConstantFallback)
-        and isinstance(new_ops[1].get_layout(), FixedLayout)
-        and isinstance(new_ops[2], ComputedBuffer)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3], ComputedBuffer)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[1], ComputedBuffer)
+        and isinstance(new_ops[1].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
     # --- Build the device layout (SpyreTensorLayout) for the padded buffer. ---
@@ -1275,32 +1268,18 @@ def lower_pad_sequence(
         padded_stl,
     )
 
-    # LX planning (scratchpad.py) accesses op.origin_node directly on the ComputedBuffer,
+    # LX planning (scratchpad.py) accesses op.origin_node directly on the buffer,
     # so we set it here explicitly.
     object.__setattr__(padded_buf, "origin_node", pad_fx)
 
-    # propagate_spyre_tensor_layouts already ran before this pass, so any op
-    # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
-    # immediately. The constant buffer (new_ops[1]) is a scalar tensor (size=[]).
-    const_buf = new_ops[1]
-    const_layout = const_buf.get_layout()
-    const_stl = SpyreTensorLayout(const_layout.size, const_layout.dtype)
-    const_buf.layout = FixedTiledLayout(
-        const_layout.device,
-        const_layout.dtype,
-        const_layout.size,
-        const_layout.stride,
-        const_stl,
-    )
-
-    # Mutation ops are intentionally left untouched
+    # The SpyreFillFallback (new_ops[0]) both allocates and fills the padded
+    # buffer, so there is no separate constant buffer to lay out here.  Mutation
+    # ops are intentionally left untouched.
 
     assert (
-        len(new_ops) == 4
+        len(new_ops) == 2
         and isinstance(new_ops[0].get_layout(), FixedTiledLayout)
-        and isinstance(new_ops[1].get_layout(), FixedTiledLayout)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[1].get_layout(), MutationLayoutSHOULDREMOVE)
     )
 
     return padded_buf, list(new_ops)

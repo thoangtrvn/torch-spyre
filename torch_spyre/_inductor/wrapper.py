@@ -58,7 +58,7 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                 from sympy import sympify
                 from torch_spyre._inductor.op_spec import TensorArg, OpSpec, UnimplementedOp, LoopSpec, spyre_constant_tensor, IndirectAccess
                 from torch_spyre.execution.async_compile import SpyreAsyncCompile
-                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout
+                from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout, spyre_empty_with_layout, set_spyre_tensor_layout, fill_tensor
                 import subprocess
             """,
             strip=True,
@@ -133,6 +133,13 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         self.writeline(
             f'{node.get_name()} = spyre_constant_tensor({value}, torch.device("{device}"), {dtype})'
         )
+
+    def generate_fill_dma(self, node):
+        # The output buffer is already allocated (should_allocate() is True, so
+        # codegen_allocation emitted spyre_empty_with_layout before this call).
+        # Launch a device-side MEMORY_FILL DMA that writes the constant directly
+        # into that buffer — no SBF compute kernel.
+        self.writeline(f"fill_tensor({node.get_name()}, {float(node.fill_value)})")
 
     def _is_pool_buffer(self, buffer: BufferLike) -> bool:
         layout = buffer.get_layout()

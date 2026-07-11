@@ -58,7 +58,7 @@ from .constants import (
     STAGGERED_EAS,
     TOPK_OPS,
 )
-from .ir import FixedTiledLayout, SpyreConstantFallback
+from .ir import FixedTiledLayout, SpyreConstantFallback, SpyreFillFallback
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -1389,6 +1389,13 @@ def propagate_spyre_tensor_layouts(
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, SpyreConstantFallback):
             op.layouts = [generic_layout(op)]
+            op.restick_cost_fn = AnyInNode.from_args()
+        elif isinstance(op, SpyreFillFallback):
+            # A FillDMA output is a uniform constant tensor — same as the
+            # constant-broadcast case, any stick layout is correct at zero
+            # cost.  Offer all valid candidates so a consumer can pick the one
+            # that avoids a restickify (see _all_constant_layouts).
+            op.layouts = _all_constant_layouts(op)
             op.restick_cost_fn = AnyInNode.from_args()
         elif isinstance(op, ExternKernel):
             logger.warning(f"unhandled node type {type(op)}")

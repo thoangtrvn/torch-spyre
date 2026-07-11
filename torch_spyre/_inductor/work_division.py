@@ -17,7 +17,7 @@ import dataclasses
 import math
 import itertools
 from sympy import Expr, Integer, Symbol, divisors
-from .ir import SpyreConstantFallback, SpyreEmptyFallback
+from .ir import SpyreConstantFallback, SpyreEmptyFallback, SpyreFillFallback
 
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -1323,7 +1323,9 @@ def _iter_computed_buffers(operations: list[Operation]):
         elif isinstance(op, MultiOutput):
             pass
         elif isinstance(op, ExternKernel):
-            if isinstance(op, (SpyreConstantFallback, SpyreEmptyFallback)):
+            if isinstance(
+                op, (SpyreConstantFallback, SpyreEmptyFallback, SpyreFillFallback)
+            ):
                 # Work division not supported on allocation/constant kernels
                 pass
             else:

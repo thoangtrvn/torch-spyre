@@ -32,8 +32,12 @@ from .constants import (
 )
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
-from .ir import SpyreReduction, SpyreConstantFallback, SpyreEmptyFallback
-from torch_spyre._C import get_elem_in_stick
+from .ir import (
+    SpyreReduction,
+    SpyreConstantFallback,
+    SpyreEmptyFallback,
+    SpyreFillFallback,
+)
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -893,21 +897,14 @@ def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memor
                 pin_memory=pin_memory,
             )
         )
-    scalar = ir.TensorBox.create(
-        SpyreConstantFallback(
-            torch.ops.spyre.constant.default, float(fill_value), dtype, device
+    # Materialize the fill with a device-side MEMORY_FILL DMA instead of a
+    # constant-broadcast Pointwise (which would compile to an SBF compute
+    # kernel).  SpyreFillFallback allocates the output and emits a
+    # fill_tensor(buf, value) call — no compute kernel.
+    return ir.TensorBox.create(
+        SpyreFillFallback(
+            torch.ops.aten.full.default, float(fill_value), list(size), device, dtype
         )
-    )
-    scalar_loader = scalar.make_loader()
-
-    def inner_fn(index):
-        return scalar_loader([])
-
-    return Pointwise.create(
-        device=device,
-        dtype=dtype,
-        inner_fn=inner_fn,
-        ranges=list(size),
     )
 
 
@@ -1064,33 +1061,18 @@ def lower_constant_pad_nd(input, pad, value=0, align_to_stick=False):
 
     dtype = input.get_dtype()
     device = input.get_device()
-    output = lowering.empty(output_size, dtype=dtype, device=device)
-    pad_constant = lower_constant(value, dtype, device)
 
-    # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
-    # Extra padding from alignment will be overwritten by input.
-    stick_size = get_elem_in_stick(dtype)
-    for (left, right), dim in zip(bounds, range(n, len(output_size))):
-        pad_left = max(0, left)
-        pad_right = max(0, right)
-        if pad_left + pad_right == 0:
-            continue
-
-        def fill_padding(count, offset):
-            if align_to_stick:
-                count += offset % stick_size
-                offset = (offset // stick_size) * stick_size
-
-            pad_size = list(output_size)
-            pad_size[dim] = count
-            pad_view = lowering.expand(pad_constant, pad_size)
-            sliced_output = ir.SliceView.create(output, dim, offset, offset + count)
-            lowering.mutate_to(sliced_output, pad_view)
-
-        if pad_left > 0:
-            fill_padding(pad_left, 0)
-        if pad_right > 0:
-            fill_padding(pad_right, output_size[dim] - pad_right)
+    # Fill the entire output with the pad value using a single device-side
+    # MEMORY_FILL DMA, then overwrite the interior with the input below.  This
+    # replaces the previous approach (empty alloc + a broadcast-constant SBF
+    # compute kernel per padded region), removing those compute kernels.  The
+    # DMA fills the whole (stick-aligned) allocation, so any align_to_stick
+    # extra padding is covered too.
+    output = ir.TensorBox.create(
+        SpyreFillFallback(
+            torch.ops.aten.full.default, float(value), output_size, device, dtype
+        )
+    )
 
     # Copy cropped input into the output at the correct offsets
     sliced_output = output

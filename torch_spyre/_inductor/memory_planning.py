@@ -22,7 +22,7 @@ from torch._inductor.scheduler import (
 from torch._inductor.ir import FallbackKernel
 from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
-from .ir import FixedTiledLayout, SpyreEmptyFallback
+from .ir import FixedTiledLayout, SpyreEmptyFallback, SpyreFillFallback
 from .scheduler import CountedLoopSchedulerNode
 from .logging_utils import get_inductor_logger
 from . import config
@@ -185,13 +185,14 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         if dep.name not in graph_outputs
     }
 
-    # SpyreEmptyFallback nodes allocate a buffer but emit no dep-tracked write
-    # so they never appear in `written` via the dep walk above.  Collect them here explicitly
+    # SpyreEmptyFallback / SpyreFillFallback nodes allocate a buffer but emit no
+    # dep-tracked write so they never appear in `written` via the dep walk above.
+    # Collect them here explicitly
     written |= {
         node.get_name()
         for node in flat_nodes
         if isinstance(node, ExternKernelSchedulerNode)
-        and isinstance(node.node, SpyreEmptyFallback)
+        and isinstance(node.node, (SpyreEmptyFallback, SpyreFillFallback))
         and node.get_name() not in graph_outputs
     }
 

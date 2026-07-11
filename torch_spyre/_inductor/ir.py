@@ -185,3 +185,54 @@ class SpyreEmptyFallback(ir.ExternKernel):
         )
         self.name = V.graph.register_buffer(self)
         V.graph.register_operation(self)
+
+
+class SpyreFillFallback(ir.ExternKernel):
+    """IR node for a constant fill materialized via a device-side FillDMA.
+
+    Like SpyreEmptyFallback, this is a self-allocating node: should_allocate()
+    returns True so the wrapper emits spyre_empty_with_layout(...) for the
+    output buffer (its placeholder FixedLayout must be upgraded to a
+    FixedTiledLayout before codegen, which propagate_spyre_tensor_layouts does
+    via the candidate `layouts` it assigns).  Unlike SpyreEmptyFallback, its
+    codegen() is NOT a no-op: it appends a fill_tensor(<buf>, <value>) call
+    which launches a MEMORY_FILL DMA writing the constant directly into device
+    memory — no SBF compute kernel and no host buffer/H2D copy.  This replaces
+    the SpyreConstantFallback + broadcast-Pointwise path used by lower_full.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        wrapper.generate_fill_dma(self)
+
+    def should_allocate(self) -> bool:
+        layout = self.get_layout()
+        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+            return False
+        return True
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        value,
+        size: list[Expr],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self.fill_value = value
+        stride = ir.FlexibleLayout.contiguous_strides(size)
+        layout = FixedLayout(device, dtype, size, stride)
+        super().__init__(
+            None,
+            layout,
+            [],
+            (value,),
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
