@@ -104,12 +104,20 @@ def _check(op_id, out_dev, out_ref):
 #   byte-match the deeptools golden op_add load layout (3-LBR-block + REUSE two-FMA);
 #   see codegen commit "add/mul WORK ON HW" + .git/sdd/POINTWISE_TORCH_PATH_BROKEN_
 #   2026-07-09.md.
+#   sub (binary) + neg (unary) added 2026-07-10: REUSE two-FMA + FNMS (sub: a - REUSE(b)*1;
+#   neg: -(x*1 - 0)), grounded in deeptools add_mul_sub_fwd.smc:343/345. HW-verified on the
+#   single-stick path (known-answer: 5-2=3, neg([1,2,3,4])=[-1,-2,-3,-4], max_diff=0). The
+#   sub operand order was HW-corrected (LXLU sends input_y=b first → REUSE=b, FIFO=a; an
+#   initial src0/src2 swap computed b-a, fixed to a-b).
 #   NOT YET SUPPORTED (Part-A fail-loud — codegen raises UnsupportedPointwiseOpError,
-#   no verified SFP binary): all unary (relu/neg/abs/tanh/sigmoid/sqrt) and binary
-#   sub/maximum. Marked xfail until their SFP binaries are built + HW-verified.
+#   no verified SFP binary): relu/abs/tanh/sigmoid/sqrt (unary) and maximum (binary).
+#   relu/maximum/abs need the FMINMAX submode or a relu mode-bit (not yet wired);
+#   tanh/sigmoid/sqrt need the FEST transcendental path. Marked xfail until built + HW-verified.
 #   The >8192-stick shapes (boundary=True) stay xfail on the LX-capacity /
 #   chunk-large-tensors gap regardless of op.
-_SUPPORTED_OPS = {"add", "mul"}
+#   NOTE: add/mul/sub are HW-verified only for the SINGLE-STICK path (s1x64); the multi-
+#   stick shapes stay xfail (looped-LDI burst path not yet byte-matched for these).
+_SUPPORTED_OPS = {"add", "mul", "sub", "neg"}
 
 
 @requires_hw
@@ -121,6 +129,11 @@ def test_pointwise_unary(op_id, fn, shape_id, M, N, boundary):
         pytest.xfail(
             f"{op_id}: no HW-verified SFP binary yet — codegen fails loud "
             "(UnsupportedPointwiseOpError, Part A). Build+verify its binary to enable."
+        )
+    if shape_id not in _SINGLE_STICK_SHAPES:
+        pytest.xfail(
+            f"{op_id} {shape_id}: multi-stick path not yet HW-verified for unary ops "
+            "(neg is verified single-stick only; burst looped-LDI is a deferred divergence)."
         )
     if boundary:
         pytest.xfail(
