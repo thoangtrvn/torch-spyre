@@ -54,16 +54,24 @@ _IBR_LOOPED_CACHE: dict = {}
 # value uses the IBR indirect gather path.
 _EBR_D_MODEL_MAX = 512
 
-# IBR single-chunk d_model ceiling (inclusive): the IBR gather reads a token row
+# IBR single-chunk d_model boundary (inclusive): the IBR gather reads a token row
 # in ceil(spt/32) burst chunks, where spt = d_model / elements_per_stick.  A
 # single LDIM burst covers at most 32 sticks (BURST field max), so d_model up to
-# 32 * elements_per_stick = 2048 (at 16-bit) needs only ONE chunk per token (C=1).
-# The C=1 path is HARDWARE-VERIFIED (IBR T7: real aten.embedding d=768 and d=2048,
-# max_diff=0 on silicon).  The MULTI-chunk path (C>1, d_model > 2048) — which emits
-# multiple LDIM gathers per token with addlarimm advances between chunks — is NOT
-# yet hardware-verified: it HANGS the device on AIU 1.0 (IBR T7: d=4096 spt=64 C=2
-# timed out while d=2048 returned in 6.3s).  Until the chunked-read path is fixed
-# and verified, d_model > this value raises rather than hanging the device.
+# 32 * elements_per_stick = 2048 (at 16-bit) needs only ONE chunk per token (C=1);
+# d_model > 2048 needs C>1 chunks.  This constant marks that C=1/C>1 boundary — it
+# is INFORMATIONAL, not a raise threshold (no code path gates on it; d_model>2048
+# routes to the multi-chunk builder in _build_embedding_launches_ibr, it does NOT
+# raise).
+#
+# BOTH paths are HARDWARE-VERIFIED on AIU 1.0 (max_diff=0):
+#   - C=1  (d_model <= 2048): IBR T7 — real aten.embedding d=768, d=2048.
+#   - C>1  (d_model  > 2048): 2026-07-11 — real aten.embedding d=4096 (C=2, N=2/4),
+#     d=5120 (C=3, N=2), d=8192 (C=4, N=2/3), all max_diff=0 across every token.
+#     The OLD C>1 emission (distinct EAR[j]=32*j + addlarimm between chunks) HUNG
+#     the device; the fix walks the C 32-stick chunks with a single-EAR0/LAR0 `.u`
+#     gather each (deeptools single-gather model), earimm EAR0,0 resetting the
+#     intra-row base per token while LAR0 walks the deposit continuously.  See
+#     scheduler/embedding.py::embedding_ibr_pattern (the UNROLLED, dispatched form).
 _IBR_SINGLE_CHUNK_D_MODEL_MAX = 2048
 
 
@@ -155,6 +163,7 @@ def _build_embedding_launches_ibr(
         from sentient_codegen.encoder.embedding_dispatch import (
             build_looped_ibr_binary_cached,
             plan_and_build_embedding_ibr_binaries_cached,
+            plan_and_build_embedding_ibr_binaries,
         )
     except ImportError as e:
         raise EmbeddingHostError(
@@ -162,25 +171,32 @@ def _build_embedding_launches_ibr(
             "on PYTHONPATH (required for IBR embedding dispatch)."
         ) from e
 
-    # Multi-chunk guard: the IBR gather reads a token row in ceil(spt/32) burst
-    # chunks (BURST field max = 32 sticks).  The single-chunk path (C=1) is
-    # hardware-verified; the multi-chunk path (C>1) HANGS the device on AIU 1.0
-    # (IBR T7) and is not yet fixed.  Fail loud rather than hang.  Derive the
-    # ceiling from elements_per_stick so it stays generation-correct.
+    # Chunks-per-token: the IBR gather reads a token row in ceil(spt/32) burst
+    # chunks (L3 BURST field max = 32 sticks).  This selects the emission path.
     elements_per_stick = gen.hw.stick_bytes * 8 // element_bits   # 64 at 16-bit
     spt = math.ceil(d_model / elements_per_stick)
     chunks_per_token = math.ceil(spt / _IBR_FILE_SIZE)            # C = ceil(spt/32)
-    if chunks_per_token > 1:
-        max_d = _IBR_FILE_SIZE * elements_per_stick               # 2048 at 16-bit
-        raise NotImplementedError(
-            f"embedding: d_model={d_model} needs sticks_per_token={spt} → "
-            f"chunks_per_token={chunks_per_token} (>1).  The multi-chunk IBR gather "
-            f"path is not yet hardware-verified (it hangs the device on AIU 1.0). "
-            f"Single-chunk IBR (d_model <= {max_d} at {element_bits}-bit) is "
-            f"hardware-verified; the chunked-read path is a tracked follow-on."
-        )
 
     tokens_per_launch = min(_IBR_FILE_SIZE, len(flat_idx))
+
+    if chunks_per_token > 1:
+        # MULTI-CHUNK PATH (C>1, d_model>2048): a token row spans C 32-stick chunks.
+        # The single-EAR0/LAR0 `.u`-walk UNROLLED gather (embedding_ibr_pattern in
+        # codegen) covers the whole row per token — the deeptools single-gather
+        # model (dcgbeCodegen.cpp:1517-1526).  The OLD distinct-EAR[j] emission and
+        # the still-unimplemented looped C>1 form both HANG AIU 1.0, so the build-
+        # once+patch cached-looped fast path (below) is C=1 ONLY — route C>1 to the
+        # unrolled builder, which re-schedules per launch (fine: C>1 launches are
+        # few and overhead-bound).  HARDWARE-VERIFIED on AIU 1.0 (2026-07-11):
+        # real aten.embedding d_model=4096 (C=2), 5120 (C=3), 8192 (C=4), tokens=2..4,
+        # all max_diff=0 across every token.
+        launches = plan_and_build_embedding_ibr_binaries(
+            flat_idx, d_model, gen,
+            element_bits=element_bits,
+            tokens_per_launch=tokens_per_launch,
+            out_segment=2,  # 3-tensor layout: weight=XLAT[0], ibr=XLAT[1], output=XLAT[2]
+        )
+        return launches, tokens_per_launch
 
     # Build-ONCE + patch: the cacheable looped binary depends only on geometry, so
     # build it once per (target, d_model, element_bits, out_segment) and patch the

@@ -6,18 +6,22 @@ import pytest
 from torch_spyre.ops._embedding_host import build_embedding_launches, _tokens_per_core
 
 
-def test_multistick_d4096_multichunk_raises():
-    """d_model=4096 (spt=64 → C=2 chunks/token) raises on the multi-chunk guard.
+def test_multistick_d4096_multichunk_plans():
+    """d_model=4096 (spt=64 → C=2 chunks/token) now PLANS via the multi-chunk fix.
 
-    The single-chunk IBR gather (C=1, d_model <= 2048) is hardware-verified
-    (IBR T7: real aten.embedding d=768/d=2048, max_diff=0). The MULTI-chunk path
-    (C>1) hangs the device on AIU 1.0 (IBR T7: d=4096 spt=64 C=2 timed out), so the
-    planner raises NotImplementedError rather than building a hanging binary until
-    the chunked-read path is fixed and verified.
+    The OLD distinct-EAR[j] chunked emission hung AIU 1.0.  The multi-chunk gather
+    now uses the deeptools single-EAR0/LAR0 `.u`-walk model (one gather per chunk
+    walking EAR0/LAR0 by the burst), which is stick-balanced and offline-verified
+    (codegen test_embedding_ibr_multichunk_*).  The planner must PLAN, not raise;
+    the C>1 device path is a pending fresh HW probe.
     """
     idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="multi-chunk|chunks_per_token"):
-        build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
+    launches, tpl = build_embedding_launches(vocab=128, d_model=4096, element_bits=16, flat_idx=idx)
+    assert len(launches) >= 1 and 1 <= tpl <= 32
+    covered = []
+    for (start, end), _b in launches:
+        covered.extend(range(start, end))
+    assert sorted(covered) == list(range(len(idx)))
 
 
 def test_two_stick_now_supported():
@@ -138,19 +142,27 @@ def test_ibr_d2048_plans_not_raises():
     )
 
 
-def test_ibr_d4096_multichunk_raises():
-    """IBR-T7: d_model=4096 (spt=64 → C=2 chunks/token) raises on the multi-chunk guard.
+def test_ibr_d4096_multichunk_plans():
+    """IBR-T7 follow-on: d_model=4096 (spt=64 → C=2 chunks/token) now PLANS.
 
-    The chunked-read path (C=ceil(spt/32)>1: 2 gather instructions per token with
-    addlarimm advances between chunks) hangs the device on AIU 1.0 (IBR T7). Until
-    fixed+verified, it raises NotImplementedError rather than building a hanging
-    binary. Single-chunk (d_model <= 2048, C=1) is the hardware-verified ceiling.
+    The OLD chunked-read emission (distinct EAR[j]=32*j + addlarimm between chunks)
+    hung AIU 1.0.  The multi-chunk gather now walks the C 32-stick chunks with a
+    single EAR0/LAR0 `.u` gather each (deeptools single-gather model), covering the
+    whole row per token — stick-balanced and offline-verified.  The planner must
+    PLAN (route to the unrolled `.u`-walk builder), not raise.  The C>1 device path
+    is a pending fresh HW probe (nn.Embedding d=4096 tokens=2).
     """
     flat_idx = list(range(4))
-    with pytest.raises(NotImplementedError, match="multi-chunk|chunks_per_token"):
-        build_embedding_launches(
-            vocab=1024, d_model=4096, element_bits=16, flat_idx=flat_idx,
-        )
+    launches, tokens_per_launch = build_embedding_launches(
+        vocab=1024, d_model=4096, element_bits=16, flat_idx=flat_idx,
+    )
+    assert len(launches) >= 1
+    assert 1 <= tokens_per_launch <= 32
+    covered = []
+    for (start, end), _binary in launches:
+        assert end > start
+        covered.extend(range(start, end))
+    assert sorted(covered) == list(range(len(flat_idx)))
 
 
 def test_ibr_more_than_32_tokens_multi_launch():
