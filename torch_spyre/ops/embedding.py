@@ -61,6 +61,7 @@ from ._embedding_host import (
     _EBR_D_MODEL_MAX,
     _IBR_FILE_SIZE,
 )
+from ._embedding_weight_cache import get_row_contiguous_weight
 
 __all__ = ["embedding", "EmbeddingHostError"]
 
@@ -168,8 +169,17 @@ def _embedding_ibr(
     # The reshape is done on CPU to ensure the reshaped view is contiguous
     # before the H2D copy (which applies the per-generation format conversion).
     # weight is currently on device; pull to CPU for reshape.
-    weight_cpu = weight.cpu().reshape(vocab * spt, eps)
-    weight_rc = weight_cpu.to(weight.device)  # H2D with row-contiguous layout
+    #
+    # CACHED: this relayout is a full-table D2H+H2D (~3.3 ms/MB) and depends ONLY
+    # on (weight data, vocab, spt) — NOT on the token indices — so the table is
+    # static across forward passes.  get_row_contiguous_weight builds it once and
+    # returns the cached device copy on every subsequent call with the SAME
+    # (weakref-identity + _version checked) weight tensor, collapsing the per-call
+    # reshape tax to a one-time cold cost.  A different weight (even same shape) or
+    # an in-place-mutated weight MISSES and rebuilds — see _embedding_weight_cache
+    # for the stale-cache correctness argument.  (Was: weight.cpu().reshape(...)
+    # .to(device) inline, which ran on EVERY call — the #1 embedding perf item.)
+    weight_rc = get_row_contiguous_weight(weight, vocab, spt, eps)  # H2D, row-contiguous
 
     # IBR seg_bits from the generation: always 27 for rcudd1a.
     # Build per-launch IBR tables from the flat_idx slice.
