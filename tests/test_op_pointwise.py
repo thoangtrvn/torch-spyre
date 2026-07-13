@@ -51,9 +51,13 @@ _EPS = 64  # elements per stick at 16-bit
 # --- op table: (id, callable, is_binary, input-domain builder) ---------------
 # The input builder returns DL16-exact operand(s) whose op result stays <= 1024.
 def _small_pos(shape):
-    # values 1..8, exact in DL16, keeps products/sums small
+    # values 1..8, exact in DL16, keeps products/sums small.
+    # NOTE: build the arange in int64 and take `% 8` BEFORE casting to float16.
+    # A float16 arange overflows at n>65504 (fp16 can't represent large integers →
+    # inf/NaN), which silently NaN'd multi-stick shapes (512×4096 = 2M elements).
+    # int64 arange is exact at any n; the values after `%8+1` are 1..8, DL16-exact.
     n = int(torch.tensor(shape).prod())
-    return (torch.arange(n, dtype=torch.float16).reshape(shape) % 8 + 1)
+    return ((torch.arange(n, dtype=torch.int64) % 8 + 1).to(torch.float16).reshape(shape))
 
 
 _UNARY_OPS = [
@@ -175,6 +179,62 @@ def test_pointwise_binary(op_id, fn, shape_id, M, N, boundary):
     out_dev = fn(a.to("spyre"), b.to("spyre")).cpu()
     out_ref = fn(a, b)
     _check(op_id, out_dev, out_ref)
+
+
+# ---------------------------------------------------------------------------
+# 3-dispatch-path coverage (mirrors tests/test_op_embedding.py _ENTRY_POINTS).
+# A pointwise op can reach the device three ways, and they DO differ (embedding
+# proved eager vs compiled dispatch route differently). Test all three:
+#   aten     — torch.ops.aten.<op> directly (the registered device kernel)
+#   eager    — the torch operator with no compile (a+b / a*b → same aten kernel)
+#   compiled — torch.compile (Inductor graph capture → Triton TTIR → codegen)
+# ---------------------------------------------------------------------------
+_ENTRY_POINTS = ("aten", "eager", "compiled")
+
+# Real-LLM shapes HW-verified THIS SESSION (2026-07-11/12): add/mul at multi-stick
+# hidden and chunked-prefill up to the LX ceiling. (id, M, N, model/hidden note)
+_LLM_BINARY_SHAPES = [
+    ("decode_d4096",     1,    4096, "Granite-8B/Mistral-7B residual/SwiGLU, decode"),
+    ("prefill_512x4096", 512,  4096, "d4096 chunked-prefill chunk (Fix A, unrolled)"),
+    ("prefill_2048x2048", 2048, 2048, "Granite-2B/TinyLlama chunked-prefill (Fix A)"),
+    ("prefill_2048x4096", 2048, 4096, "d4096 chunked-prefill (Fix B, looped L3, 128 chunks)"),
+]
+_ATEN_BINARY = {"add": torch.ops.aten.add, "mul": torch.ops.aten.mul}
+
+
+def _run_binary_via(entry, op_id, fn, a_dev, b_dev):
+    """Dispatch a binary pointwise op to the device via one of the 3 entry points."""
+    if entry == "aten":
+        return _ATEN_BINARY[op_id](a_dev, b_dev).cpu()
+    if entry == "eager":
+        return fn(a_dev, b_dev).cpu()          # a+b / a*b, no compile
+    if entry == "compiled":
+        return torch.compile(fn)(a_dev, b_dev).cpu()
+    raise ValueError(entry)
+
+
+@requires_hw
+@pytest.mark.parametrize("entry", _ENTRY_POINTS)
+@pytest.mark.parametrize("shape_id,M,N,note", _LLM_BINARY_SHAPES, ids=[s[0] for s in _LLM_BINARY_SHAPES])
+@pytest.mark.parametrize("op_id", ["add", "mul"])
+def test_pointwise_binary_dispatch_paths(op_id, shape_id, M, N, note, entry):
+    """add/mul on real LLM shapes must be correct via ALL THREE dispatch paths
+    (aten op / eager / torch.compile), matching the coverage embedding.md's test has.
+
+    Shapes are the residual-add / SwiGLU-mul shapes HW-verified this session, incl.
+    the Fix A (unrolled) and Fix B (looped L3) chunked-prefill regimes. All must be
+    max_diff==0 with DL16-exact operands, regardless of how the op is dispatched.
+    """
+    fn = {"add": lambda a, b: a + b, "mul": lambda a, b: a * b}[op_id]
+    a = _small_pos((M, N))
+    b = (_small_pos((M, N)) % 4 + 1)     # 1..4 → sums/products <= 1024, DL16-exact
+    out_dev = _run_binary_via(entry, op_id, fn, a.to("spyre"), b.to("spyre"))
+    out_ref = fn(a, b)
+    md = (out_dev - out_ref).abs().max().item()
+    assert md == 0.0, (
+        f"{op_id} {shape_id} via {entry}: max_diff={md} (expected 0.0). "
+        f"[{note}]"
+    )
 
 
 def test_pointwise_shape_model():
