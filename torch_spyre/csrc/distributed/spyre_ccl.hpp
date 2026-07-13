@@ -65,7 +65,8 @@ class SpyreCCLNotSupportedException : public std::runtime_error {
 class SpyreCCLBackend : public c10d::Backend {
  public:
   SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store, int rank,
-                  int size);
+                  int size,
+                  std::chrono::milliseconds op_timeout = kUnsetTimeout);
 
   ~SpyreCCLBackend();
 
@@ -214,6 +215,12 @@ class SpyreCCLBackend : public c10d::Backend {
   std::atomic<uint64_t> seq_{0};
   // Set by abort()/shutdown(); once true no further collectives are launched.
   std::atomic<bool> aborted_{false};
+  // The process-group timeout from init_process_group(timeout=...), captured at
+  // construction and used as the default deadline for Work::wait() when the
+  // caller passes no explicit (positive) per-call timeout. kUnsetTimeout means
+  // "block indefinitely" (no PG timeout configured). Immutable after
+  // construction, so no synchronization is needed to read it.
+  const std::chrono::milliseconds op_timeout_;
 
   [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
       const at::Tensor& input_tensor);
@@ -246,17 +253,21 @@ class SpyreCCLWork : public Work {
    *                       full duration of the async op. Because the schedule
    *                       captures raw device pointers, releasing these tensors
    *                       before completion would free memory the collective is
-   *                       still using (use-after-free). Holding a reference here
-   *                       ties their lifetime to the Work.
+   *                       still using (use-after-free). Holding a reference
+   * here ties their lifetime to the Work.
    * @param result_tensors The output tensors used to complete the Future so
    *                       fut.value() / functional-collective consumers observe
    *                       the collective result. Must be a subset of
    *                       hold_tensors.
+   * @param default_timeout The process-group timeout to apply in wait() when
+   *                       the caller passes no explicit (positive) per-call
+   *                       timeout. kUnsetTimeout means "block indefinitely".
    */
   SpyreCCLWork(OpType opType,
                std::unique_ptr<spyre_comms::WorkSchedule> work_schedule,
                std::vector<at::Tensor> hold_tensors = {},
-               std::vector<at::Tensor> result_tensors = {});
+               std::vector<at::Tensor> result_tensors = {},
+               std::chrono::milliseconds default_timeout = kUnsetTimeout);
   ~SpyreCCLWork() override;
   [[nodiscard]] bool isCompleted() override;
   [[nodiscard]] bool isSuccess() const override;
@@ -277,6 +288,9 @@ class SpyreCCLWork : public Work {
   std::vector<at::Tensor> hold_tensors_;
   std::vector<at::Tensor> result_tensors_;
   std::atomic<bool> completed_{false};
+  // PG-level default deadline applied by wait() when the caller passes no
+  // explicit positive timeout. kUnsetTimeout means "block indefinitely".
+  const std::chrono::milliseconds default_timeout_;
 };
 
 }  // namespace c10d

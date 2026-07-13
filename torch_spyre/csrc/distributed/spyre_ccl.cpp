@@ -38,8 +38,12 @@ namespace c10d {
  * Wrapper Backend for the Sypre Collective Library
  ***********************************************/
 SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
-                                 int rank, int size)
-    : Backend(rank, size), group_context_(nullptr), comm_stream_(nullptr) {
+                                 int rank, int size,
+                                 std::chrono::milliseconds op_timeout)
+    : Backend(rank, size),
+      group_context_(nullptr),
+      comm_stream_(nullptr),
+      op_timeout_(op_timeout) {
   DEBUGINFO("# [Spyre CCL]: Constructor for ", getBackendName());
 
   /*
@@ -74,11 +78,10 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
    * hangs). Detect that case from the store/rank/size args and fail cleanly
    * instead of silently doing the wrong thing.
    */
-  const bool is_world_group =
-      (static_cast<spyre_comms::process_id_t>(size) ==
-       world_context->getSize()) &&
-      (static_cast<spyre_comms::process_id_t>(rank) ==
-       world_context->getRank());
+  const bool is_world_group = (static_cast<spyre_comms::process_id_t>(size) ==
+                               world_context->getSize()) &&
+                              (static_cast<spyre_comms::process_id_t>(rank) ==
+                               world_context->getRank());
   if (!is_world_group) {
     // EXTENSION POINT: when the comms library gains a sub-group context
     // factory, replace this throw with something like
@@ -533,7 +536,8 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
   std::vector<at::Tensor> hold = outputTensors[0];
   hold.push_back(inputTensors[0]);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws),
-                                           std::move(hold), outputTensors[0]);
+                                           std::move(hold), outputTensors[0],
+                                           op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
@@ -568,7 +572,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws),
-                                           tensors, tensors);
+                                           tensors, tensors, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(
@@ -596,7 +600,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
   ws->SetStreamAffinity(comm_stream_);
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
-  return c10::make_intrusive<SpyreCCLWork>(OpType::BARRIER, std::move(ws));
+  return c10::make_intrusive<SpyreCCLWork>(
+      OpType::BARRIER, std::move(ws), std::vector<at::Tensor>{},
+      std::vector<at::Tensor>{}, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
@@ -614,7 +620,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws),
-                                           tensors, tensors);
+                                           tensors, tensors, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
@@ -662,7 +668,8 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws),
-                                           std::move(hold), std::move(result));
+                                           std::move(hold), std::move(result),
+                                           op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
@@ -685,7 +692,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
   ws->start();
   seq_.fetch_add(1, std::memory_order_relaxed);
   return c10::make_intrusive<SpyreCCLWork>(OpType::REDUCE, std::move(ws),
-                                           tensors, tensors);
+                                           tensors, tensors, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce_scatter(
@@ -719,7 +726,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
   // would desynchronize the counter across ranks, causing "Detected mismatch
   // between collectives on ranks" errors on the next collective call.
   return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws), tensors,
-                                           tensors);
+                                           tensors, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
@@ -737,7 +744,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
   // P2P operations must NOT increment the collective sequence counter.
   // See comment in send() above.
   return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws), tensors,
-                                           tensors);
+                                           tensors, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recvAnysource(
@@ -748,8 +755,16 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recvAnysource(
 
 c10::intrusive_ptr<Backend> SpyreCCLBackend::createSpyreCCLBackend(
     const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size,
-    const std::chrono::duration<float>& /* unused */) {
-  return c10::make_intrusive<SpyreCCLBackend>(store, rank, size);
+    const std::chrono::duration<float>& timeout) {
+  // c10d hands the process-group timeout in as seconds (duration<float>).
+  // Convert to whole milliseconds for SpyreCCLWork::wait(). A non-positive
+  // value means "no PG timeout" — normalize it to kUnsetTimeout so wait()
+  // treats it as "block indefinitely" rather than a zero-length deadline.
+  const auto op_timeout =
+      timeout.count() > 0.0f
+          ? std::chrono::duration_cast<std::chrono::milliseconds>(timeout)
+          : kUnsetTimeout;
+  return c10::make_intrusive<SpyreCCLBackend>(store, rank, size, op_timeout);
 }
 
 void SpyreCCLBackend::abort_guard(const char* op) {
@@ -767,6 +782,16 @@ void SpyreCCLBackend::abort() {
   // down instead of issuing more work. True mid-flight cancellation needs a
   // new comms API (reported to the runtime owners).
   aborted_.store(true, std::memory_order_release);
+
+  // Fail-fast (Phase 0): half-close the shared OOB sockets so any peer blocked
+  // in an OOB read wakes immediately via EOF, rather than waiting for this
+  // rank's normal (barrier-first) finalize teardown. This is a no-op unless we
+  // are the last live spyre-comms reference, so it cannot break a healthy
+  // sibling ProcessGroup that still shares the singleton sockets. It does NOT
+  // finalize the library or close fds — the destructor's finalize_library()
+  // still does that. Idempotent, so a repeated abort() is safe.
+  spyre_comms::abort_oob_connections();
+
   DEBUGINFO("# [Spyre CCL]: abort() requested for ", getBackendName());
 }
 
@@ -781,13 +806,15 @@ void SpyreCCLBackend::shutdown() {
 SpyreCCLWork::SpyreCCLWork(OpType opType,
                            std::unique_ptr<spyre_comms::WorkSchedule> ws,
                            std::vector<at::Tensor> hold_tensors,
-                           std::vector<at::Tensor> result_tensors)
+                           std::vector<at::Tensor> result_tensors,
+                           std::chrono::milliseconds default_timeout)
     : Work(-1, opType),
       future_(c10::make_intrusive<at::ivalue::Future>(
           c10::ListType::create(c10::TensorType::get()))),
       work_schedule_(std::move(ws)),
       hold_tensors_(std::move(hold_tensors)),
-      result_tensors_(std::move(result_tensors)) {}
+      result_tensors_(std::move(result_tensors)),
+      default_timeout_(default_timeout) {}
 
 SpyreCCLWork::~SpyreCCLWork() {
   // If the Work is destroyed while the transfer is still reading/writing the
@@ -803,7 +830,8 @@ SpyreCCLWork::~SpyreCCLWork() {
   if (work_schedule_ && !work_schedule_->query()) {
     try {
       work_schedule_->synchronize();
-    } catch (...) {
+    }
+    catch (...) {
       // Destructors must not throw; a failed transfer is surfaced via wait().
     }
   }
@@ -848,27 +876,36 @@ bool SpyreCCLWork::isSuccess() const {
 }
 
 bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
+  // Timeout precedence (matches the c10d convention): an explicit positive
+  // per-call timeout always wins; otherwise fall back to the process-group
+  // default captured from init_process_group(timeout=...). If neither is set,
+  // block indefinitely. This is why init_process_group(timeout=...) now has an
+  // effect on this backend where it previously did not.
+  const std::chrono::milliseconds effective_timeout =
+      (timeout != kUnsetTimeout && timeout.count() > 0) ? timeout
+                                                        : default_timeout_;
   if (!completed_.load(std::memory_order_acquire) && work_schedule_) {
     // kUnsetTimeout (or a non-positive value) means "block indefinitely".
-    if (timeout == kUnsetTimeout || timeout.count() <= 0) {
+    if (effective_timeout == kUnsetTimeout || effective_timeout.count() <= 0) {
       work_schedule_->wait();
     } else {
       // The underlying WorkSchedule::wait() has no deadline, so poll query()
       // until the timeout elapses. This bounds the wait so a dead peer cannot
       // hang the caller forever (P1). TODO: replace with a native timed wait
       // once spyre_comms exposes one.
-      const auto deadline = std::chrono::steady_clock::now() + timeout;
+      const auto deadline =
+          std::chrono::steady_clock::now() + effective_timeout;
       while (!work_schedule_->query()) {
         if (std::chrono::steady_clock::now() >= deadline) {
           bool expected = false;
           if (completed_.compare_exchange_strong(expected, true,
                                                  std::memory_order_acq_rel)) {
             finish_error("[SpyreCCL]: collective timed out after " +
-                         std::to_string(timeout.count()) + " ms");
+                         std::to_string(effective_timeout.count()) + " ms");
           }
           throw std::runtime_error(
               "[SpyreCCL]: collective wait timed out after " +
-              std::to_string(timeout.count()) + " ms");
+              std::to_string(effective_timeout.count()) + " ms");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
