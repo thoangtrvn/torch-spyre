@@ -392,5 +392,14 @@ test/logs/*
 test/*.txt
 test/*.json
 
+# benchmark history ledger -- machine/run-local artifact, same treatment as
+# the existing --json output files from bench_distributed.py
+examples/distributed/bench_history.csv
+
+# deployment-state marker stamped by sync_to_sentient.sh at sync time (see
+# bench_history.py's get_deployed_state()) -- regenerated every sync, not
+# meant to be a persistent local file
+examples/distributed/.deployed_state.json
+
 .*env*
 stubs
