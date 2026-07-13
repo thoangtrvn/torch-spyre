@@ -61,7 +61,13 @@ def _small_pos(shape):
 
 
 _UNARY_OPS = [
-    ("relu",       lambda x: torch.relu(x - 4)),          # spans neg→0 clamp
+    # relu is BARE (no `x-4`): a fused sub+relu (`torch.relu(x-4)`) lowers to an
+    # Inductor `maximum__` helper over a subf result — a MULTI-OP fused elementwise
+    # chain the classifier does NOT yet handle generically (it faults; see memory
+    # generic-fused-elementwise-gap). Bare relu on a SIGNED input (built by
+    # _signed_small, so negatives are present WITHOUT an in-graph sub) is the
+    # HW-verified path. Fused relu(x-4) is covered by an explicit xfail below.
+    ("relu",       lambda x: torch.relu(x)),              # bare max(x,0); needs signed input
     ("neg",        lambda x: torch.neg(x)),
     ("abs",        lambda x: torch.abs(x - 4)),
     ("tanh",       lambda x: torch.tanh(x / 8)),           # bounded, exact-ish domain
@@ -121,7 +127,12 @@ def _check(op_id, out_dev, out_ref):
 #   chunk-large-tensors gap regardless of op.
 #   NOTE: add/mul/sub are HW-verified only for the SINGLE-STICK path (s1x64); the multi-
 #   stick shapes stay xfail (looped-LDI burst path not yet byte-matched for these).
-_SUPPORTED_OPS = {"add", "mul", "sub", "neg"}
+#   relu (unary) added 2026-07-13: single sfp.fminmax(MAX, S2=ZERO) = max(x,0), byte-matches
+#   the deeptools op_relu_5 golden; HW-verified single-stick, all 3 dispatch paths
+#   (relu([-4,-1,0,2,5])=[0,0,0,2,5], max_diff=0). Fixes the aten.relu→identity mis-map that
+#   was COPYING negatives (HW-confirmed COPIED_INPUT before the fix). Multi-stick relu stays
+#   xfail (same task-#12 num_cores>1 guard as neg — single-stick/single-core verified only).
+_SUPPORTED_OPS = {"add", "mul", "sub", "neg", "relu"}
 
 
 @requires_hw
