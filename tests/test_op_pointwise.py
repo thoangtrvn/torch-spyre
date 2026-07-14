@@ -60,6 +60,14 @@ def _small_pos(shape):
     return ((torch.arange(n, dtype=torch.int64) % 8 + 1).to(torch.float16).reshape(shape))
 
 
+def _signed_small(shape):
+    # DL16-exact values spanning negatives AND positives: (i%8)-4 → -4..3, so relu's
+    # max(x,0) clamp is genuinely exercised (roughly half the elements clamp to 0).
+    # int64 arange then cast (fp16 arange overflows to NaN at n>65504 — see _small_pos).
+    n = int(torch.tensor(shape).prod())
+    return ((torch.arange(n, dtype=torch.int64) % 8 - 4).to(torch.float16).reshape(shape))
+
+
 _UNARY_OPS = [
     # relu is BARE (no `x-4`): a fused sub+relu (`torch.relu(x-4)`) lowers to an
     # Inductor `maximum__` helper over a subf result — a MULTI-OP fused elementwise
@@ -125,37 +133,52 @@ def _check(op_id, out_dev, out_ref):
 #   tanh/sigmoid/sqrt need the FEST transcendental path. Marked xfail until built + HW-verified.
 #   The >8192-stick shapes (boundary=True) stay xfail on the LX-capacity /
 #   chunk-large-tensors gap regardless of op.
-#   NOTE: add/mul/sub are HW-verified only for the SINGLE-STICK path (s1x64); the multi-
-#   stick shapes stay xfail (looped-LDI burst path not yet byte-matched for these).
 #   relu (unary) added 2026-07-13: single sfp.fminmax(MAX, S2=ZERO) = max(x,0), byte-matches
-#   the deeptools op_relu_5 golden; HW-verified single-stick, all 3 dispatch paths
-#   (relu([-4,-1,0,2,5])=[0,0,0,2,5], max_diff=0). Fixes the aten.relu→identity mis-map that
-#   was COPYING negatives (HW-confirmed COPIED_INPUT before the fix). Multi-stick relu stays
-#   xfail (same task-#12 num_cores>1 guard as neg — single-stick/single-core verified only).
+#   the deeptools op_relu_5/op_relu_128_768 goldens. Fixes the aten.relu→identity mis-map that
+#   was COPYING negatives (HW-confirmed COPIED_INPUT before the fix).
+#   MULTI-STICK MULTI-CORE now HW-VERIFIED (2026-07-13, task #12 bug-3 fix, commit 5b59031):
+#   neg/relu at 128×768 (spc=48, 2 chunks), 128×4096 (8 chunks), 512×4096 all max_diff=0 on
+#   silicon. Root cause was the unary multi-chunk OUTPUT-STORE base offset (chunk LAR = raw
+#   cumulative, not output_base+cumulative → chunk>0 read the INPUT staging region and copied
+#   un-transformed input). So neg/relu are no longer single-stick-only.
 _SUPPORTED_OPS = {"add", "mul", "sub", "neg", "relu"}
+# Ops HW-verified across the MULTI-STICK shapes (not just s1x64), max_diff=0 on silicon:
+#   add/mul/sub — via the Fix A (unrolled) + Fix B (looped L3) chunked-prefill work
+#     (HW-verified 128×768, 512×4096, 2048×2048/4096 across 32 cores).
+#   neg/relu   — via the task-#12 bug-3 fix (2026-07-13, commit 5b59031).
+# i.e. EVERY currently-supported pointwise op works multi-stick multi-core. The only
+# remaining xfail is the boundary shape (2048×4096, LX-capacity — see `boundary` below).
+_MULTISTICK_VERIFIED_OPS = {"add", "mul", "sub", "neg", "relu"}
 
 
 @requires_hw
 @pytest.mark.parametrize("shape_id,M,N,boundary", _SHAPES, ids=[s[0] for s in _SHAPES])
 @pytest.mark.parametrize("op_id,fn", _UNARY_OPS, ids=[o[0] for o in _UNARY_OPS])
 def test_pointwise_unary(op_id, fn, shape_id, M, N, boundary):
-    """Unary pointwise op on device matches CPU across real transformer shapes."""
+    """Unary pointwise op on device matches CPU across real transformer shapes.
+
+    relu MUST see negatives to exercise the max(x,0) clamp (a positive-only input makes
+    relu a no-op and would NOT catch the identity-mis-map or the multi-chunk dropped-
+    compute bug). _signed_small provides them for relu; other unary ops keep _small_pos.
+    """
     if op_id not in _SUPPORTED_OPS:
         pytest.xfail(
             f"{op_id}: no HW-verified SFP binary yet — codegen fails loud "
             "(UnsupportedPointwiseOpError, Part A). Build+verify its binary to enable."
         )
-    if shape_id not in _SINGLE_STICK_SHAPES:
+    if shape_id not in _SINGLE_STICK_SHAPES and op_id not in _MULTISTICK_VERIFIED_OPS:
         pytest.xfail(
-            f"{op_id} {shape_id}: multi-stick path not yet HW-verified for unary ops "
-            "(neg is verified single-stick only; burst looped-LDI is a deferred divergence)."
+            f"{op_id} {shape_id}: multi-stick path not yet HW-verified for this unary op "
+            "(neg/relu ARE multi-stick-verified; others' burst looped-LDI is deferred)."
         )
     if boundary:
         pytest.xfail(
             f"{shape_id}: [{M},{N}] single-tile exceeds LX scratchpad (LBR0 pin) — "
             "needs tiling / chunk-large-tensors (tracked codegen follow-on)."
         )
-    x = _small_pos((M, N))
+    # relu needs signed input (clamp); build it WITHOUT an in-graph sub (fused sub+relu
+    # hits the separate generic-fused-elementwise classifier gap).
+    x = _signed_small((M, N)) if op_id == "relu" else _small_pos((M, N))
     out_dev = fn(x.to("spyre")).cpu()
     out_ref = fn(x)
     _check(op_id, out_dev, out_ref)
@@ -167,18 +190,17 @@ def test_pointwise_unary(op_id, fn, shape_id, M, N, boundary):
 def test_pointwise_binary(op_id, fn, shape_id, M, N, boundary):
     """Binary pointwise op on device matches CPU across real transformer shapes.
 
-    add/mul are HW-verified (byte-match the deeptools golden op_add layout).
-    sub/maximum fail loud until their SFP binaries are built (Part A guard).
+    add/mul/sub are HW-verified multi-stick multi-core (Fix A/B chunked-prefill:
+    128×768, 512×4096, 2048×2048/4096 all max_diff=0). maximum fails loud (no binary).
     """
     if op_id not in _SUPPORTED_OPS:
         pytest.xfail(
             f"{op_id}: no HW-verified SFP binary yet — codegen fails loud "
-            "(UnsupportedPointwiseOpError, Part A). sub/maximum tracked as follow-ons."
+            "(UnsupportedPointwiseOpError, Part A). maximum tracked as a follow-on."
         )
-    if shape_id not in _SINGLE_STICK_SHAPES:
+    if shape_id not in _SINGLE_STICK_SHAPES and op_id not in _MULTISTICK_VERIFIED_OPS:
         pytest.xfail(
-            f"{op_id} {shape_id}: multi-stick burst LXLU path not yet HW-verified "
-            "(single-stick add/mul are; burst looped-LDI is a deferred divergence)."
+            f"{op_id} {shape_id}: multi-stick path not yet HW-verified for this op."
         )
     if boundary:
         pytest.xfail(
