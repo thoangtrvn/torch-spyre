@@ -110,8 +110,18 @@ _APPROX_TOL = 2e-2
 # ttir_to_schedule._compute_tiling fails loud ("problem_dims have N=1") because it cannot
 # recover the true (M, N) under the regex TTIR backend. So torch-dispatched reductions
 # still don't produce output — they now fail at codegen tiling, not at Triton arg binding.
-_FRONTEND_WORKS = False  # Stage 1 (R0_BLOCK) fixed; Stage 2 (axis recovery, N=1) still open
-_FRONTEND_STAGE1_FIXED = True  # R0_BLOCK arg mismatch resolved (choices.py persistent-reduction gate)
+# #193 is a CHAIN of frontend gates. Fixed so far: stage 1 (R0_BLOCK arg mismatch,
+# choices.py) and stage 2 (mlir_text not threaded → recovery skipped; now passed from
+# backends/spyre/compiler.py). Recovery now returns the correct extents (reduced=8,
+# kept=64 for sum[8,64] dim=0). REMAINING stage 3: the axis ANALYZER mislabels the axis —
+# analyze_ttir returns reduce_axis=1 for a torch dim=0 reduction, so _compute_tiling flips
+# (M,N) to M=64,N=8 and resolve_reduction_tiling raises UnsupportedReduceAxisError (routes
+# a legitimately PER-LANE dim=0 reduction into the unsupported axis-1 / #173 path). The
+# generated kernel is genuinely per-lane (xindex=kept, r0=reduced), so this is an axis-
+# LABELING bug in _axis_from_row_stride_orientation, NOT the #173 cross-lane capability gap.
+_FRONTEND_WORKS = False  # stage 3 (axis mislabel) still open — see test_reduction_dim0 xfail
+_FRONTEND_STAGE1_FIXED = True   # R0_BLOCK arg mismatch (choices.py) — done
+_FRONTEND_STAGE2_FIXED = True   # mlir_text threading → recovery runs, extents correct — done
 _RAGGED_N_WORKS = False  # flip to True when the ragged-dim=0 reduction follow-on lands
 
 
@@ -129,11 +139,12 @@ def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, ragged):
     ALL shapes; ragged shapes additionally gated on the #180 ragged-N follow-on."""
     if not _FRONTEND_WORKS:
         pytest.xfail(
-            f"{op_id} {shape_id}: #193 stage 2 (axis recovery) — the R0_BLOCK arg "
-            "mismatch (stage 1) is FIXED so reductions now reach codegen, but Inductor "
-            "collapses the dim=0 kept-dim to N=1 and ttir_to_schedule._compute_tiling "
-            "fails loud ('problem_dims have N=1'). Recovering the true (M,N) needs the "
-            "libtriton structural walk (reduction-dim-recovery #193)."
+            f"{op_id} {shape_id}: #193 stage 3 (axis mislabel) — stages 1 (R0_BLOCK) and "
+            "2 (mlir_text→recovery) are fixed and the extents recover correctly, but "
+            "analyze_ttir labels a torch dim=0 reduction as reduce_axis=1, so "
+            "resolve_reduction_tiling raises UnsupportedReduceAxisError (routes a per-lane "
+            "dim=0 reduction into the unsupported axis-1 path). Axis-labeling bug in "
+            "_axis_from_row_stride_orientation, not the #173 cross-lane gap."
         )
     if ragged and not _RAGGED_N_WORKS:
         pytest.xfail(
@@ -159,7 +170,7 @@ def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     dropped/duplicated output lane shows as a nonzero max_diff. Guards the per-lane
     output layout once the frontend works. xfails on #193 until then."""
     if not _FRONTEND_WORKS:
-        pytest.xfail("#193 stage 2 (axis recovery, N=1) — see test_reduction_dim0.")
+        pytest.xfail("#193 stage 3 (axis mislabel: dim=0 → reduce_axis=1) — see test_reduction_dim0.")
     M, N = 8, 128
     x = _distinct_cols(M, N, cap=8)          # sum = 8 * (1..8) = 8..64, DL16-exact
     out_dev = fn(x.to("spyre")).cpu()
