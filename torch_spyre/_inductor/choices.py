@@ -71,10 +71,25 @@ class SpyreHeuristics(InductorChoices):
         that handles tiling decisions. Triton block sizes just need to be
         valid stick-aligned values so the Triton IR is well-formed.
 
-        Kernel types and their block size keys:
-        - Matmul (tl.dot): YBLOCK/R0_BLOCK/XBLOCK
-        - Reduction: XBLOCK/R0_BLOCK
-        - Pointwise: XBLOCK only
+        INVARIANT: the fixed_config must contain EXACTLY the *_BLOCK keys that the
+        generated kernel declares as constexpr parameters — no more, no fewer.
+        Triton's ASTSource binds each config key via `arg_names.index(key)`, so a key
+        the kernel does not declare raises `ValueError: '<KEY>' is not in list` (and a
+        missing required key would leave the block size unset). The concrete kernel does
+        not exist at this hook (kernel_cls is the CLASS, not an instance), so we cannot
+        read the signature directly — instead we predict the declared keys using
+        Inductor's OWN kernel-shape decision functions, which are the same calls that
+        determine the signature downstream (so they cannot drift from it).
+
+        Kernel types and the block keys their signature declares:
+        - Matmul (tl.dot): YBLOCK/R0_BLOCK/XBLOCK. Never persistent → all three always
+          declared.
+        - Reduction: XBLOCK always; R0_BLOCK ONLY when NOT persistent. A persistent
+          reduction (reduction extent fits one block) bakes R0_BLOCK as an in-body
+          `tl.constexpr` and does NOT declare it as a parameter — so R0_BLOCK is gated on
+          `should_use_persistent_reduction` (Inductor's own decision). Injecting it
+          unconditionally was the #193 'R0_BLOCK' is not in list break.
+        - Pointwise: XBLOCK only. Always blocked in x → XBLOCK always declared.
         """
         is_matmul = (features.is_reduction()
                      and hasattr(features, 'contains_op')
@@ -120,15 +135,29 @@ class SpyreHeuristics(InductorChoices):
                 })
 
         elif is_reduction:
-            # Reduction: XBLOCK + R0_BLOCK, both stick-aligned
+            # Reduction: XBLOCK always; R0_BLOCK ONLY for looped (non-persistent) kernels.
+            # Inductor generates two reduction kernel shapes:
+            #   - persistent (reduction extent fits one block): signature declares only
+            #     XBLOCK; R0_BLOCK is baked as an in-body `tl.constexpr` and is NOT a
+            #     kernel parameter. Injecting R0_BLOCK here makes Triton's ASTSource do
+            #     `arg_names.index("R0_BLOCK")` on a signature that lacks it →
+            #     `ValueError: 'R0_BLOCK' is not in list` (the #193 frontend break).
+            #   - looped (large reduction extent): signature declares BOTH XBLOCK and
+            #     R0_BLOCK (the `for r0_offset in range(...)` form) — R0_BLOCK is required.
+            # `should_use_persistent_reduction` is Inductor's own decision function
+            # (same one the codegen uses to pick the kernel shape), so this matches the
+            # generated signature exactly. cooperative_reduction=False: Spyre does not
+            # emit cooperative reductions.
             x_val = _resolve_dim("x") or 0
             r0_val = _resolve_dim("r0_") or 0
             problem_dims = {"X": x_val, "R0": r0_val}
 
-            kernel_kwargs["fixed_config"] = FixedTritonConfig({
-                "XBLOCK": elements_per_stick,
-                "R0_BLOCK": elements_per_stick,
-            })
+            persistent = self.should_use_persistent_reduction(
+                features, cooperative_reduction=False)
+            block_config = {"XBLOCK": elements_per_stick}
+            if not persistent:
+                block_config["R0_BLOCK"] = elements_per_stick
+            kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
 
         else:
             # Pointwise: XBLOCK only, stick-aligned

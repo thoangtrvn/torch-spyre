@@ -104,7 +104,14 @@ _APPROX_TOL = 2e-2
 # HW-verified via the direct scheduler path (resolve_reduction_tiling). These tests
 # therefore xfail on the FRONTEND until #193 lands; once it does, aligned shapes should
 # pass and only the ragged shapes should remain xfail (#180) until the ragged-N follow-on.
-_FRONTEND_WORKS = False  # flip to True when #193 (R0_BLOCK / mean recursion) is fixed
+# #193 has TWO stages. Stage 1 (R0_BLOCK arg mismatch) is FIXED — choices.py no longer
+# injects R0_BLOCK for persistent reductions, so reductions now reach the codegen backend.
+# Stage 2 (axis recovery) remains: Inductor collapses the dim=0 kept-dim to N=1, and
+# ttir_to_schedule._compute_tiling fails loud ("problem_dims have N=1") because it cannot
+# recover the true (M, N) under the regex TTIR backend. So torch-dispatched reductions
+# still don't produce output — they now fail at codegen tiling, not at Triton arg binding.
+_FRONTEND_WORKS = False  # Stage 1 (R0_BLOCK) fixed; Stage 2 (axis recovery, N=1) still open
+_FRONTEND_STAGE1_FIXED = True  # R0_BLOCK arg mismatch resolved (choices.py persistent-reduction gate)
 _RAGGED_N_WORKS = False  # flip to True when the ragged-dim=0 reduction follow-on lands
 
 
@@ -122,9 +129,11 @@ def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, ragged):
     ALL shapes; ragged shapes additionally gated on the #180 ragged-N follow-on."""
     if not _FRONTEND_WORKS:
         pytest.xfail(
-            f"{op_id} {shape_id}: torch reduction frontend broken (#193) — Inductor "
-            "lowering raises 'R0_BLOCK' is not in list (sum/max) / RecursionError (mean); "
-            "no reduction reaches codegen through torch yet."
+            f"{op_id} {shape_id}: #193 stage 2 (axis recovery) — the R0_BLOCK arg "
+            "mismatch (stage 1) is FIXED so reductions now reach codegen, but Inductor "
+            "collapses the dim=0 kept-dim to N=1 and ttir_to_schedule._compute_tiling "
+            "fails loud ('problem_dims have N=1'). Recovering the true (M,N) needs the "
+            "libtriton structural walk (reduction-dim-recovery #193)."
         )
     if ragged and not _RAGGED_N_WORKS:
         pytest.xfail(
@@ -150,7 +159,7 @@ def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     dropped/duplicated output lane shows as a nonzero max_diff. Guards the per-lane
     output layout once the frontend works. xfails on #193 until then."""
     if not _FRONTEND_WORKS:
-        pytest.xfail("reduction frontend broken (#193) — see test_reduction_dim0.")
+        pytest.xfail("#193 stage 2 (axis recovery, N=1) — see test_reduction_dim0.")
     M, N = 8, 128
     x = _distinct_cols(M, N, cap=8)          # sum = 8 * (1..8) = 8..64, DL16-exact
     out_dev = fn(x.to("spyre")).cpu()
