@@ -196,7 +196,9 @@ void SpyreAllocator::copy_data(void* dest, const void* src,
 }
 
 uint32_t SpyreAllocator::segmentForRegion(uint64_t region_id) const {
-  return getFlexAllocator()->segmentForRegion(region_id);
+  // flex removed FlexAllocator::segmentForRegion(region_id); resolve the region
+  // via the id->region map and read its segment id directly.
+  return getFlexAllocator()->getIdToRegionMap().at(region_id)->segment_id();
 }
 
 // Register our custom allocator

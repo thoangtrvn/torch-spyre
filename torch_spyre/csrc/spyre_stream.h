@@ -48,6 +48,12 @@ class SpyreStream {
   void executeProgramAsync(const KernelArtifacts& arts,
                            const std::vector<at::Tensor>& args) const;
 
+  // Device-side MEMORY_FILL DMA. Routes through flex::RuntimeStream::fillAsync,
+  // which performs the value->pattern conversion internally (no host buffer or
+  // H2D copy).
+  void fillAsync(const flex::CompositeAddress* dst, double value,
+                 DataFormats dtype, bool use_dmai = true) const;
+
   // Conversions
   c10::Stream unwrap() const;
 

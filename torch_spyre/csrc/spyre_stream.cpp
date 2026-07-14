@@ -199,6 +199,15 @@ flex::RuntimeStream* SpyreStream::resolveRuntimeHandle() const {
   return it->second;
 }
 
+void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
+                            DataFormats dtype, bool use_dmai) const {
+  // Device-side MEMORY_FILL DMA. flex::RuntimeStream::fillAsync converts the
+  // scalar value to the hardware fill pattern (via RuntimeOperationFill::
+  // valueToFillPattern) internally, so no FillParams construction is needed
+  // here.
+  getRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+}
+
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
                                 const flex::CompositeAddress* device_address,
                                 const DataConversionInfo* dci,
@@ -209,14 +218,17 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
 
-  // Create and launch operation
+  // Create and launch operation via flex's typed params API (the generic
+  // launchOperation(op) overload was removed from flex).
+  auto* params =
+      flex::createDmaParams(cpu_ptr, device_address->total_size(), host2device,
+                            device_address, std::move(dci_ptr));
   if (host2device) {
-    flex::RuntimeOperationH2D op(cpu_ptr, device_address, dci_ptr);
-    flex_stream->launchOperation(op);
+    flex_stream->launchOperationH2D(params);
   } else {
-    flex::RuntimeOperationD2H op(device_address, cpu_ptr, dci_ptr);
-    flex_stream->launchOperation(op);
+    flex_stream->launchOperationD2H(params);
   }
+  flex::destroyDmaParams(params);
 }
 
 void SpyreStream::executeProgramAsync(
@@ -230,14 +242,17 @@ void SpyreStream::executeProgramAsync(
     tensor_allocs.push_back(&ctx->composite_addr);
   }
 
-  // Program
+  // Program. Build via flex's typed params API (the generic
+  // launchOperation(op) overload and the RuntimeOperationCompute direct-launch
+  // ctor were removed from flex).
   auto* ctx = static_cast<SharedOwnerCtx*>(arts.device_alloc.get_context());
-  flex::RuntimeOperationCompute compute_op(
+  auto* params = flex::createComputeParams(
       &ctx->composite_addr, std::move(tensor_allocs), arts.bundle_mlir_path);
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
-  flex_stream->launchOperation(compute_op);
+  flex_stream->launchOperationCompute(params);
+  flex::destroyComputeParams(params);
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
@@ -332,11 +347,15 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
     idx = (idx + 1) % streams.size();
   }
 
-  // Create corresponding flex stream handle (if not exists)
+  // Create corresponding flex stream handle (if not exists). flex removed
+  // RuntimeContext::toPriority(int); map the torch priority (0=normal, <0=high)
+  // to the RuntimeStreamPriority enum directly.
   if (pool.stream_handle_map.find(stream_id) == pool.stream_handle_map.end()) {
     auto runtime = GlobalRuntime::get();
-    flex::RuntimeStream* flex_handle =
-        runtime->createStream(runtime->toPriority(priority));
+    flex::RuntimeStreamPriority stream_priority =
+        priority < 0 ? flex::RuntimeStreamPriority::HIGH
+                     : flex::RuntimeStreamPriority::NORMAL;
+    flex::RuntimeStream* flex_handle = runtime->createStream(stream_priority);
     pool.stream_handle_map[stream_id] = flex_handle;
   }
 
