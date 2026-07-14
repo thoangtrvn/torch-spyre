@@ -68,6 +68,28 @@ def _signed_small(shape):
     return ((torch.arange(n, dtype=torch.int64) % 8 - 4).to(torch.float16).reshape(shape))
 
 
+def _distinct_per_stick(shape, period, offset=0):
+    # DL16-exact operand whose value is DISTINCT PER STICK with a period that must NOT
+    # divide the 64-element stick width. This de-periodizes the operand so a per-stick /
+    # per-core FEED bug (a load pointer that doesn't advance across sticks/cores) is
+    # CAUGHT, not masked.
+    #
+    # WHY THIS EXISTS (task #33): the `_small_pos`/`_signed_small` builders use periods
+    # 8 and 4 — both DIVIDE the 64-element stick — so every stick carries identical
+    # values. A real sub bug (multi-core input_y PatchInit read `b` from stick 0 on every
+    # core → device computed a[stick] - b[stick % sticks_per_core]) was INVISIBLE to those
+    # operands and shipped as "HW-verified" until a de-periodized probe exposed it. Any
+    # period coprime-to-64 (7, 13, 20, …) makes value(stick s) = ((s % period) + 1 +
+    # offset), so a frozen/misindexed stick shows up as a nonzero max_diff. Result stays
+    # <= 1024 (DL16-exact). See codegen pointwise.md §12.
+    M, N = shape
+    n_sticks = (N + _EPS - 1) // _EPS
+    stick_of_col = torch.arange(N, dtype=torch.int64) // _EPS          # (N,) stick index
+    vals = (stick_of_col % period) + 1 + offset                        # distinct per stick
+    row = vals.to(torch.float16).unsqueeze(0)                          # (1, N)
+    return row.expand(M, N).contiguous()
+
+
 _UNARY_OPS = [
     # relu is BARE (no `x-4`): a fused sub+relu (`torch.relu(x-4)`) lowers to an
     # Inductor `maximum__` helper over a subf result — a MULTI-OP fused elementwise
@@ -143,11 +165,19 @@ def _check(op_id, out_dev, out_ref):
 #   un-transformed input). So neg/relu are no longer single-stick-only.
 _SUPPORTED_OPS = {"add", "mul", "sub", "neg", "relu"}
 # Ops HW-verified across the MULTI-STICK shapes (not just s1x64), max_diff=0 on silicon:
-#   add/mul/sub — via the Fix A (unrolled) + Fix B (looped L3) chunked-prefill work
+#   add/mul   — via the Fix A (unrolled) + Fix B (looped L3) chunked-prefill work
 #     (HW-verified 128×768, 512×4096, 2048×2048/4096 across 32 cores).
-#   neg/relu   — via the task-#12 bug-3 fix (2026-07-13, commit 5b59031).
-# i.e. EVERY currently-supported pointwise op works multi-stick multi-core. The only
-# remaining xfail is the boundary shape (2048×4096, LX-capacity — see `boundary` below).
+#   neg/relu  — via the task-#12 bug-3 fix (2026-07-13, commit 5b59031). neg/relu decode
+#     at full hidden width (1×4096) additionally needed the 2026-07-14 UR-unroll-alias
+#     emitter fix (commit 137ed55) — it HUNG before that (codegen pointwise.md §11).
+#   sub       — CORRECTED 2026-07-14 (task #33, commit 8fe89bb): sub multi-stick was
+#     silently WRONG until then — the per-core input_y (b) EAR1 PatchInit fold was gated
+#     to add/mul only, so every core read b from stick 0 (device computed
+#     a[stick]-b[stick % sticks_per_core]). The PERIODIC operands above (periods 8/4, both
+#     divide the 64-stick width) MASKED it — every stick was identical. Fixed + re-verified
+#     with distinct-per-stick operands (see test_pointwise_binary_distinct_per_stick, the
+#     de-periodized guard that catches this class). pointwise.md §12.
+# The only remaining xfail is the boundary shape (2048×4096, LX-capacity — see `boundary`).
 _MULTISTICK_VERIFIED_OPS = {"add", "mul", "sub", "neg", "relu"}
 
 
@@ -212,6 +242,49 @@ def test_pointwise_binary(op_id, fn, shape_id, M, N, boundary):
     out_dev = fn(a.to("spyre"), b.to("spyre")).cpu()
     out_ref = fn(a, b)
     _check(op_id, out_dev, out_ref)
+
+
+# --- de-periodized (distinct-per-stick) binary regression (task #33) ----------
+# Multi-stick binary shapes with operands whose per-stick period does NOT divide the
+# 64-element stick, so a per-stick / per-core input FEED bug is CAUGHT, not masked. This
+# is the guard that would have caught the sub input_y PatchInit bug (multi-core `b` read
+# from stick 0 → a[stick]-b[stick%sticks_per_core]); the periodic `_small_pos` operands
+# (periods 8/4, both divide 64) made every stick identical and hid it. See pointwise.md §12.
+#
+# NON-COMMUTATIVE op (sub) is essential: a+b/a*b absorb an operand swap/misfeed that a-b
+# cannot, so `sub` is the sensitive canary. Each op gets DISTINCT periods on the two
+# operands (both coprime-to-64) so neither a nor b can be silently frozen.
+_DEPERIODIZED_BINARY = [
+    ("add", lambda a, b: a + b),
+    ("mul", lambda a, b: a * b),
+    ("sub", lambda a, b: a - b),
+]
+_DEPERIODIZED_SHAPES = [
+    ("decode_1x4096", 1, 4096),     # M=1 wide → 32-core, small sticks-per-core
+    ("multi_128x4096", 128, 4096),  # multi-core multi-stick prefill chunk
+]
+
+
+@requires_hw
+@pytest.mark.parametrize("shape_id,M,N", _DEPERIODIZED_SHAPES, ids=[s[0] for s in _DEPERIODIZED_SHAPES])
+@pytest.mark.parametrize("op_id,fn", _DEPERIODIZED_BINARY, ids=[o[0] for o in _DEPERIODIZED_BINARY])
+def test_pointwise_binary_distinct_per_stick(op_id, fn, shape_id, M, N):
+    """Binary op with distinct-per-stick operands (period coprime-to-64) must be exact.
+
+    Guards against per-stick/per-core feed bugs that periodic operands mask. a: period 20,
+    b: period 7 — both coprime to the 64-stick width, and mul stays <= 20*7=140 <= 1024
+    (DL16-exact), sub result in [-6, 19], add in [2, 27] — all DL16-exact.
+    """
+    a = _distinct_per_stick((M, N), period=20)   # 1..20 per stick
+    b = _distinct_per_stick((M, N), period=7)     # 1..7 per stick
+    out_dev = fn(a.to("spyre"), b.to("spyre")).cpu()
+    out_ref = fn(a, b)
+    md = (out_dev - out_ref).abs().max().item()
+    assert md == 0.0, (
+        f"{op_id} {shape_id} distinct-per-stick: max_diff={md} (expected 0.0). "
+        "A nonzero diff here means an operand's per-stick/per-core feed is frozen or "
+        "misindexed (the task-#33 sub PatchInit bug class)."
+    )
 
 
 # ---------------------------------------------------------------------------
