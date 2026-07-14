@@ -65,6 +65,19 @@ def _distinct_cols(M, N, cap=8):
     return cols.unsqueeze(0).expand(M, N).contiguous()
 
 
+def _max_known_answer(M, N):
+    # Strong MAX gate: values increase down the rows so the per-column max sits at the
+    # LAST row (row M-1), and each column's max is distinct = (col%8)+2. A wrong FMINMAX
+    # combine (keeps an earlier/wrong row), a dropped input stick, or a frozen lane all
+    # change the max → nonzero max_diff. DL16-exact (values <= M+8 <= 1024 for these M).
+    #   x[r, c] = (c % 8) + 1 + (r / M)  is NOT DL16-clean; instead use integer steps:
+    #   x[r, c] = (c % 8) + 1 + r   → per-column max at r=M-1 = (c%8)+1+(M-1), distinct per col.
+    rows = torch.arange(M, dtype=torch.int64).unsqueeze(1)          # (M,1)
+    cols = (torch.arange(N, dtype=torch.int64) % 8).unsqueeze(0)    # (1,N)
+    x = (cols + 1 + rows)                                            # (M,N), max down rows at M-1
+    return x.to(torch.float16)
+
+
 # --- op table: (id, torch fn dim=0, reference fn, exact?) ---------------------
 def _sum0(t):
     return torch.sum(t, dim=0)
@@ -85,25 +98,44 @@ _REDUCTION_OPS = [
 ]
 
 # Which reduction ops reach a working codegen binary today (dim=0, per-lane path).
-# Only `sum` is end-to-end HW-verified (max_diff=0). `max` and `mean` fail for OP-SPECIFIC
-# reasons UNRELATED to the reduce-axis path (they share the same stick-native classifier
-# that `sum` proves correct):
-#   - max : torch.max(dim) decomposes to an `amax` whose compare is not a registered SFP
-#           op → the classifier tags it `pointwise_unsupported` (fails loud at the pointwise
-#           guard, not the reduction path). Needs a max-reduction SFP binary (FMINMAX).
+# `sum` and `max` are end-to-end HW-verified (max_diff=0). `mean` still fails for an
+# OP-SPECIFIC reason unrelated to the reduce-axis path:
+#   - max : FIXED (task #52) — torch.max(dim) lowers via @torch._inductor.runtime.
+#           triton_helpers.max2 (a tl.reduce over the elementwise `maximum` combine). The
+#           classifier now keys on the tt.call BASE name (max/max2/amax → "max"), robust to
+#           the module-path churn that had made it fall through to pointwise_unsupported.
+#           Routes to max_nonstick (PE FMINMAX); shares sum's stick-native axis path.
 #   - mean: torch.mean lowering hits a RecursionError in the Inductor decomposition
-#           (mean = sum / count) before reaching codegen. Separate frontend issue.
-_REDUCTION_OP_HW_VERIFIED = {"sum"}
+#           (mean = sum / count) before reaching codegen. Separate frontend issue (#53).
+_REDUCTION_OP_HW_VERIFIED = {"sum", "max"}
 
-# (id, M, N, ragged?) — dim=0 reductions. N drives output width (sticks); M is the
-# reduced extent. Aligned N ∈ {64, 128}; ragged N ∈ {100, 40, 5}.
+# (id, M, N, ragged?) — dim=0 reductions. N (last dim) is the CONTIGUOUS/stick axis and
+# drives the output width in sticks = ceil(N/64); M is the reduced extent (rows). Aligned
+# N is a multiple of 64; ragged N is not. Full expected-pass sweep for the supported ops
+# (sum/max): vary M (reduced extent) AND N (output-stick count, incl. real-model hidden
+# widths) so a shape-specific datapath bug — a dropped output stick, a per-core split issue
+# at many output sticks, an M-loop-count error — is CAUGHT, not assumed away. DL16-exact:
+# sum=M and max=(N-col)+M-1 stay <= 1024 for these M (<=512).
+# regime: "" = supported (expected pass), "ragged" = #180, "regimeB" = #183 (single output
+# stick with M>64 → reduce-axis split across cores, cross-core combine NOT built).
 _SHAPES = [
-    ("m8_n64",       8,   64,   False),   # 1 output stick, aligned
-    ("m8_n128",      8,   128,  False),   # 2 output sticks, aligned
-    ("m64_n64",      64,  64,   False),   # larger reduced extent
-    ("m8_n100",      8,   100,  True),    # N>eps ragged (1 full + 36 tail)
-    ("m8_n40",       8,   40,   True),    # N<eps sub-stick
-    ("m8_n5",        8,   5,    True),    # tiny sub-stick
+    # --- aligned N, small output (1 stick), vary the reduced extent M (M<=64: single-core) ---
+    ("m1_n64",       1,   64,   ""),        # M=1 (single reduced row) — decode-like
+    ("m8_n64",       8,   64,   ""),        # 1 output stick
+    ("m32_n64",      32,  64,   ""),
+    ("m64_n64",      64,  64,   ""),        # M=64: single-core envelope boundary
+    ("m512_n64",     512, 64,   "regimeB"), # M>64, 1 output stick → Regime B (#183), fail-loud
+    # --- aligned N, multi output stick (output core-split regime), vary N width ---
+    ("m8_n128",      8,   128,  ""),        # 2 output sticks
+    ("m8_n256",      8,   256,  ""),        # 4 output sticks
+    ("m8_n512",      8,   512,  ""),        # 8 output sticks
+    ("m8_n768",      8,   768,  ""),        # GPT-2 hidden (12 sticks)
+    ("m32_n2048",    32,  2048, ""),        # Llama-2B hidden (32 sticks) × real M
+    ("m8_n4096",     8,   4096, ""),        # Llama/Mistral hidden (64 sticks)
+    # --- ragged / sub-stick N (gated on #180 until the ragged-N follow-on) ---
+    ("m8_n100",      8,   100,  "ragged"),  # N>eps ragged (1 full + 36 tail)
+    ("m8_n40",       8,   40,   "ragged"),  # N<eps sub-stick
+    ("m8_n5",        8,   5,    "ragged"),  # tiny sub-stick
 ]
 
 _APPROX_TOL = 2e-2
@@ -140,28 +172,35 @@ def _check(op_id, exact, out_dev, out_ref):
 
 
 @requires_hw
-@pytest.mark.parametrize("shape_id,M,N,ragged", _SHAPES, ids=[s[0] for s in _SHAPES])
+@pytest.mark.parametrize("shape_id,M,N,regime", _SHAPES, ids=[s[0] for s in _SHAPES])
 @pytest.mark.parametrize("op_id,fn,exact", _REDUCTION_OPS, ids=[o[0] for o in _REDUCTION_OPS])
-def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, ragged):
-    """dim=0 (per-lane, across-stick) reduction on device matches CPU. sum is end-to-end
-    HW-verified; max/mean xfail for op-specific reasons (not the reduce-axis path); ragged
-    shapes gated on the #180 ragged-N follow-on."""
+def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, regime):
+    """dim=0 (per-lane, across-stick) reduction on device matches CPU across a full M×N
+    sweep (reduced extent M ∈ 1..512; output width N up to real-model hidden 4096). sum and
+    max are end-to-end HW-verified; mean xfails (op-specific); ragged N (#180) and Regime B
+    (#183) shapes fail loud and are gated as xfail."""
     if op_id not in _REDUCTION_OP_HW_VERIFIED:
         pytest.xfail(
-            f"{op_id}: dim=0 axis path works (sum proves it — same classifier), but {op_id} "
-            "fails for an OP-SPECIFIC reason: max → torch.max decomposes to an amax the "
-            "classifier tags pointwise_unsupported (needs a FMINMAX max-reduction binary); "
-            "mean → RecursionError in the Inductor mean=sum/count decomposition. Separate "
-            "follow-ons, NOT the #193 reduce-axis gap."
+            f"{op_id}: dim=0 axis path works (sum/max prove it — same classifier), but "
+            f"{op_id} fails for an OP-SPECIFIC reason: mean → RecursionError in the Inductor "
+            "mean=sum/count decomposition (#53). NOT the reduce-axis gap."
         )
-    if ragged and not _RAGGED_N_WORKS:
+    if regime == "ragged" and not _RAGGED_N_WORKS:
         pytest.xfail(
             f"{op_id} {shape_id}: ragged/sub-stick N not yet supported for reductions "
             "(#180). dim=0 is per-lane so the tail is inert (like pointwise); ceil "
-            "follow-on pending after #193."
+            "follow-on pending."
         )
-    # Keep the reduced result DL16-exact: all-ones → sum=M (<=1024 for these M).
-    x = _ones_like_small(M, N)
+    if regime == "regimeB":
+        pytest.xfail(
+            f"{op_id} {shape_id}: single output stick (N<=64) with M>64 is Regime B — the "
+            "reduce axis is split across cores needing a cross-core datafifo combine, NOT "
+            "built (#183). Fails loud (UnsupportedReductionShapeError), never silent-wrong."
+        )
+    # Known-answer operand, DL16-exact. sum/mean: all-ones (sum=M<=1024). max: increasing
+    # down rows so the per-column max is a distinct value at the last row — a wrong FMINMAX
+    # combine or dropped stick shows as nonzero max_diff (the FMINMAX-correctness gate).
+    x = _max_known_answer(M, N) if op_id == "max" else _ones_like_small(M, N)
     out_dev = fn(x.to("spyre")).cpu()
     out_ref = fn(x)
     assert out_dev.shape == out_ref.shape, (
@@ -184,6 +223,21 @@ def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     out_dev = fn(x.to("spyre")).cpu()
     out_ref = fn(x)
     _check(op_id, exact, out_dev, out_ref)
+
+
+@requires_hw
+def test_elementwise_maximum_is_not_a_reduction():
+    """Routing guard for the max2/maximum distinction (task #52). torch.maximum(a,b) is
+    ELEMENTWISE (two tensors) and uses the `maximum__` combine helper — NOT the `max2__`
+    reduction. It has no verified SFP binary, so it must STILL fail loud
+    (pointwise_unsupported), never be mis-routed to max_nonstick (which would compute a
+    reduction over a binary elementwise op → wrong output). A regression that made the
+    reduction classifier match `maximum` would silently break this."""
+    import pytest as _pt
+    a = _ones_like_small(8, 64)
+    b = _ones_like_small(8, 64) * 2
+    with _pt.raises(Exception):  # UnsupportedPointwiseOpError surfaces as InductorError on compile
+        torch.maximum(a.to("spyre"), b.to("spyre")).cpu()
 
 
 @requires_hw
