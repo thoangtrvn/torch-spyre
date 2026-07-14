@@ -131,7 +131,18 @@ class LoopSpec:
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    return torch.tensor(const_val, dtype=dtype).to(device)
+    # Materialize the scalar constant with a device-side MEMORY_FILL DMA instead
+    # of torch.tensor(v).to(device). The .to() path is a host->device copy that
+    # IOMMU-maps the host buffer per call (each map/unmap costs ~2-3 ms in
+    # profiles, and adds IOVA-mapping pressure); fill_tensor writes the pattern
+    # directly on-device with no host buffer and no IOMMU mapping. Constants are
+    # emitted per compiled block and re-run every layer/token, so this removes a
+    # per-constant H2D map from the hot path.
+    import torch_spyre
+
+    t = torch.empty((), dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, float(const_val))
+    return t
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:
