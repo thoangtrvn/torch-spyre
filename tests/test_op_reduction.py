@@ -84,6 +84,17 @@ _REDUCTION_OPS = [
     ("mean", _mean0, False),  # mean divides → allow small DL16 tol
 ]
 
+# Which reduction ops reach a working codegen binary today (dim=0, per-lane path).
+# Only `sum` is end-to-end HW-verified (max_diff=0). `max` and `mean` fail for OP-SPECIFIC
+# reasons UNRELATED to the reduce-axis path (they share the same stick-native classifier
+# that `sum` proves correct):
+#   - max : torch.max(dim) decomposes to an `amax` whose compare is not a registered SFP
+#           op → the classifier tags it `pointwise_unsupported` (fails loud at the pointwise
+#           guard, not the reduction path). Needs a max-reduction SFP binary (FMINMAX).
+#   - mean: torch.mean lowering hits a RecursionError in the Inductor decomposition
+#           (mean = sum / count) before reaching codegen. Separate frontend issue.
+_REDUCTION_OP_HW_VERIFIED = {"sum"}
+
 # (id, M, N, ragged?) — dim=0 reductions. N drives output width (sticks); M is the
 # reduced extent. Aligned N ∈ {64, 128}; ragged N ∈ {100, 40, 5}.
 _SHAPES = [
@@ -106,22 +117,19 @@ _APPROX_TOL = 2e-2
 # pass and only the ragged shapes should remain xfail (#180) until the ragged-N follow-on.
 # #193 has TWO stages. Stage 1 (R0_BLOCK arg mismatch) is FIXED — choices.py no longer
 # injects R0_BLOCK for persistent reductions, so reductions now reach the codegen backend.
-# Stage 2 (axis recovery) remains: Inductor collapses the dim=0 kept-dim to N=1, and
-# ttir_to_schedule._compute_tiling fails loud ("problem_dims have N=1") because it cannot
-# recover the true (M, N) under the regex TTIR backend. So torch-dispatched reductions
-# still don't produce output — they now fail at codegen tiling, not at Triton arg binding.
-# #193 is a CHAIN of frontend gates. Fixed so far: stage 1 (R0_BLOCK arg mismatch,
-# choices.py) and stage 2 (mlir_text not threaded → recovery skipped; now passed from
-# backends/spyre/compiler.py). Recovery now returns the correct extents (reduced=8,
-# kept=64 for sum[8,64] dim=0). REMAINING stage 3: the axis ANALYZER mislabels the axis —
-# analyze_ttir returns reduce_axis=1 for a torch dim=0 reduction, so _compute_tiling flips
-# (M,N) to M=64,N=8 and resolve_reduction_tiling raises UnsupportedReduceAxisError (routes
-# a legitimately PER-LANE dim=0 reduction into the unsupported axis-1 / #173 path). The
-# generated kernel is genuinely per-lane (xindex=kept, r0=reduced), so this is an axis-
-# LABELING bug in _axis_from_row_stride_orientation, NOT the #173 cross-lane capability gap.
-_FRONTEND_WORKS = False  # stage 3 (axis mislabel) still open — see test_reduction_dim0 xfail
-_FRONTEND_STAGE1_FIXED = True   # R0_BLOCK arg mismatch (choices.py) — done
-_FRONTEND_STAGE2_FIXED = True   # mlir_text threading → recovery runs, extents correct — done
+# #193 was a CHAIN of frontend gates, ALL now fixed for the dim=0 per-lane path:
+#   stage 1 — R0_BLOCK arg mismatch (choices.py: no R0_BLOCK for persistent reductions).
+#   stage 2 — mlir_text not threaded → axis recovery skipped (backends/spyre/compiler.py
+#             now passes mlir_text=ttir_text; recover_reduction_dims returns correct extents).
+#   stage 3 — axis MISLABEL: analyze_ttir returned the BLOCK trailing axis (r0=1) for a torch
+#             dim=0 reduction. Fixed STICK-NATIVELY: reduced_axis_is_across_stick() reads the
+#             load-stride arithmetic (reduced axis strided → across-stick → per-lane → axis 0;
+#             reduced axis contiguous → within-stick → #173). _compute_tiling uses it and the
+#             tiling's reduce_axis is no longer clobbered by the stale block axis.
+# RESULT: torch.sum(dim=0) is end-to-end HW-verified (max_diff=0). dim=1/within-stick still
+# fails loud (#173). max/mean fail for OP-SPECIFIC reasons (see _REDUCTION_OP_HW_VERIFIED),
+# NOT the axis path.
+_FRONTEND_WORKS = True   # stages 1+2+3 fixed for the dim=0 per-lane reduction path
 _RAGGED_N_WORKS = False  # flip to True when the ragged-dim=0 reduction follow-on lands
 
 
@@ -135,16 +143,16 @@ def _check(op_id, exact, out_dev, out_ref):
 @pytest.mark.parametrize("shape_id,M,N,ragged", _SHAPES, ids=[s[0] for s in _SHAPES])
 @pytest.mark.parametrize("op_id,fn,exact", _REDUCTION_OPS, ids=[o[0] for o in _REDUCTION_OPS])
 def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, ragged):
-    """dim=0 reduction on device matches CPU. Currently xfails on the #193 frontend for
-    ALL shapes; ragged shapes additionally gated on the #180 ragged-N follow-on."""
-    if not _FRONTEND_WORKS:
+    """dim=0 (per-lane, across-stick) reduction on device matches CPU. sum is end-to-end
+    HW-verified; max/mean xfail for op-specific reasons (not the reduce-axis path); ragged
+    shapes gated on the #180 ragged-N follow-on."""
+    if op_id not in _REDUCTION_OP_HW_VERIFIED:
         pytest.xfail(
-            f"{op_id} {shape_id}: #193 stage 3 (axis mislabel) — stages 1 (R0_BLOCK) and "
-            "2 (mlir_text→recovery) are fixed and the extents recover correctly, but "
-            "analyze_ttir labels a torch dim=0 reduction as reduce_axis=1, so "
-            "resolve_reduction_tiling raises UnsupportedReduceAxisError (routes a per-lane "
-            "dim=0 reduction into the unsupported axis-1 path). Axis-labeling bug in "
-            "_axis_from_row_stride_orientation, not the #173 cross-lane gap."
+            f"{op_id}: dim=0 axis path works (sum proves it — same classifier), but {op_id} "
+            "fails for an OP-SPECIFIC reason: max → torch.max decomposes to an amax the "
+            "classifier tags pointwise_unsupported (needs a FMINMAX max-reduction binary); "
+            "mean → RecursionError in the Inductor mean=sum/count decomposition. Separate "
+            "follow-ons, NOT the #193 reduce-axis gap."
         )
     if ragged and not _RAGGED_N_WORKS:
         pytest.xfail(
@@ -167,10 +175,10 @@ def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, ragged):
 @pytest.mark.parametrize("op_id,fn,exact", _REDUCTION_OPS, ids=[o[0] for o in _REDUCTION_OPS])
 def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     """Distinct-per-column operands at an aligned multi-stick width (N=128, M=8): a
-    dropped/duplicated output lane shows as a nonzero max_diff. Guards the per-lane
-    output layout once the frontend works. xfails on #193 until then."""
-    if not _FRONTEND_WORKS:
-        pytest.xfail("#193 stage 3 (axis mislabel: dim=0 → reduce_axis=1) — see test_reduction_dim0.")
+    dropped/duplicated output lane shows as a nonzero max_diff. Guards the per-lane output
+    layout. sum is HW-verified; max/mean xfail for op-specific reasons (see test_reduction_dim0)."""
+    if op_id not in _REDUCTION_OP_HW_VERIFIED:
+        pytest.xfail(f"{op_id}: op-specific gap (not the reduce-axis path) — see test_reduction_dim0.")
     M, N = 8, 128
     x = _distinct_cols(M, N, cap=8)          # sum = 8 * (1..8) = 8..64, DL16-exact
     out_dev = fn(x.to("spyre")).cpu()
