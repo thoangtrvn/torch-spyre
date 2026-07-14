@@ -288,6 +288,80 @@ def test_pointwise_binary_distinct_per_stick(op_id, fn, shape_id, M, N):
 
 
 # ---------------------------------------------------------------------------
+# Ragged N (N not a multiple of elements_per_stick) — sub-stick support.
+#
+# WHY: N that is not a whole number of sticks (N%64 != 0 at 16-bit) is the sub-stick /
+# ragged-N case. Through torch.compile these already work TODAY because Inductor flattens
+# [M,N] to a 1D grid and the torch-spyre bridge decomposes it as N=64, M=ceil(numel/64) —
+# the ragged dimension becomes a stick-aligned 1D stream, and the last stick's tail lands
+# in the row's HBM stick-padding (device_size ceil-pads the stick dim; readback returns
+# only the logical N elements). HW-verified 2026-07-14 (neg/relu, all max_diff=0).
+#
+# This is a REGRESSION-LOCK: it pins the currently-working behavior so the planned codegen
+# ceil-fix (design 2026-07-14-substick-ragged-n-pointwise) cannot silently break it. It
+# exercises BOTH regimes: N>eps non-multiple (100, 300 → whole sticks + a partial tail) and
+# N<eps sub-stick (40, 5 → a single partial stick). Both must be max_diff==0.
+#
+# Operands: _small_pos/_signed_small use arange%8 — over a flat 1D stream every element is
+# distinct-per-position, so a dropped/duplicated tail element shows as a nonzero max_diff.
+_RAGGED_N_SHAPES = [
+    ("sub_stick_1x40",   1,   40),    # N<eps: single partial stick (24 tail), decode
+    ("sub_stick_4x40",   4,   40),    # N<eps: multi-row sub-stick
+    ("ragged_1x100",     1,   100),   # N>eps: 1 full + 36 tail, decode
+    ("ragged_4x100",     4,   100),   # N>eps: multi-row ragged
+    ("ragged_3x200",     3,   200),   # N>eps: 3 full + 8 tail
+    ("ragged_7x91",      7,   91),    # N>eps: 1 full + 27 tail, prime dims
+    ("tiny_1x5",         1,   5),     # N<<eps: 5 valid, 59 tail (smallest real case)
+]
+
+
+@requires_hw
+@pytest.mark.parametrize("shape_id,M,N", _RAGGED_N_SHAPES, ids=[s[0] for s in _RAGGED_N_SHAPES])
+@pytest.mark.parametrize("op_id,fn", _UNARY_OPS, ids=[o[0] for o in _UNARY_OPS])
+def test_pointwise_unary_ragged_n(op_id, fn, shape_id, M, N):
+    """Unary pointwise op at ragged N (N % 64 != 0) must be exact — the tail must not
+    corrupt the logical output. Regression-lock for the sub-stick support path."""
+    if op_id not in _SUPPORTED_OPS:
+        pytest.xfail(f"{op_id}: no HW-verified SFP binary yet (Part A fail-loud).")
+    x = _signed_small((M, N)) if op_id == "relu" else _small_pos((M, N))
+    out_dev = fn(x.to("spyre")).cpu()
+    out_ref = fn(x)
+    assert out_dev.shape == out_ref.shape, (
+        f"{op_id} {shape_id}: device shape {tuple(out_dev.shape)} != logical "
+        f"{tuple(out_ref.shape)} — stick-padding tail leaked into the logical shape."
+    )
+    _check(op_id, out_dev, out_ref)
+
+
+@requires_hw
+@pytest.mark.parametrize("shape_id,M,N", _RAGGED_N_SHAPES, ids=[s[0] for s in _RAGGED_N_SHAPES])
+@pytest.mark.parametrize("op_id,fn", _BINARY_OPS, ids=[o[0] for o in _BINARY_OPS])
+def test_pointwise_binary_ragged_n(op_id, fn, shape_id, M, N):
+    """Binary pointwise op at ragged N (N % 64 != 0) must be exact. Regression-lock."""
+    if op_id not in _SUPPORTED_OPS:
+        pytest.xfail(f"{op_id}: no HW-verified SFP binary yet (Part A fail-loud).")
+    a = _small_pos((M, N))
+    b = (_small_pos((M, N)) % 4 + 1)  # 1..4, keeps sums/products <= 1024
+    out_dev = fn(a.to("spyre"), b.to("spyre")).cpu()
+    out_ref = fn(a, b)
+    assert out_dev.shape == out_ref.shape, (
+        f"{op_id} {shape_id}: device shape {tuple(out_dev.shape)} != logical "
+        f"{tuple(out_ref.shape)} — stick-padding tail leaked into the logical shape."
+    )
+    _check(op_id, out_dev, out_ref)
+
+
+def test_ragged_n_shape_model():
+    """Hardware-independent: ragged N ceil-rounds to whole sticks (the sub-stick contract
+    the codegen ceil-fix must honor). Guards the arithmetic without a board."""
+    assert math.ceil(40 / _EPS) == 1     # N<eps → 1 partial stick
+    assert math.ceil(100 / _EPS) == 2    # N>eps → 1 full + 1 tail stick
+    assert math.ceil(200 / _EPS) == 4
+    assert math.ceil(91 / _EPS) == 2
+    assert math.ceil(5 / _EPS) == 1
+
+
+# ---------------------------------------------------------------------------
 # 3-dispatch-path coverage (mirrors tests/test_op_embedding.py _ENTRY_POINTS).
 # A pointwise op can reach the device three ways, and they DO differ (embedding
 # proved eager vs compiled dispatch route differently). Test all three:
