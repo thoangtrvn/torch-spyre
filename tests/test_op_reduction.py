@@ -105,9 +105,16 @@ _REDUCTION_OPS = [
 #           classifier now keys on the tt.call BASE name (max/max2/amax → "max"), robust to
 #           the module-path churn that had made it fall through to pointwise_unsupported.
 #           Routes to max_nonstick (PE FMINMAX); shares sum's stick-native axis path.
-#   - mean: torch.mean lowering hits a RecursionError in the Inductor decomposition
-#           (mean = sum / count) before reaching codegen. Separate frontend issue (#53).
-_REDUCTION_OP_HW_VERIFIED = {"sum", "max"}
+#   - mean: FIXED (task #53) — a Spyre decomposition registers aten.mean.dim →
+#           sum(dim) * (1/count), a MULTIPLY by a compile-time constant. On the live
+#           Triton path Inductor's default split emitted sum + a divf-by-count kernel
+#           (divf → pointwise_unsupported); folding the reciprocal makes the trailing
+#           kernel the SCALAR-AFFINE mul (HW-verified #56), and registering the decomp
+#           also kills the aten.mean.dim fallback → eager-wrap RecursionError. See
+#           torch_spyre/_inductor/decompositions.py::mean_dim_decomp. Result carries the
+#           DL16 reciprocal tolerance (exact=False, _APPROX_TOL) — 1/count is DL16-exact
+#           only for power-of-2 count; all non-ragged mean shapes here use M∈{1,8,32,64}.
+_REDUCTION_OP_HW_VERIFIED = {"sum", "max", "mean"}  # mean: #53 aten.mean.dim → sum*(1/M) decomp
 
 # (id, M, N, ragged?) — dim=0 reductions. N (last dim) is the CONTIGUOUS/stick axis and
 # drives the output width in sticks = ceil(N/64); M is the reduced extent (rows). Aligned

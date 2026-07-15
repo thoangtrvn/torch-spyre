@@ -441,6 +441,50 @@ def addmm_decomp(
     return result
 
 
+@register_spyre_decomposition([torch.ops.aten.mean.dim])
+def mean_dim_decomp(
+    input: torch.Tensor,
+    dim,
+    keepdim: bool = False,
+    *,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Decompose mean(dim) into sum(dim) * (1/count) — a MULTIPLY, not a divide.
+
+    Why this decomposition (task #53): on the live torch.compile→Triton path,
+    ``aten.mean.dim`` is in ``lowering._TRITON_INCOMPATIBLE_LOWERINGS``, so the
+    dedicated ``lower_mean`` (SpyreReduction "mean") does NOT fire. Inductor's
+    DEFAULT decomposition splits mean into a ``sum`` reduction (HW-verified) plus a
+    trailing ``divf``-by-count kernel — and ``divf`` classifies as
+    ``pointwise_unsupported`` in the codegen (no divide datapath). By folding the
+    reciprocal at compile time and emitting ``sum * (1/count)`` (an ``arith.mulf``
+    by a compile-time constant), the trailing kernel becomes the SCALAR-AFFINE
+    ``mul`` subform, which is HW-verified single- and multi-stick (#56, Stages
+    1/2/3). Registering this decomp ALSO stops Inductor emitting the
+    ``aten.mean.dim`` fallback that otherwise re-dispatches through the eager
+    torch.compile wrap → infinite recursion (the "RecursionError" symptom); one
+    change closes both failure modes.
+
+    This is a plain-aten decomposition (emits ``sum`` + ``mul``, no ``spyre.*``
+    custom op), so it is NOT in ``_TRITON_INCOMPATIBLE_DECOMPOSITIONS`` and DOES
+    fire on the Triton path — exactly where the default sum+div split was losing.
+
+    ⚠️ DL16 precision: ``1/count`` is DL16-exact only for power-of-2 ``count``
+    (e.g. count=8→0.125, 512→2^-9). For a non-power-of-2 reduced extent the scale
+    is inexact and the result carries the scalar-affine round-to-nearest tolerance
+    (scalar-affine.md §6c), not ``max_diff=0``. This matches ``torch.mean``'s own
+    fp16 behaviour (it also scales by a rounded reciprocal), so it is a precision
+    property, not a correctness bug.
+    """
+    dims = (dim,) if isinstance(dim, int) else tuple(dim)
+    summed = torch.sum(input, dim=dims, keepdim=keepdim, dtype=dtype)
+    size = input.shape
+    count = 1
+    for d in dims:
+        count *= size[d]
+    return summed * (1.0 / count)
+
+
 ###############################################################################################
 ##                           Spyre decompositions for aten ops                               ##
 ###############################################################################################
