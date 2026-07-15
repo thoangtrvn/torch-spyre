@@ -22,6 +22,7 @@
 #include <chrono>
 #include <spyre_comms.hpp>
 #include <string>
+#include <thread>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <torch/csrc/distributed/c10d/Types.hpp>
@@ -213,7 +214,12 @@ class SpyreCCLBackend : public c10d::Backend {
   // (which calls finalize_library() in its destructor).
   flex::RuntimeStream* comm_stream_ = nullptr;
   std::atomic<uint64_t> seq_{0};
-  // Set by abort()/shutdown(); once true no further collectives are launched.
+  // Set by abort()/shutdown(), OR by report_and_abort() when this rank's own
+  // collective throws, OR by the watchdog thread when a peer's failure is
+  // observed via the Store. Once true no further collectives are launched
+  // (abort_guard) -- a permanent, one-way ratchet for the lifetime of this
+  // backend, matching ProcessGroupNCCL: a faulted communicator is never
+  // revived.
   std::atomic<bool> aborted_{false};
   // The process-group timeout from init_process_group(timeout=...), captured at
   // construction and used as the default deadline for Work::wait() when the
@@ -221,6 +227,16 @@ class SpyreCCLBackend : public c10d::Backend {
   // "block indefinitely" (no PG timeout configured). Immutable after
   // construction, so no synchronization is needed to read it.
   const std::chrono::milliseconds op_timeout_;
+
+  // Retained from the constructor (previously discarded) for the cross-rank
+  // fail-fast watchdog: a rank writes its own failure here so peers'
+  // watchdog_loop() threads can detect it and abort promptly, instead of
+  // sitting blocked until an unrelated subsystem's own timeout fires. See
+  // report_and_abort()/watchdog_loop() and
+  // flex-opensource/docs/process-group-fail-fast-investigation.md (Phase 1a).
+  c10::intrusive_ptr<::c10d::Store> store_;
+  std::thread watchdog_thread_;
+  std::atomic<bool> watchdog_stop_{false};
 
   [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
       const at::Tensor& input_tensor);
@@ -237,6 +253,22 @@ class SpyreCCLBackend : public c10d::Backend {
   // Throws if abort()/shutdown() has been called, preventing new collectives
   // from being launched on a backend that is tearing down.
   void abort_guard(const char* op);
+
+  // Marks this backend permanently aborted (idempotent -- a no-op if already
+  // aborted, by this rank's own failure, a peer's, or an explicit
+  // abort()/shutdown()), writes msg to the shared Store error key so peers'
+  // watchdog_loop() threads learn of it, and flags comm_stream_ for shutdown
+  // with msg as the reason so a peer already blocked in synchronize() returns
+  // promptly instead of waiting for an unrelated timeout. Called both by the
+  // collective methods' own catch blocks (this rank's failure) and by
+  // watchdog_loop() (a peer's failure) -- the two converge on identical
+  // handling.
+  void report_and_abort(const std::string& msg);
+
+  // Background thread (started in the constructor, stopped+joined in the
+  // destructor before finalize_library()) that polls the Store for any
+  // peer's failure and calls report_and_abort() on this rank when found.
+  void watchdog_loop();
 };
 
 /***********************************************
