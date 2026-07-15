@@ -57,13 +57,26 @@ requires_hw = pytest.mark.skipif(
 _EPS = 64  # elements per stick at 16-bit
 
 
-# --- operand builder: DL16-exact, result stays <= 1024 ------------------------
+# --- operand builder: DL16-exact, DE-PERIODIZED PER STICK, result stays <= 1024 ----
 def _small_pos(shape):
-    # values 1..8 (exact in DL16); products/sums with the small constants below
-    # stay <= 1024. int64 arange then cast (a float16 arange overflows to NaN at
-    # n>65504 — see test_op_pointwise._small_pos).
+    """DL16-exact operand with a DISTINCT value per stick (constant within a stick).
+
+    ⚠️ De-periodization is load-bearing for the multi-stick shapes. A period-8
+    operand (the old `arange % 8 + 1`) makes every 64-element stick byte-identical
+    (64 % 8 == 0), so a multi-stick STICK-DROP / mis-read (the multicore-multichunk
+    unary-bug class) is INVISIBLE — the dropped stick equals its neighbour and
+    `max_diff` stays 0, a false green. Instead: value = (stick_index % 199) + 1,
+    constant across the 64 elements of a stick but distinct across sticks, so a
+    dropped/duplicated/mis-walked stick shows as a wrong value (nonzero max_diff).
+
+    DL16-exactness across ALL 8 subforms: per-stick value ∈ [1, 199]; the tightest
+    constraint is `mul_5` (v*5 ≤ 995 ≤ 1024). int64 arange then cast (a float16
+    arange overflows to NaN at n>65504 — see test_op_pointwise._small_pos).
+    """
     n = int(torch.tensor(shape).prod())
-    return (torch.arange(n, dtype=torch.int64) % 8 + 1).to(torch.float16).reshape(shape)
+    n_sticks = (n + 63) // 64
+    per_stick = (torch.arange(n_sticks, dtype=torch.int64) % 199) + 1
+    return per_stick.repeat_interleave(64)[:n].to(torch.float16).reshape(shape)
 
 
 # --- scalar-affine op table: (id, callable(x)->x∘c, reference is the SAME fn on CPU) --
