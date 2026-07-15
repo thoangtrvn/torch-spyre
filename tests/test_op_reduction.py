@@ -98,8 +98,8 @@ _REDUCTION_OPS = [
 ]
 
 # Which reduction ops reach a working codegen binary today (dim=0, per-lane path).
-# `sum` and `max` are end-to-end HW-verified (max_diff=0). `mean` still fails for an
-# OP-SPECIFIC reason unrelated to the reduce-axis path:
+# `sum`, `max`, AND `mean` are all end-to-end HW-verified (max_diff=0). How each was
+# unblocked (all OP-SPECIFIC, none the reduce-axis path):
 #   - max : FIXED (task #52) — torch.max(dim) lowers via @torch._inductor.runtime.
 #           triton_helpers.max2 (a tl.reduce over the elementwise `maximum` combine). The
 #           classifier now keys on the tt.call BASE name (max/max2/amax → "max"), robust to
@@ -114,7 +114,10 @@ _REDUCTION_OPS = [
 #           torch_spyre/_inductor/decompositions.py::mean_dim_decomp. Result carries the
 #           DL16 reciprocal tolerance (exact=False, _APPROX_TOL) — 1/count is DL16-exact
 #           only for power-of-2 count; all non-ragged mean shapes here use M∈{1,8,32,64}.
-_REDUCTION_OP_HW_VERIFIED = {"sum", "max", "mean"}  # mean: #53 aten.mean.dim → sum*(1/M) decomp
+#           HW-VERIFIED 2026-07-15 (max_diff=0 at [8,64],[8,128],[8,4096],[32,2048]) once the
+#           #86 in-place 1-segment fix landed — the mean decomp's trailing scale kernel is
+#           in-place (Inductor aliases load+store), which faulted 0x7b1b until #86.
+_REDUCTION_OP_HW_VERIFIED = {"sum", "max", "mean"}  # all HW-verified; mean via #53 decomp + #86 in-place
 
 # (id, M, N, ragged?) — dim=0 reductions. N (last dim) is the CONTIGUOUS/stick axis and
 # drives the output width in sticks = ceil(N/64); M is the reduced extent (rows). Aligned
@@ -183,14 +186,15 @@ def _check(op_id, exact, out_dev, out_ref):
 @pytest.mark.parametrize("op_id,fn,exact", _REDUCTION_OPS, ids=[o[0] for o in _REDUCTION_OPS])
 def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, regime):
     """dim=0 (per-lane, across-stick) reduction on device matches CPU across a full M×N
-    sweep (reduced extent M ∈ 1..512; output width N up to real-model hidden 4096). sum and
-    max are end-to-end HW-verified; mean xfails (op-specific); ragged N (#180) and Regime B
-    (#183) shapes fail loud and are gated as xfail."""
+    sweep (reduced extent M ∈ 1..512; output width N up to real-model hidden 4096). sum,
+    max, AND mean are end-to-end HW-verified (mean via the #53 sum*(1/count) decomp + the
+    #86 in-place 1-segment fix — HW-confirmed max_diff=0 at [8,64/128/4096],[32,2048]
+    2026-07-15). ragged N (#180) and Regime B (#183) shapes fail loud and are gated as xfail."""
     if op_id not in _REDUCTION_OP_HW_VERIFIED:
         pytest.xfail(
-            f"{op_id}: dim=0 axis path works (sum/max prove it — same classifier), but "
-            f"{op_id} fails for an OP-SPECIFIC reason: mean → RecursionError in the Inductor "
-            "mean=sum/count decomposition (#53). NOT the reduce-axis gap."
+            f"{op_id}: dim=0 axis path works (sum/max/mean prove it — same classifier), but "
+            f"{op_id} is not yet HW-verified end-to-end for an OP-SPECIFIC reason (NOT the "
+            "reduce-axis gap)."
         )
     if regime == "ragged" and not _RAGGED_N_WORKS:
         pytest.xfail(
@@ -222,7 +226,7 @@ def test_reduction_dim0(op_id, fn, exact, shape_id, M, N, regime):
 def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     """Distinct-per-column operands at an aligned multi-stick width (N=128, M=8): a
     dropped/duplicated output lane shows as a nonzero max_diff. Guards the per-lane output
-    layout. sum is HW-verified; max/mean xfail for op-specific reasons (see test_reduction_dim0)."""
+    layout. sum, max, and mean are all HW-verified (see test_reduction_dim0)."""
     if op_id not in _REDUCTION_OP_HW_VERIFIED:
         pytest.xfail(f"{op_id}: op-specific gap (not the reduce-axis path) — see test_reduction_dim0.")
     M, N = 8, 128
