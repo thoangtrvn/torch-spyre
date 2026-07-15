@@ -102,7 +102,16 @@ _SHAPES = [
 # EMPTY until the lowering lands + is HW-verified (max_diff=0). Flip entries in as
 # each (op, path) is proven on silicon — same discipline as _SUPPORTED_OPS in
 # test_op_pointwise.py. Until then every case xfails with the #56 reason.
-_HW_VERIFIED_AFFINE_OPS: set[str] = {"mul_0p5"}  # Stage 1: mul_0p5 @ s1x64 HW-verified (#82)
+_HW_VERIFIED_AFFINE_OPS: set[str] = {  # Stage 1 (#82): mul_0p5. Stage 2 (#83): remaining single-stick subforms.
+    "mul_0p5",
+    "mul_0p25",
+    "mul_5",
+    "add_0p5",
+    "add_7",
+    "sub_3",
+    "rsub_10",
+    "rmul_0p5",
+}
 
 # Ops HW-verified across MULTI-STICK shapes (not just s1x64). Subset of the above.
 _MULTISTICK_VERIFIED_AFFINE_OPS: set[str] = set()
