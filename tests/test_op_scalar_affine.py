@@ -127,7 +127,16 @@ _HW_VERIFIED_AFFINE_OPS: set[str] = {  # Stage 1 (#82): mul_0p5. Stage 2 (#83): 
 }
 
 # Ops HW-verified across MULTI-STICK shapes (not just s1x64). Subset of the above.
-_MULTISTICK_VERIFIED_AFFINE_OPS: set[str] = set()
+_MULTISTICK_VERIFIED_AFFINE_OPS: set[str] = {  # Stage 3 (#84): de-periodized operand proves multi-stick correctness.
+    "mul_0p5",
+    "mul_0p25",
+    "mul_5",
+    "add_0p5",
+    "add_7",
+    "sub_3",
+    "rsub_10",
+    "rmul_0p5",
+}
 _SINGLE_STICK_SHAPES = {"s1x64"}
 
 
