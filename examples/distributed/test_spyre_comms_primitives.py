@@ -41,6 +41,17 @@ C10D_BACKEND = "spyreccl"
 COLLECTIVE_ELEMENTS = 4096
 # Minimum for non-splitting ops (broadcast, send/recv)
 MIN_ELEMENTS = 64
+# A one-directional transfer larger than the HDMA pool (FLEX_HDMA_P2PSIZE,
+# default 8 MB) needs more chunks than send_credit, so it exercises the
+# one-directional CBS-segmentation path fixed by SPYRE_COMMS_SYMMETRIZE_RECV_CBS.
+# 12 MB fp16 > 8 MB pool guarantees n_chunks > credit regardless of chunk size.
+LARGE_ONEDIR_ELEMENTS = 6 * 1024 * 1024  # 12 MB fp16
+
+
+def _symmetrize_recv_cbs_enabled():
+    """True when SPYRE_COMMS_SYMMETRIZE_RECV_CBS is set to a non-empty, non-0 value."""
+    v = os.environ.get("SPYRE_COMMS_SYMMETRIZE_RECV_CBS", "")
+    return v not in ("", "0")
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +208,53 @@ def test_send_recv_pingpong():
         _report("send_recv pingpong (rank 1)", ok_recv)
     else:
         _skip("send_recv pingpong (non-participant)", f"rank {rank}")
+
+
+def test_send_recv_large_onedirectional():
+    """A one-directional send/recv larger than the HDMA pool (>8 MB).
+
+    rank 0 sends 12 MB to rank 1; rank 1 receives. This needs more chunks than
+    send_credit, so it hits the one-directional CBS-segmentation path:
+      - With SPYRE_COMMS_SYMMETRIZE_RECV_CBS=1 the sender's SEND run and the
+        receiver's RECV run split into matching flex CBSes at the credit
+        boundary, so the transfer completes (this exercises the new
+        receiver-side RECV credit gate -- without it, the receiver's RECVs stay
+        in one CBS and the transfer deadlocks).
+      - Without the flag the sender fail-fasts via the InterleaveP2PWithinSteps
+        guard, which aborts the whole process group (report_and_abort). Running
+        that here would poison every later test in this file, so the flag-off
+        case is SKIPPED -- verify it separately with a standalone run (expect a
+        fast SpyreCommsException on the sender).
+    """
+    rank = dist.get_rank()
+    size = dist.get_world_size()
+    name = "send_recv_large_onedirectional (12MB, >send_credit)"
+    if size < 2:
+        _skip(name, "requires >= 2 ranks")
+        return
+    if rank not in (0, 1):
+        _skip(name, f"rank {rank} not involved in 2-rank test")
+        return
+    if not _symmetrize_recv_cbs_enabled():
+        _skip(
+            name,
+            "requires SPYRE_COMMS_SYMMETRIZE_RECV_CBS=1 (fail-fast otherwise aborts the group)",
+        )
+        return
+
+    fill_val = 9.0
+    if rank == 0:
+        t = _device_tensor(LARGE_ONEDIR_ELEMENTS, torch.float16, fill_value=fill_val)
+        dist.send(t, dst=1)
+        _report(name, True, "sent 12MB one-directional (flag on)")
+    else:  # rank == 1
+        t = _device_tensor(LARGE_ONEDIR_ELEMENTS, torch.float16, fill_value=-1.0)
+        dist.recv(t, src=0)
+        result = t.to("cpu")
+        expected = torch.zeros(LARGE_ONEDIR_ELEMENTS, dtype=torch.float16)
+        expected.fill_(fill_val)
+        ok = torch.allclose(result, expected)
+        _report(name, ok, "received 12MB one-directional (flag on)")
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +530,12 @@ def main():
 
     # -- AllGather --
     test_allgather()
+
+    # -- Large one-directional P2P (>send_credit) --
+    # Runs only with SPYRE_COMMS_SYMMETRIZE_RECV_CBS=1; skipped otherwise (its
+    # fail-fast path aborts the group -- see the test doc). Placed last so a
+    # failure/timeout here cannot block any earlier test.
+    test_send_recv_large_onedirectional()
 
     # -- Summary --
     dist.barrier()
