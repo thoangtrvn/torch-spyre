@@ -236,6 +236,65 @@ def test_reduction_dim0_distinct_cols(op_id, fn, exact):
     _check(op_id, exact, out_dev, out_ref)
 
 
+# ---------------------------------------------------------------------------
+# ENTRY-POINT axis (aten / eager / compiled) at real-LLM dim=0 shapes.
+#
+# The existing test_reduction_dim0 dispatches ONLY via the bare torch op (`torch.sum(t,
+# dim=0)`). The file docstring ASSERTS that aten / eager / compiled all route through the
+# same Inductor frontend (#193), but that convergence is not itself pinned by a test —
+# mirrors test_op_embedding._ENTRY_POINTS / test_op_pointwise's dispatch-paths test. If the
+# three entries ever diverge (as they DID for embedding + pointwise), this catches it.
+#
+# Shapes: real-LLM dim=0 reductions — a decode-width `[1,N]` (M=1 reduced extent, a single
+# row → the reduce is a no-op copy but the frontend/axis-recovery still runs) and a small
+# prefill `[8,N]` at hidden widths. sum/max/mean are all HW-verified for dim=0 (per
+# _REDUCTION_OP_HW_VERIFIED); op-specific unverified ops xfail as elsewhere.
+# ---------------------------------------------------------------------------
+_REDUCTION_ENTRY_POINTS = ("aten", "eager", "compiled")
+_REDUCTION_LLM_SHAPES = [
+    ("m1_n4096",   1,   4096),   # decode-width reduce (Llama/Mistral hidden), single row
+    ("m8_n768",    8,   768),    # GPT-2 hidden prefill-ish
+    ("m8_n4096",   8,   4096),   # Llama/Mistral hidden
+]
+_ATEN_REDUCTION = {"sum": torch.ops.aten.sum, "max": torch.ops.aten.amax}
+
+
+def _run_reduction_via(entry, op_id, fn, x_dev):
+    """Dispatch a dim=0 reduction to the device via one of the 3 entry points.
+    For aten, sum/amax take dim as an arg; mean falls back to the torch fn (no simple
+    single aten overload here — it decomposes)."""
+    if entry == "aten" and op_id in _ATEN_REDUCTION:
+        return _ATEN_REDUCTION[op_id](x_dev, 0).cpu()
+    if entry == "compiled":
+        return torch.compile(fn, dynamic=False)(x_dev).cpu()
+    # eager (and mean-via-fn for the aten slot): the bare torch fn
+    return fn(x_dev).cpu()
+
+
+@requires_hw
+@pytest.mark.parametrize("entry", _REDUCTION_ENTRY_POINTS)
+@pytest.mark.parametrize("shape_id,M,N", _REDUCTION_LLM_SHAPES, ids=[s[0] for s in _REDUCTION_LLM_SHAPES])
+@pytest.mark.parametrize("op_id,fn,exact", _REDUCTION_OPS, ids=[o[0] for o in _REDUCTION_OPS])
+def test_reduction_dim0_entry_points(op_id, fn, exact, shape_id, M, N, entry):
+    """dim=0 reduction correct via ALL THREE dispatch paths (aten / eager / compiled) at
+    real-LLM hidden widths — the coverage embedding + pointwise have but reduction lacked.
+    sum/max/mean are HW-verified for dim=0; op-specific unverified ops xfail (not the axis)."""
+    if op_id not in _REDUCTION_OP_HW_VERIFIED:
+        pytest.xfail(
+            f"{op_id}: dim=0 axis path works (same classifier), but {op_id} not yet "
+            "HW-verified end-to-end for an OP-SPECIFIC reason (NOT the reduce-axis gap)."
+        )
+    # sum/mean: all-ones (sum=M<=1024). max: increasing down rows (distinct per-column max).
+    x = _max_known_answer(M, N) if op_id == "max" else _ones_like_small(M, N)
+    out_dev = _run_reduction_via(entry, op_id, fn, x.to("spyre"))
+    out_ref = fn(x)
+    assert out_dev.shape == out_ref.shape, (
+        f"{op_id} {shape_id} via {entry}: device shape {tuple(out_dev.shape)} != "
+        f"{tuple(out_ref.shape)}"
+    )
+    _check(op_id, exact, out_dev, out_ref)
+
+
 @requires_hw
 def test_elementwise_maximum_is_not_a_reduction():
     """Routing guard for the max2/maximum distinction (task #52). torch.maximum(a,b) is

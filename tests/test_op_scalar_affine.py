@@ -214,6 +214,84 @@ def test_scalar_affine_compiled(op_id, fn, exact, shape_id, M, N, boundary):
 
 
 # ---------------------------------------------------------------------------
+# RAGGED N — scalar-affine at N not a multiple of elements_per_stick (64 @16-bit).
+#
+# Scalar-affine rides the SAME shared unary datapath (single input load, one SFP compute)
+# as neg/relu/pointwise (scalar-affine.md §2), so it hits the SAME 1D-flatten shape-recovery
+# path — and therefore the SAME ragged-N behaviour:
+#   M==1 ragged (1×100, 1×40, 1×5): logical sticks == physical sticks → NO tail drop → the
+#         path that already works for bare pointwise; expected-pass for the HW-verified
+#         subforms (scalar-affine is HW-verified multi-stick, scalar-affine.md).
+#   M>1  ragged (4×100, 3×130, 2×65): physical > logical → trailing physical stick(s)
+#         never written → read 0 (the #167/#166 op-agnostic tail-drop; the mechanism is in
+#         choices.py 1D-flatten and is INDEPENDENT of the SFP compute, so scalar-affine
+#         drops identically to add/mul/neg). xfail-strict until Fix A HW-verifies.
+# This closes the ragged coverage gap for scalar-affine (the aligned _SHAPES table above
+# had none), including both entry points.
+# ---------------------------------------------------------------------------
+_RAGGED_AFFINE_SHAPES = [
+    ("aff_ragged_1x100",  1,  100),   # M=1 ragged (no tail drop) — expected-pass if verified
+    ("aff_sub_stick_1x40", 1, 40),    # M=1 sub-stick (no tail drop)
+    ("aff_tiny_1x5",      1,  5),     # M=1 tiny sub-stick (no tail drop)
+    ("aff_ragged_4x100",  4,  100),   # M>1 ragged → #166/#167 tail-drop → xfail-strict
+    ("aff_ragged_3x130",  3,  130),   # M>1 ragged
+    ("aff_subsz_2x65",    2,  65),    # M>1 just-over-one-stick
+]
+_RAGGED_AFFINE_166_REASON = (
+    "#166 op-independent ragged M>1 tail-drop: scalar-affine rides the shared unary datapath, "
+    "so the physical>logical stick-drop in the SHARED .to(spyre) stick-write layer applies "
+    "identically — trailing physical sticks past ceil(M·N/64) logical sticks are never written "
+    "→ read 0. PREDICTED op-agnostic (the add/mul/sub sibling was HW-measured failing at the "
+    "operand maxima), NOT yet HW-measured for scalar-affine. NOTE: 'Fix A' (Inductor choices.py) "
+    "was REFUTED for the binary case (stayed 11 with it present) — the real fix is at the shared "
+    "layer; #167 reopened. Auto-flips when a real fix HW-verifies for these ops."
+)
+
+
+@requires_hw
+@pytest.mark.parametrize("entry", ("eager", "compiled"))
+@pytest.mark.parametrize("shape_id,M,N", _RAGGED_AFFINE_SHAPES, ids=[s[0] for s in _RAGGED_AFFINE_SHAPES])
+@pytest.mark.parametrize("op_id,fn,exact", _SCALAR_AFFINE_OPS, ids=[o[0] for o in _SCALAR_AFFINE_OPS])
+def test_scalar_affine_ragged_n(op_id, fn, exact, shape_id, M, N, entry, request):
+    """`x ∘ c` at ragged N via eager AND compiled. M==1 ragged is expected-pass for the
+    HW-verified subforms (no tail drop when logical==physical); M>1 ragged is xfail-strict
+    on the #166 op-agnostic tail-drop (auto-flips when Fix A HW-verifies)."""
+    if op_id not in _HW_VERIFIED_AFFINE_OPS:
+        pytest.xfail(_xfail_reason(op_id, shape_id))
+    if op_id not in _MULTISTICK_VERIFIED_AFFINE_OPS:
+        pytest.xfail(f"{op_id} {shape_id}: multi-stick scalar-affine not yet HW-verified.")
+    if M > 1:
+        request.node.add_marker(pytest.mark.xfail(reason=_RAGGED_AFFINE_166_REASON, strict=True))
+    x = _small_pos((M, N))
+    if entry == "eager":
+        out_dev = fn(x.to("spyre")).cpu()
+    else:
+        out_dev = torch.compile(fn, dynamic=False)(x.to("spyre")).cpu()
+    out_ref = fn(x)
+    assert out_dev.shape == out_ref.shape, (
+        f"{op_id} {shape_id} via {entry}: device shape {tuple(out_dev.shape)} != "
+        f"{tuple(out_ref.shape)} — ragged tail leaked into logical shape."
+    )
+    _check(op_id, out_dev, out_ref)
+
+
+def test_ragged_affine_shape_model():
+    """HW-independent: the ragged scalar-affine table is genuinely ragged and splits M==1
+    (no drop) from M>1 (tail drop). Guards the blind-spot table without a board."""
+    import math
+    for _id, M, N in _RAGGED_AFFINE_SHAPES:
+        assert N % _EPS != 0, f"{_id}: N={N} must be ragged (not a stick multiple)"
+    # M==1 rows: logical == physical (single row) → no drop.
+    assert [s for s in _RAGGED_AFFINE_SHAPES if s[1] == 1], "must keep M==1 (no-drop) rows"
+    # M>1 rows: physical (M·ceil(N/64)) > logical (ceil(M·N/64)) → the drop regime.
+    for _id, M, N in _RAGGED_AFFINE_SHAPES:
+        if M > 1:
+            physical = M * math.ceil(N / _EPS)
+            logical = math.ceil(M * N / _EPS)
+            assert physical > logical, f"{_id}: expected physical>logical drop regime"
+
+
+# ---------------------------------------------------------------------------
 # Guard: an out-of-port constant is the whole point. This is a HW-independent CI
 # guard documenting the invariant so a future "just use the constant port" shortcut
 # that only handles {0,1,2,3} cannot silently pass the suite while dropping 0.5/0.25.

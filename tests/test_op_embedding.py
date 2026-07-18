@@ -192,6 +192,43 @@ def test_embedding_shape(shape_id, vocab, d_model, n_tokens, needs_multichunk, e
     )
 
 
+# ---------------------------------------------------------------------------
+# TOKEN-COUNT axis — the resolved C>1 multi-chunk 32-token register-wrap regression.
+#
+# The main test_embedding_shape sweep varies d_model (spt/C path) but pins n_tokens per
+# shape (mostly 2-8). It does NOT sweep the TOKEN COUNT at a fixed C>1 d_model — which is
+# exactly the axis of the resolved 32-token bug: C>1 (d_model>2048) at a 32-token prefill
+# was max_diff=511 (L3SU register-index wrap — 4-bit S0/S2 index over 16 EAR/16 LAR regs,
+# output sticks >512 wraps mod-16 and chunk 16 collides on register 0), fixed 2026 (commit
+# 18df559 / [[embedding-multichunk-32token-bug]]) → now HW-verified max_diff=0. Sweeping
+# n_tokens ∈ {1 (decode), 8, 16, 32 (the prior fault point)} at a C=2 d_model is the
+# regression-lock for that fix — it must stay max_diff=0 as tokens cross the wrap boundary.
+# ---------------------------------------------------------------------------
+_TOKEN_SWEEP = [1, 8, 16, 32]     # decode → the 32-token prefill that was max_diff=511
+
+
+@requires_hw
+@pytest.mark.parametrize("entry", _ENTRY_POINTS)
+@pytest.mark.parametrize("n_tokens", _TOKEN_SWEEP, ids=[f"tok{n}" for n in _TOKEN_SWEEP])
+@pytest.mark.parametrize(
+    "shape_id,d_model",
+    [("d4096_C2", 4096), ("qwen_d3584_C2", 3584)],
+    ids=["d4096_C2", "qwen_d3584_C2"],
+)
+def test_embedding_multichunk_token_sweep(shape_id, d_model, n_tokens, entry):
+    """C>1 (multi-chunk) embedding gather across a token-count sweep (1→32) via all three
+    entry points — the regression-lock for the resolved 32-token L3SU register-index wrap
+    (was max_diff=511 at 32 tokens; must stay max_diff=0). Vocab downsized (path depends on
+    d_model, not vocab)."""
+    vocab = 8192
+    max_diff = _run_embedding(vocab, d_model, n_tokens, entry=entry)
+    assert max_diff == 0.0, (
+        f"{shape_id}/tok{n_tokens}/{entry} (d_model={d_model}, spt={_spt(d_model)} "
+        f"C={_chunks(d_model)}): max_diff={max_diff} != 0 — the 32-token multi-chunk "
+        "register-wrap regression (embedding-multichunk-32token-bug) may have returned."
+    )
+
+
 def test_embedding_path_classification():
     """Guard the spt/C derivation the codegen path selection depends on — a pure
     arithmetic check that runs without hardware, so the shape contract is validated
