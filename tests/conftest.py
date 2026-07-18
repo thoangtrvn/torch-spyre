@@ -13,12 +13,77 @@
 # limitations under the License.
 
 import os
+import shutil
 from pathlib import Path
 import yaml
 import pytest
 
 
 import shared_config
+
+
+# ── Ragged M>1 pointwise HW compile-cache clear (#168) ──────────────────────
+# A choices.py (InductorChoices) source edit does NOT invalidate the on-disk
+# Inductor FxGraphCache or Triton kernel cache — those are keyed on the FX graph
+# + input metadata + Inductor config, not on third-party choices source. On HW,
+# a stale pre-fix compiled kernel can therefore mask a correct choices.py fix
+# (see #167/#168). Explicit name set (not a "ragged" substring match) so this
+# does NOT sweep in the HW-independent, pure-math test_ragged_*_shape_model
+# tests, which never compile.
+_RAGGED_CACHE_CLEAR_TESTS = frozenset({
+    "test_pointwise_unary_ragged_n",
+    "test_pointwise_binary_ragged_n",
+    "test_pointwise_unary_ragged_m_gt1",
+    "test_pointwise_binary_ragged_m_gt1",
+    "test_scalar_affine_ragged_n",
+    "test_pointwise_fused_single_input_chain",
+})
+
+
+def _clear_dir_contents(d: Path) -> None:
+    """Remove the CONTENTS of d (not d itself). Silent if d is absent.
+
+    Best-effort: a locked/absent cache entry must never abort the test.
+    """
+    if not d or not d.is_dir():
+        return
+    for entry in d.iterdir():
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink(missing_ok=True)
+        except OSError:
+            pass  # best-effort; a locked file must not abort the test
+
+
+@pytest.fixture(autouse=True)
+def _clear_compile_caches_for_ragged(request):
+    """Ragged M>1 pointwise HW tests exercise Inductor/choices.py tiling. A
+    choices.py edit does NOT bust FxGraphCache/Triton disk cache, so a stale
+    pre-fix compiled kernel can mask a correct fix (#167/#168). Clear the
+    compile caches before these specific tests so HW observes current codegen.
+
+    Scoped to _RAGGED_CACHE_CLEAR_TESTS only — this must NOT clear on every
+    test (that would be TORCHINDUCTOR_FORCE_DISABLE_CACHES-equivalent, hiding
+    real caching bugs and slowing down the whole suite).
+    """
+    name = getattr(request.node, "originalname", None) or request.node.function.__name__
+    if name in _RAGGED_CACHE_CLEAR_TESTS:
+        # Inductor FxGraphCache (effective dir, honoring TORCHINDUCTOR_CACHE_DIR)
+        try:
+            from torch._inductor.codecache import cache_dir as _inductor_cache_dir
+            _clear_dir_contents(Path(_inductor_cache_dir()))
+        except Exception:
+            _clear_dir_contents(Path(os.environ.get(
+                "TORCHINDUCTOR_CACHE_DIR",
+                f"/tmp/torchinductor_{os.environ.get('USER', '')}")))
+        # Triton cache
+        _clear_dir_contents(Path(os.environ.get(
+            "TRITON_CACHE_DIR", str(Path.home() / ".triton" / "cache"))))
+        # Sentient codegen cache
+        _clear_dir_contents(Path.home() / ".sentient_cache")
+    yield
 
 
 def _get_case_marks(case: dict) -> set[str]:
