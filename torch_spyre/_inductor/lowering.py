@@ -853,11 +853,15 @@ def _reoffset(node, offset):
 
 @register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
 def lower_spyre_from_d2d(src, dst, src_off, dst_off):
-    # A sliced src/dst reaches us as a graph input whose storage_offset was
-    # dropped (offset==0 on its layout). Re-introduce the offsets in-graph so
-    # they land in the coordinate that superdsc bakes into the kernel; without
-    # this the kernel reads/writes from the storage base and every offset
-    # silently returns the first call's data. See _reoffset above.
+    # This op only reaches the compiled path for row-major, stick-aligned
+    # operands: spyre__copy_from (eager.py) routes non-row-major or sub-stick /
+    # non-stick-aligned-offset views to a CPU round-trip instead, because the
+    # kernel cannot represent those layouts. So here src/dst are always
+    # row-major; we only need to re-introduce the (whole-stick) storage_offset
+    # that Inductor dropped from the graph input, so it lands in the coordinate
+    # superdsc bakes into the kernel. Without this the kernel reads/writes from
+    # the storage base and every offset silently returns the first call's data.
+    # See _reoffset above and _d2d_kernel_can_bake in eager.py.
     src = _reoffset(src, src_off)
     dst = _reoffset(dst, dst_off)
     lowering.mutate_to(dst, src)

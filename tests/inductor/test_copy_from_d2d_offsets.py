@@ -21,16 +21,16 @@ storage_offset is dropped by the Inductor backend (its FixedLayout.offset is
 0 and SpyreTensorLayout has no offset field), so the compiled kernel bound the
 storage base pointer and read from element 0.
 
-The fix re-introduces the offset in-graph in lower_spyre_from_d2d
-(torch_spyre/_inductor/lowering.py) via a ReinterpretView, so the offset lands
-in the coordinate that superdsc bakes into the SDSC binary.
-
-The transpose / permute / strided cases below deliberately exercise
-NON-contiguous views. They probe whether re-injecting only the scalar
-storage_offset onto the input's own (size, stride) layout is sufficient
-("Option 2"), or whether the full view (size + stride + offset) must be
-reconstructed from the base tensor ("Option 1"). If any strided case fails on
-hardware while the contiguous cases pass, Option 2 is insufficient.
+The fix has two parts:
+  * Row-major, stick-aligned operands (the common row-offset path) stay on
+    device: lower_spyre_from_d2d re-introduces the dropped storage_offset
+    in-graph via a ReinterpretView so it lands in the coordinate superdsc
+    bakes into the SDSC binary.
+  * Any other view — non-row-major (transpose / permute-of-stick / stepped
+    slice) or an offset that is sub-stick / not stick-aligned — is routed by
+    spyre__copy_from (eager.py) to a CPU round-trip, which honors
+    storage_offset via the H2D/D2H DMA path. Correct for arbitrary strided
+    views, at a performance cost for those exotic copies.
 """
 
 import unittest
@@ -82,44 +82,38 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         torch.testing.assert_close(out[1:2], torch.full((1, 64), -1.0, dtype=DTYPE))
         torch.testing.assert_close(out[3:4], torch.full((1, 64), -1.0, dtype=DTYPE))
 
-    @unittest.expectedFailure
     def test_column_slice_inner_offset(self):
         """Offset along the last (stick) dim: narrow columns at an offset.
 
-        KNOWN LIMITATION (silent wrong data). A storage_offset that falls in
-        the innermost / stick dimension is not correctly baked: the fix
-        re-introduces the flat offset onto the layout, but superdsc decomposes
-        per-dim offsets against device_size and does not split a stick-dim
-        offset correctly, so the read is off by the stick-dim component.
-        Tracked for the follow-up PR (stick-dim offset handling), distinct from
-        the row-offset bug fixed here."""
+        A stick-dim offset cannot be baked as a sub-stick base offset (the
+        device layout has no such field), so this routes to the CPU
+        round-trip fallback, which honors storage_offset."""
         x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
         # columns [64:128) -> nonzero offset within a row
         out = x.narrow(1, 64, 64).clone()
         torch.testing.assert_close(out.cpu(), x.cpu()[:, 64:128])
 
+    def test_partial_stick_offset(self):
+        """Offset in the stick dim that is NOT a whole-stick multiple."""
+        x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
+        out = x.narrow(1, 32, 64).clone()  # columns [32:96), sub-stick offset
+        torch.testing.assert_close(out.cpu(), x.cpu()[:, 32:96])
+
 
 class TestCopyFromD2DStridedViews(unittest.TestCase):
-    """Non-contiguous views: transpose / permute / step slices / select.
+    """Non-contiguous / non-stick-aligned views: transpose / permute / stepped
+    slice / select / stick-dim offset.
 
-    permute and select work (the offset fix carries them). transpose and
-    stepped-slice cases are marked expectedFailure: they fail in the Spyre
-    restickify layout pass ("no mechanism to resolve stick incompatibility" /
-    "scatter elements from one stick to multiple sticks"), NOT in offset
-    handling. Verified to fail identically on the pre-fix baseline (offset==0
-    transpose reduces lower_spyre_from_d2d to the original mutate_to), so these
-    are pre-existing backend limitations, not regressions from this fix, and
-    reconstructing size+stride explicitly (Option 1) would not resolve them.
-    Tracked for the follow-up PR.
+    These cannot be represented by the compiled d2d kernel, so spyre__copy_from
+    routes them to a CPU round-trip (see _d2d_kernel_can_bake in eager.py).
+    They emit a FallbackWarning but must produce correct data.
     """
 
-    @unittest.expectedFailure
     def test_transpose_clone(self):
         x = torch.arange(4 * 64, dtype=DTYPE, device=DEVICE).reshape(4, 64)
         out = x.t().clone()  # (64, 4), non-contiguous
         torch.testing.assert_close(out.cpu(), x.cpu().t())
 
-    @unittest.expectedFailure
     def test_transpose_then_offset_clone(self):
         """Transpose AND a nonzero offset along the transposed dim."""
         x = torch.arange(4 * 64, dtype=DTYPE, device=DEVICE).reshape(4, 64)
@@ -144,14 +138,12 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
         out = x.select(0, 2).clone()  # row 2 as 1-D (64,), storage_offset=128
         torch.testing.assert_close(out.cpu(), x.cpu()[2])
 
-    @unittest.expectedFailure
     def test_stepped_slice_clone(self):
         """Strided (step>1) slice — non-unit stride plus offset."""
         x = torch.arange(8 * 64, dtype=DTYPE, device=DEVICE).reshape(8, 64)
         out = x[1::2].clone()  # rows 1,3,5,7 ; offset=64, stride[0]=128
         torch.testing.assert_close(out.cpu(), x.cpu()[1::2])
 
-    @unittest.expectedFailure
     def test_transpose_varying_offsets_loop(self):
         """Multiple distinct offsets on a transposed view in one process."""
         x = torch.arange(8 * 64, dtype=DTYPE, device=DEVICE).reshape(8, 64)

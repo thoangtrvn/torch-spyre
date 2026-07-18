@@ -14,7 +14,7 @@
 
 import torch
 import torch_spyre.ops.fallbacks  # noqa: F401
-from .fallbacks import _get_op_overloads
+from .fallbacks import _get_op_overloads, warn_fallback
 import warnings
 import functools
 import inspect
@@ -22,6 +22,47 @@ import operator
 
 
 aten = torch.ops.aten
+
+
+def _is_row_major_contiguous(t: torch.Tensor) -> bool:
+    """True iff t's strides are EXACTLY the row-major strides for its shape.
+
+    Stricter than ``t.is_contiguous()``, which ignores size-1 dims. A
+    transposed ``[64, 1]`` view (stride ``[1, 64]``) reports is_contiguous()
+    True, but its innermost logical dim is not stride-1, so the Spyre d2d
+    kernel would pin the stick to a degenerate size-1 axis and mis-copy.
+    Requiring an exact stride match rejects that while still accepting genuine
+    trailing size-1 dims (e.g. ``[4, 64, 1]`` -> stride ``[64, 1, 1]``).
+    """
+    expected = 1
+    for size, stride in zip(reversed(t.shape), reversed(t.stride())):
+        if stride != expected:
+            return False
+        expected *= size
+    return True
+
+
+def _d2d_kernel_can_bake(src: torch.Tensor, dst: torch.Tensor) -> bool:
+    """Whether the compiled d2d copy kernel can correctly represent src/dst.
+
+    The kernel bakes a per-dim byte offset from the in-graph coordinate but
+    (a) cannot express a non-row-major layout, and (b) cannot express a
+    storage_offset that lands inside a stick (sub-stick), nor reliably bake a
+    whole-stick offset that would need reconstructing the base extent. So we
+    only take the on-device path for row-major operands whose storage_offset is
+    a whole-stick multiple; everything else falls back to a CPU round-trip
+    (which honors storage_offset via the H2D/D2H DMA path). See
+    docs/copy_from_d2d_offset_bug.md.
+    """
+    from torch_spyre._C import get_elem_in_stick
+
+    stick = get_elem_in_stick(src.dtype)
+    for t in (src, dst):
+        if not _is_row_major_contiguous(t):
+            return False
+        if t.storage_offset() % stick != 0:
+            return False
+    return True
 
 
 # Decorator to keep track of compiled variant
@@ -244,9 +285,19 @@ def spyre__copy_from(self, dst, non_blocking=False):
         torch_spyre._C.copy_tensor(self, dst, non_blocking)
         return dst
     elif self.device.type == "spyre" and self.device == dst.device:
-        # Pass storage_offsets explicitly: a graph input's storage_offset is
-        # dropped by Inductor, so the lowering must re-introduce it in-graph
-        # (see copy_from_d2d in customops.py and lower_spyre_from_d2d).
+        if not _d2d_kernel_can_bake(self, dst):
+            # Non-row-major or sub-stick / non-stick-aligned offset: the
+            # compiled d2d kernel cannot represent this layout (it would
+            # silently read from the wrong offset or fail to compile). Round
+            # trip through the host, which honors storage_offset via the DMA
+            # path. Slower, but correct for arbitrary strided/offset views.
+            warn_fallback("torch.ops.spyre.copy_from_d2d (strided/offset view)")
+            dst.copy_(self.cpu())
+            return dst
+        # Fast path: row-major, stick-aligned operands. Pass storage_offsets
+        # explicitly: a graph input's storage_offset is dropped by Inductor, so
+        # the lowering must re-introduce it in-graph (see copy_from_d2d in
+        # customops.py and lower_spyre_from_d2d).
         torch.ops.spyre.copy_from_d2d(
             self, dst, self.storage_offset(), dst.storage_offset()
         )
