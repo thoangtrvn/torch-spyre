@@ -91,6 +91,7 @@ register_torch_compile_kernel(
         aten.exp,
         aten.floor,
         aten.log,
+        aten.amax,  # max(dim) reduction — registers .out overload so direct aten.amax works
         aten.mean,
         aten.mul,
         aten.reciprocal,
