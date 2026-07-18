@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 
 from torch._inductor.choices import InductorChoices
@@ -21,6 +23,38 @@ from torch._inductor.virtualized import V
 
 
 class SpyreHeuristics(InductorChoices):
+    @staticmethod
+    def _recover_pointwise_shape(features, x_val):
+        """Recover the TRUE 2D (M, N) of a 1D-flattened pointwise kernel.
+
+        Inductor collapses a contiguous [M,N] pointwise into a 1D iteration grid
+        {"x": M*N}, but does NOT reshape the buffers — the output ComputedBuffer's
+        layout still carries [M, N] (Buffer.get_size() returns [*layout.size]).
+        Read it back (same "Inductor collapsed the shape" recovery class as the
+        #193 reduction dim recovery). Returns (M, N), or (x_val, None) when a 2D
+        layout matching x_val can't be found — the caller then falls back to the
+        old flat decompose (safe for aligned / M=1; fails safe, never silent-wrong).
+        """
+        try:
+            ski = getattr(V.graph.sizevars, "statically_known_int", None)
+
+            def _to_int(dim):
+                if ski is not None:
+                    return ski(dim)
+                return int(V.graph.sizevars.size_hint(dim))
+
+            for node in features.scheduler_nodes():
+                buf = getattr(node, "node", None)
+                size = buf.get_size() if buf is not None else None
+                if size and len(size) == 2:
+                    m = _to_int(size[0])
+                    n = _to_int(size[1])
+                    if m and n and m * n == x_val:
+                        return m, n
+        except (TypeError, ValueError, AttributeError):
+            pass
+        return x_val, None
+
     @staticmethod
     def reduction_split_factor(
         device: torch.device,
@@ -164,7 +198,20 @@ class SpyreHeuristics(InductorChoices):
             # Extract M and N for the codegen's autotuner. Pointwise is tiled
             # as (M, 1, N) where N must be a multiple of elements_per_stick.
             # For 2D grids (y + x), M = y_val, N = x_val.
-            # For 1D grids (x only), decompose: N = elements_per_stick, M = x_val / N.
+            # For 1D grids (x only), Inductor collapsed [M,N] to a flat numel
+            # x_val=M*N, THROWING AWAY the per-row stick padding the physical
+            # device tensor still carries (spyre_tensor_impl.cpp:170 row-pads to
+            # M*ceil(N/64) sticks; D2H reads all of them, :286). Decomposing as
+            # m_val=ceil(x_val/64) makes the kernel write only ceil(M*N/64)
+            # contiguous sticks — SHORT by the trailing row-tail sticks for ragged
+            # N (N%64!=0) AND M>1, which then read 0 on HW (#166: add=11/mul=28/
+            # sub=7). Recover the TRUE (M,N) from the output buffer layout (Inductor
+            # flattens the iteration grid, NOT the buffer size) and flatten over the
+            # PADDED stick count so the kernel walks every physical stick. Row-major
+            # stick order is contiguous (row r, sub-stick s -> r*ceil(N/64)+s), so a
+            # contiguous M*ceil(N/64)-stick walk is correct — only the COUNT was
+            # wrong. Mirrors the #193 reduction shape recovery for the same
+            # "Inductor collapsed the shape" class.
             x_val = _resolve_dim("x") or 0
             y_val = _resolve_dim("y") or 0
 
@@ -172,9 +219,22 @@ class SpyreHeuristics(InductorChoices):
                 m_val = y_val
                 n_val = x_val
             elif x_val > 0:
-                # 1D grid: decompose into M rows of N stick-aligned elements
+                # 1D grid: recover the true 2D (M, N) from the output buffer layout.
+                true_m, true_n = self._recover_pointwise_shape(features, x_val)
                 n_val = elements_per_stick
-                m_val = (x_val + n_val - 1) // n_val  # ceil division
+                if (true_n is not None
+                        and true_n % elements_per_stick != 0
+                        and true_m > 1):
+                    # Ragged N with M>1: flatten over the ROW-PADDED physical stick
+                    # count so the kernel writes M*ceil(N/64) sticks (== the device
+                    # tensor), not the flat ceil(M*N/64). This is the ONLY case that
+                    # changes vs prior behavior (#166 fix).
+                    m_val = true_m * math.ceil(true_n / elements_per_stick)
+                else:
+                    # M=1, or N a stick multiple: flat == row-padded already.
+                    # Unchanged (byte-identical to prior behavior — verified for
+                    # [1,100],[2,64],[128,768],[512,4096]).
+                    m_val = (x_val + n_val - 1) // n_val  # ceil division
             else:
                 m_val = 1
                 n_val = elements_per_stick
