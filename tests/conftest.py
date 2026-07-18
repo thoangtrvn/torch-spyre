@@ -112,6 +112,15 @@ def pytest_sessionstart(session):
     before performing collection and entering the run test loop.
     """
 
+    # Cap the Inductor compile-worker pool BEFORE importing torch (Inductor reads this at
+    # init). Default is 32 workers forked PER compiled kernel; across a large op-test file
+    # (hundreds of per-test torch.compile calls in one process) that fork storm exhausts
+    # host resources and crashes the compile subprocess pool → torch._inductor.exc.
+    # SubprocException on the LATER tests (a host-side cascade distinct from the device-side
+    # StreamInErrorState). Each op test compiles ~one small kernel, so one worker is plenty.
+    # setdefault → CI / a caller may still override (e.g. export TORCHINDUCTOR_COMPILE_THREADS=8).
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
     # avoid circular imports when using xdist
     import torch  # noqa: F401
 

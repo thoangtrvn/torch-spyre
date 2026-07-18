@@ -560,15 +560,23 @@ _FUSED_SINGLE_INPUT_CHAINS = [
     ("fma_5x_minus_2",      lambda x: 5.0 * x - 2.0,        False, True),   # [mul, sub_r] HW-verified
     ("chain_xm5_x2_plus1",  lambda x: (x - 5.0) * 2.0 + 1.0, False, True),  # 3-node; was the src2=ONE hang
     ("relu_xm5",            lambda x: torch.relu(x - 5.0),  False, True),   # fminmax-in-chain HW-verified
-    # Classifier ACCEPTS these folds (div-by-const→mul(1/c); neg; sub_l) but they were
-    # NOT on the 2026-07-16 HW probe → xfail-strict until the sweep confirms.
-    ("div_x_by_2",          lambda x: x / 2.0,              False, False),  # divf-by-const → mul 0.5 fold
-    ("chain_3_minus_x_x2",  lambda x: (3.0 - x) * 2.0,      False, False),  # sub_l then mul
-    ("chain_neg_plus_3",    lambda x: torch.neg(x) + 3.0,   False, False),  # neg then add
+    # div-by-const→mul(1/c), sub_l, and neg folds — HW-verified 2026-07-18 (max_diff=0 at all
+    # _FUSED_HW_VERIFIED_SHAPES incl. decode_1x4096, eager + compiled, cache-cleared).
+    ("div_x_by_2",          lambda x: x / 2.0,              False, True),   # divf-by-const → mul 0.5 fold
+    ("chain_3_minus_x_x2",  lambda x: (3.0 - x) * 2.0,      False, True),   # sub_l then mul
+    ("chain_neg_plus_3",    lambda x: torch.neg(x) + 3.0,   False, True),   # neg then add
 ]
 
-# The chains + shapes silicon-verified max|err|=0 on 2026-07-16 (fused-elementwise.md).
-_FUSED_HW_VERIFIED_CHAINS = {"fma_2x_plus_3", "fma_5x_minus_2", "chain_xm5_x2_plus1", "relu_xm5"}
+# The chains + shapes silicon-verified max|err|=0. Base set 2026-07-16 (fused-elementwise.md);
+# div/sub_l/neg folds added 2026-07-18 (all max_diff=0 at the 4 base shapes, cache-cleared).
+# NOTE: fused_decode_1x4096 is deliberately NOT here — (x-5)*2+1 compiled is WRONG there
+# (max_diff=8, isolated/cache-cleared 2026-07-18, a real 3-node×decode-wide bug, #170). The
+# verified set is a (chain × shape) product, so a shape only enters once ALL verified chains
+# pass at it. decode_1x4096 stays unverified until that bug is fixed.
+_FUSED_HW_VERIFIED_CHAINS = {
+    "fma_2x_plus_3", "fma_5x_minus_2", "chain_xm5_x2_plus1", "relu_xm5",
+    "div_x_by_2", "chain_3_minus_x_x2", "chain_neg_plus_3",
+}
 _FUSED_HW_VERIFIED_SHAPES = {"fused_1x64", "fused_128x768", "fused_128x4096", "fused_512x4096"}
 
 # (id, M, N). The four HW-verified shapes PLUS out-of-envelope shapes (decode-wide,
@@ -618,21 +626,32 @@ def test_pointwise_fused_single_input_chain(
         N % _EPS != 0 and M > 1
     )
     if not verified:
+        # decode_1x4096 (M=1, N=4096, decode-wide) is NOT exhaustively swept and has a CONFIRMED
+        # real bug — (x-5)*2+1 compiled = max_diff=8 there (#170). Some chains pass, some don't, so
+        # it is neither a verified shape nor a hard-fail: use a NON-strict xfail so a passing chain
+        # (XPASS) does not turn the suite red and the (x-5)*2+1 failure is tolerated pending #170.
+        strict = shape_id != "fused_decode_1x4096"
         if chain_id not in _FUSED_HW_VERIFIED_CHAINS:
             reason = (
                 f"{chain_id}: classifier accepts this fold but it was NOT on the "
                 "2026-07-16 fused-elementwise HW probe (fused-elementwise.md §6). "
                 "Flip when a HW known-answer passes (max_diff==0)."
             )
+        elif shape_id == "fused_decode_1x4096":
+            reason = (
+                f"{chain_id} {shape_id}: decode-wide (M=1,N=4096) is not exhaustively "
+                "HW-swept; (x-5)*2+1 compiled is a known real bug here (#170). Non-strict "
+                "xfail until #170 is fixed and the shape is swept for all chains."
+            )
         else:
             reason = (
                 f"{chain_id} {shape_id}: fused chain HW-verified only at "
                 "[1,64]/[128,768]/[128,4096]/[512,4096] single-core (2026-07-16) plus "
-                "ragged M>1 (#167, 2026-07-17); this shape (decode-wide / aligned multi-core) "
+                "ragged M>1 (#167, 2026-07-17); this shape (aligned multi-core) "
                 "is out of the verified envelope. >2-node/multi-core fused are pending "
                 "(fused-elementwise.md §6)."
             )
-        request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
+        request.node.add_marker(pytest.mark.xfail(reason=reason, strict=strict))
     x = _signed_small((M, N)) if needs_signed else _small_pos((M, N))
     out_dev = _run_unary_via(entry, fn, x.to("spyre"))
     out_ref = fn(x)
@@ -823,14 +842,17 @@ def test_ragged_m_gt1_shape_model():
 
 
 def test_fused_hw_verified_envelope_is_honest():
-    """Contract guard (HW-independent): the fused expected-pass envelope must match the
-    2026-07-16 milestone exactly — the four verified chains and the four verified shapes,
-    no more. Prevents silently widening expected-pass beyond what silicon proved."""
+    """Contract guard (HW-independent): the fused expected-pass envelope must match what
+    silicon proved — the 4 chains + 4 shapes verified 2026-07-16, PLUS the div/sub_l/neg
+    folds verified 2026-07-18 (all max_diff=0 at the 4 base shapes, cache-cleared).
+    fused_decode_1x4096 is deliberately EXCLUDED: (x-5)*2+1 is wrong there (#170).
+    Prevents silently widening expected-pass beyond what silicon proved."""
     assert _FUSED_HW_VERIFIED_CHAINS == {
-        "fma_2x_plus_3", "fma_5x_minus_2", "chain_xm5_x2_plus1", "relu_xm5"
+        "fma_2x_plus_3", "fma_5x_minus_2", "chain_xm5_x2_plus1", "relu_xm5",
+        "div_x_by_2", "chain_3_minus_x_x2", "chain_neg_plus_3",
     }
     assert _FUSED_HW_VERIFIED_SHAPES == {
-        "fused_1x64", "fused_128x768", "fused_128x4096", "fused_512x4096"
+        "fused_1x64", "fused_128x768", "fused_128x4096", "fused_512x4096",
     }
     # Every HW-verified chain id must exist in the chain table with hw_verified=True.
     verified_in_table = {c[0] for c in _FUSED_SINGLE_INPUT_CHAINS if c[3]}
