@@ -174,11 +174,11 @@ def _sp5_reason(case_id, M, K, N):
 
 def _multicore_164_reason(case_id, M, K, N, C):
     return (
-        f"{case_id} [{M}x{K}x{N}, C={C}]: BLOCKED on SP5 routing (see single-core reason) "
-        f"AND #164. The SP2 multi-core emitter byte-matches the goldens offline, but the "
-        f"first silicon probe FAULTED (RAS 0x7b1b, box wedged) — HW-UNVERIFIED. Even once "
-        f"SP5 routing lands, C>1 known-answers stay unproven until #164 is resolved. Flip "
-        f"into _MULTICORE_HW_VERIFIED_MATMUL only after BOTH clear."
+        f"{case_id} [{M}x{K}x{N}, routed C via choose_cores]: BLOCKED on SP5 routing only. "
+        f"The SP2 multi-core seg-relative emitter is HW-VERIFIED (commit bf7339b: C=2 spc=1/spc=2 "
+        f"D1/D3 max_diff=0); #164 (the 0x7b1b stale-file fault) is RESOLVED. These cases flip into "
+        f"_MULTICORE_HW_VERIFIED_MATMUL once SP5 frontend routing lands AND a torch.compile "
+        f"known-answer passes (max_diff==0) at the choose_cores-routed C."
     )
 
 
@@ -304,3 +304,17 @@ def test_matmul_shape_model():
     assert math.ceil(64 / _EPS) == 1
     # LLM projection: 4096 hidden = 64 sticks each way (needs SP3 K-loop + SP4 N-tile).
     assert math.ceil(4096 / _EPS) == 64
+
+
+# Routed core count: choose_cores picks C from M at the default SENCORES budget (32).
+# The test-case C column DOCUMENTS the intended spc regime; the ROUTED C is what runs.
+_ROUTED_CORES = {2: 1, 4: 2, 8: 4}  # M -> choose_cores(M,64,64,32)
+
+
+def test_matmul_routed_cores_contract():
+    """SP5 routes num_cores via choose_cores (budget=SENCORES=32 default), NOT the
+    declared C column. Documents/locks the M->C mapping the HW probe verifies."""
+    from sentient_codegen.scheduler.matmul_tiling_policy import choose_cores
+    for M, expected_c in _ROUTED_CORES.items():
+        assert choose_cores(M, 64, 64, 32) == expected_c, (
+            f"M={M}: choose_cores routed C={choose_cores(M,64,64,32)}, expected {expected_c}")
