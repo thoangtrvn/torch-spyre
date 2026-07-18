@@ -625,17 +625,336 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(
   throw SpyreCCLNotSupportedException(getBackendName(), __func__);
 }
 
+// All-to-all as N independent single-peer pairwise legs (never a multi-peer
+// batch — see docs/alltoall-transport-design.md). Round r pairs this rank with
+// partner p = (r - rank) mod N, a symmetric perfect matching (both ranks
+// compute the same round and select each other), so each round is a set of
+// independent 2-party exchanges; running the rounds serially is deadlock-free
+// by construction. The p == rank round is a local device copy (no network).
+// Phase 1 is correctness-first: serial, balanced (equal per-peer send/recv
+// extents), stick-aligned, single-chunk buffers only;
+// asymmetric/large/interleaved cases fail fast (Phase 2).
 c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllToAllOptions& opts) {
-  throw SpyreCCLNotSupportedException(getBackendName(), __func__);
+  abort_guard("alltoall");
+  try {
+    const int world = static_cast<int>(group_context_->getSize());
+    const int me = static_cast<int>(group_context_->getRank());
+    if (static_cast<int>(inputTensors.size()) != world ||
+        static_cast<int>(outputTensors.size()) != world) {
+      TORCH_CHECK(
+          false, "[", getBackendName(),
+          "]: alltoall requires input and output tensor lists of length "
+          "world_size (",
+          world, "); got ", inputTensors.size(), " and ", outputTensors.size());
+    }
+    for (auto& t : inputTensors) check_single_tensor(t);
+    for (auto& t : outputTensors) check_single_tensor(t);
+
+    // Precompute buffer descriptors and validate EVERY leg up front — before
+    // any network op — so an unsupported (Phase 1: asymmetric per-peer) size
+    // fails cleanly on this rank with no partial transfers already in flight
+    // against peers this rank would otherwise not reach.
+    std::vector<spyre_comms::BufferDesc> send_bufs;
+    std::vector<spyre_comms::BufferDesc> recv_bufs;
+    send_bufs.reserve(world);
+    recv_bufs.reserve(world);
+    for (int p = 0; p < world; ++p) {
+      send_bufs.push_back(prepare_buffer_desc(inputTensors[p]));
+      recv_bufs.push_back(prepare_buffer_desc(outputTensors[p]));
+      if (send_bufs[p].byte_count == 0 && recv_bufs[p].byte_count == 0) {
+        continue;
+      }
+      // Phase 1: balanced only — per-peer send extent must equal recv extent
+      // (the existing sendrecv/device_copy require it). Asymmetric legs are
+      // Phase 2.
+      TORCH_CHECK(send_bufs[p].byte_count == recv_bufs[p].byte_count, "[",
+                  getBackendName(),
+                  "]: alltoall Phase 1 supports only balanced (equal per-peer "
+                  "send/recv) sizes; peer ",
+                  p, " send=", send_bufs[p].byte_count,
+                  " bytes recv=", recv_bufs[p].byte_count,
+                  " bytes. Asymmetric all-to-all is not yet supported.");
+    }
+
+    // The send buffers must be fully written before the DMA reads them (A5).
+    order_after_caller_stream(inputTensors[0]);
+
+    std::unique_ptr<spyre_comms::WorkSchedule> last_ws;
+    for (int r = 0; r < world; ++r) {
+      const int p = ((r - me) % world + world) % world;
+      if (send_bufs[p].byte_count == 0 && recv_bufs[p].byte_count == 0) {
+        continue;
+      }
+
+      std::unique_ptr<spyre_comms::WorkSchedule> ws;
+      if (p == me) {
+        ws = group_context_->device_copy(recv_bufs[p], send_bufs[p]);
+      } else {
+        ws = group_context_->sendrecv(send_bufs[p], recv_bufs[p], p, /*tag=*/r);
+      }
+      ws->SetStreamAffinity(comm_stream_);
+      ws->start();
+      ws->wait();
+      last_ws = std::move(ws);
+    }
+    TORCH_CHECK(last_ws, "[", getBackendName(),
+                "]: alltoall produced no work (all legs empty)");
+
+    seq_.fetch_add(1, std::memory_order_relaxed);
+    std::vector<at::Tensor> hold(outputTensors.begin(), outputTensors.end());
+    hold.insert(hold.end(), inputTensors.begin(), inputTensors.end());
+    std::vector<at::Tensor> result = outputTensors;
+    return c10::make_intrusive<SpyreCCLWork>(
+        OpType::ALLTOALL, std::move(last_ws), std::move(hold),
+        std::move(result), op_timeout_);
+  }
+  catch (const std::exception& e) {
+    report_and_abort(std::string("alltoall: ") + e.what());
+    throw;
+  }
+  catch (...) {
+    report_and_abort("alltoall: unknown error");
+    throw;
+  }
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall_base(
     at::Tensor& outputTensor, at::Tensor& inputTensor,
     std::vector<int64_t>& outputSplitSizes,
     std::vector<int64_t>& inputSplitSizes, const AllToAllOptions& opts) {
-  throw SpyreCCLNotSupportedException(getBackendName(), __func__);
+  abort_guard("alltoall_base");
+  try {
+    check_single_tensor(inputTensor);
+    check_single_tensor(outputTensor);
+
+    const int world = static_cast<int>(group_context_->getSize());
+    const int me = static_cast<int>(group_context_->getRank());
+
+    const int64_t in_rows = inputTensor.size(0);
+    const int64_t out_rows = outputTensor.size(0);
+    TORCH_CHECK(in_rows > 0 && out_rows > 0, "[", getBackendName(),
+                "]: alltoall_base requires non-empty tensors");
+
+    // world == 1: trivially output = input (whole tensor, identical shape and
+    // layout, so a verbatim device copy is correct). Handles the degenerate
+    // single-rank case and guarantees the round loop below (world > 1) always
+    // produces at least one network leg (a non-null Work to return).
+    if (world == 1) {
+      spyre_comms::BufferDesc in_b = prepare_buffer_desc(inputTensor);
+      spyre_comms::BufferDesc out_b = prepare_buffer_desc(outputTensor);
+      order_after_caller_stream(inputTensor);
+      auto ws = group_context_->device_copy(out_b, in_b);
+      ws->SetStreamAffinity(comm_stream_);
+      ws->start();
+      ws->wait();
+      seq_.fetch_add(1, std::memory_order_relaxed);
+      return c10::make_intrusive<SpyreCCLWork>(
+          OpType::ALLTOALL_BASE, std::move(ws),
+          std::vector<at::Tensor>{outputTensor, inputTensor},
+          std::vector<at::Tensor>{outputTensor}, op_timeout_);
+    }
+
+    // Layout-aware per-peer decomposition. A >=2D device tensor is stored in a
+    // tiled SpyreTensorLayout (device_size = [ceil(inner/64), rows, 64] for a
+    // rank-2 tensor), so a logical dim-0 slice is NOT a contiguous device byte
+    // range and cannot be sliced at the transport layer by raw byte offset (the
+    // confirmed 2-D failure, docs/alltoall-transport-design.md §13.1). Instead
+    // we let torch-spyre's own layout-aware ops carve out each peer's dim-0
+    // sub-chunk as a fresh, standard-layout device tensor (clone), move it as a
+    // WHOLE tensor (the proven, layout-safe path), and scatter the received
+    // tensor back into the output sub-region (copy_ into a narrowed view). This
+    // relies on the now-fixed dim-0 (row-major) storage_offset handling in the
+    // eager device copy spyre::copy_from_d2d (was the §13.6 blocker; core fix
+    // hardware-confirmed 2026-07-17). See §13.2/§13.8.
+    //
+    // NOTE: .clone() (NOT .contiguous()) — a dim-0 narrow of a contiguous
+    // tensor is itself "contiguous" (only a storage offset), so .contiguous()
+    // returns the view and prepare_buffer_desc would read the PARENT
+    // allocation's composite_addr. clone() forces a fresh allocation whose
+    // composite_addr IS the sub-chunk.
+
+    // Split sizes count dim-0 elements; each is numel/size(0) elements wide.
+    const int64_t in_row_elems = inputTensor.numel() / in_rows;
+    const int64_t out_row_elems = outputTensor.numel() / out_rows;
+    const size_t in_row_bytes = static_cast<size_t>(in_row_elems) *
+                                static_cast<size_t>(inputTensor.element_size());
+    const size_t out_row_bytes =
+        static_cast<size_t>(out_row_elems) *
+        static_cast<size_t>(outputTensor.element_size());
+
+    // Empty split list ⇒ uniform even split across the world.
+    std::vector<int64_t> in_splits = inputSplitSizes;
+    std::vector<int64_t> out_splits = outputSplitSizes;
+    if (in_splits.empty()) {
+      TORCH_CHECK(in_rows % world == 0, "[", getBackendName(),
+                  "]: alltoall_base with empty inputSplitSizes requires input "
+                  "dim0 (",
+                  in_rows, ") divisible by world size (", world, ")");
+      in_splits.assign(world, in_rows / world);
+    }
+    if (out_splits.empty()) {
+      TORCH_CHECK(
+          out_rows % world == 0, "[", getBackendName(),
+          "]: alltoall_base with empty outputSplitSizes requires output "
+          "dim0 (",
+          out_rows, ") divisible by world size (", world, ")");
+      out_splits.assign(world, out_rows / world);
+    }
+    TORCH_CHECK(static_cast<int>(in_splits.size()) == world &&
+                    static_cast<int>(out_splits.size()) == world,
+                "[", getBackendName(),
+                "]: split-size lists must have length world_size (", world,
+                ")");
+
+    // Prefix (element) offsets for each peer's dim-0 sub-chunk.
+    std::vector<int64_t> in_off(world, 0);
+    std::vector<int64_t> out_off(world, 0);
+    for (int j = 1; j < world; ++j) {
+      in_off[j] = in_off[j - 1] + in_splits[j - 1];
+      out_off[j] = out_off[j - 1] + out_splits[j - 1];
+    }
+    TORCH_CHECK(in_off[world - 1] + in_splits[world - 1] == in_rows, "[",
+                getBackendName(), "]: inputSplitSizes must sum to input dim0 (",
+                in_rows, ")");
+    TORCH_CHECK(out_off[world - 1] + out_splits[world - 1] == out_rows, "[",
+                getBackendName(),
+                "]: outputSplitSizes must sum to output dim0 (", out_rows, ")");
+
+    // For a 1-D tensor, dim-0 IS the innermost (stick) dimension, so a dim-0
+    // narrow is a stick-dim offset — only the stick-aligned case is supported
+    // by the copy_from_d2d fix (non-stick-aligned innermost offsets remain an
+    // xfail). For >=2D, dim-0 is NOT the stick dim, so arbitrary dim-0 offsets
+    // are supported. Require 128-byte (stick) alignment only for the 1-D case.
+    const bool require_stick_align =
+        (inputTensor.dim() == 1 || outputTensor.dim() == 1);
+    constexpr size_t kStickBytes = 128;
+
+    // Validate EVERY leg up front — before any op — so an unsupported split
+    // (asymmetric, or non-stick-aligned 1-D) fails cleanly with no partial
+    // transfers in flight against peers this rank would otherwise not reach.
+    for (int p = 0; p < world; ++p) {
+      const size_t s_off = static_cast<size_t>(in_off[p]) * in_row_bytes;
+      const size_t s_len = static_cast<size_t>(in_splits[p]) * in_row_bytes;
+      const size_t r_off = static_cast<size_t>(out_off[p]) * out_row_bytes;
+      const size_t r_len = static_cast<size_t>(out_splits[p]) * out_row_bytes;
+      if (s_len == 0 && r_len == 0) {
+        continue;
+      }
+      // Balanced only — the single-peer sendrecv requires equal send/recv byte
+      // extents. Asymmetric (MoE) splits are Phase 2.
+      TORCH_CHECK(
+          s_len == r_len, "[", getBackendName(),
+          "]: alltoall_base Phase 1 supports only balanced (equal "
+          "per-peer send/recv) splits; peer ",
+          p, " send=", s_len, " bytes recv=", r_len,
+          " bytes. Asymmetric all-to-all (MoE token routing) is not yet "
+          "supported.");
+      if (require_stick_align) {
+        TORCH_CHECK(
+            s_off % kStickBytes == 0 && s_len % kStickBytes == 0 &&
+                r_off % kStickBytes == 0 && r_len % kStickBytes == 0,
+            "[", getBackendName(),
+            "]: alltoall_base on a 1-D tensor requires 128-byte (stick) "
+            "aligned per-peer offsets/sizes (dim-0 is the stick "
+            "dimension); peer ",
+            p, " send_off=", s_off, " send_len=", s_len, " recv_off=", r_off,
+            " recv_len=", r_len);
+      }
+    }
+
+    // Ensure the producing compute has landed before we read/clone the input.
+    order_after_caller_stream(inputTensor);
+
+    // Keep every per-peer send/recv tensor alive for the WHOLE collective. The
+    // spyre allocator frees a device tensor's memory IMMEDIATELY on destruction
+    // (spyre_allocator.cpp ReportAndDelete: USE_DEFERRED is not defined, and
+    // comm_stream_ is never recordStream()'d), so letting these per-round
+    // buffers destruct each iteration would return their memory to the
+    // allocator and the NEXT round's clone/empty_like could reuse it while this
+    // round's HDMA is still settling — nondeterministic cross-round corruption
+    // (HARDWARE-CONFIRMED 2026-07-17, §13.5). Retaining them here restores the
+    // long-lived-buffer invariant the list-form path already has. Freed
+    // together after the final sync.
+    std::vector<at::Tensor> keep_alive;
+    keep_alive.reserve(static_cast<size_t>(2 * world));
+
+    std::unique_ptr<spyre_comms::WorkSchedule> last_ws;
+
+    for (int r = 0; r < world; ++r) {
+      const int p = ((r - me) % world + world) % world;
+      const int64_t in_o = in_off[p];
+      const int64_t in_l = in_splits[p];
+      const int64_t out_o = out_off[p];
+      const int64_t out_l = out_splits[p];
+
+      if (in_l == 0 && out_l == 0) {
+        continue;
+      }
+
+      if (p == me) {
+        // Local move: output[out slice] = input[in slice], layout-aware.
+        outputTensor.narrow(0, out_o, out_l)
+            .copy_(inputTensor.narrow(0, in_o, in_l));
+        continue;
+      }
+
+      // Materialize a contiguous, standard-layout per-peer send tensor and a
+      // matching receive tensor.
+      at::Tensor send_p = inputTensor.narrow(0, in_o, in_l).clone();
+      at::Tensor recv_p = at::empty_like(outputTensor.narrow(0, out_o, out_l));
+      // send_p must be fully materialized before the HDMA reads its device
+      // memory (the transfer runs on comm_stream_, not the caller stream).
+      order_after_caller_stream(send_p);
+
+      spyre_comms::BufferDesc send_buf = prepare_buffer_desc(send_p);
+      spyre_comms::BufferDesc recv_buf = prepare_buffer_desc(recv_p);
+      auto ws = group_context_->sendrecv(send_buf, recv_buf, p, /*tag=*/r);
+      ws->SetStreamAffinity(comm_stream_);
+      ws->start();
+      ws->wait();
+
+      // Scatter the received rows into the output sub-region (layout-aware),
+      // then retain both buffers so their device memory is not freed/reused
+      // until the whole collective completes.
+      outputTensor.narrow(0, out_o, out_l).copy_(recv_p);
+      keep_alive.push_back(std::move(send_p));
+      keep_alive.push_back(std::move(recv_p));
+      last_ws = std::move(ws);
+    }
+
+    // All caller-stream ops (self-copies, clones, scatters) must complete
+    // before the retained buffers are freed on return and before the caller
+    // reads output.
+    order_after_caller_stream(outputTensor);
+
+    if (!last_ws) {
+      // No cross-rank legs (every peer split was 0 — a valid but degenerate
+      // all-local exchange; the self copy above already produced the result).
+      // Synthesize a completed Work (identity device copy) so the Future/wait
+      // path is well-formed.
+      spyre_comms::BufferDesc out_b = prepare_buffer_desc(outputTensor);
+      last_ws = group_context_->device_copy(out_b, out_b);
+      last_ws->SetStreamAffinity(comm_stream_);
+      last_ws->start();
+      last_ws->wait();
+    }
+
+    seq_.fetch_add(1, std::memory_order_relaxed);
+    std::vector<at::Tensor> hold = {outputTensor, inputTensor};
+    return c10::make_intrusive<SpyreCCLWork>(
+        OpType::ALLTOALL_BASE, std::move(last_ws), std::move(hold),
+        std::vector<at::Tensor>{outputTensor}, op_timeout_);
+  }
+  catch (const std::exception& e) {
+    report_and_abort(std::string("alltoall_base: ") + e.what());
+    throw;
+  }
+  catch (...) {
+    report_and_abort("alltoall_base: unknown error");
+    throw;
+  }
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
