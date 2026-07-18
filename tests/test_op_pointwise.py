@@ -294,56 +294,40 @@ def test_pointwise_binary_distinct_per_stick(op_id, fn, shape_id, M, N):
 # ragged-N case. Inductor flattens [M,N] to a 1D grid and the torch-spyre bridge decomposes
 # it as N'=64, M'=ceil(M·N/64) LOGICAL sticks.
 #
-# ⚠️ THE M>1 CATCH (HW-proven this session, #167 — corrects the earlier "row-padding absorbs
-# the tail" claim, which was WRONG): the 1D-flatten writes ceil(M·N/64) LOGICAL sticks, but
-# `.to("spyre")` row-pads each row to M·ceil(N/64) PHYSICAL sticks. When N%64 != 0 AND M>1,
-# physical > logical, so the trailing physical sticks are NEVER WRITTEN and read back as 0 —
-# the ragged tail does NOT land inertly in padding; it drops real data.
-# HW probe at the committed operands (a∈0..7, b∈1..4) gave add=11 / mul=28 / sub=7 — the
-# OPERAND MAXIMA (max(a+b)=11, max(a*b)=28), i.e. the failing element reads ~0 where the
-# correct value was maximal. FINGERPRINT (direct mechanism proof, 3×200): the wrong elements
-# are cols 192-199 = the 200%64=8 partial tail of rows 1,2 ONLY; row 0 is correct (it aligns
-# by coincidence) — exactly the "physical row-pad sticks unwritten" prediction. Reproduced
-# BYTE-IDENTICAL under codegen@7718bdc (pre-SP1/SP2) AND with "Fix A" (Inductor choices.py)
-# present, so this is PRE-EXISTING and NOT fixed by Fix A — the prior "max_diff=0" green was a
-# periodicity-masked / unverified-batch false-green (same class as pointwise.md §7/§11/§12).
-# The bug is in the SHARED .to(spyre) stick-write layer (eager, which never routes through
-# choices.py, fails identically at 11), not the Inductor tiling hook; #167 reopened there.
-#   M==1: logical == physical (one row) → NO drop → HW-passes. Kept GREEN below.
-#   M>1 : physical > logical → tail drop → xfail-strict(#167) below; auto-flips when a real
-#         shared-layer fix HW-verifies (no green flip pending — Fix A did not fix it).
+# THE M>1 CATCH (root-caused + FIXED this session, #167): the naive 1D-flatten wrote
+# ceil(M·N/64) LOGICAL sticks, but `.to("spyre")` row-pads each row to M·ceil(N/64) PHYSICAL
+# sticks. When N%64 != 0 AND M>1, physical > logical, so the trailing physical sticks were
+# NEVER WRITTEN and read back as 0 — the ragged tail dropped real data (it did NOT land inertly
+# in padding; that earlier claim was wrong). FINGERPRINT (direct mechanism proof, 3×200): the
+# wrong elements were cols 192-199 = the 200%64=8 partial tail of rows 1,2 ONLY; row 0 was
+# correct (it aligns by coincidence) — exactly the "physical row-pad sticks unwritten" mechanism.
+#
+# FIX (#167): torch_spyre/_inductor/choices.py recovers the true (M,N) and row-pads the 1D
+# flatten to m_val = M·ceil(N/64), so the op writes the physical stick count the tensor actually
+# occupies. HW-VERIFIED max_diff=0.0 (add/mul/sub, neg/relu, fused single-input chains, and
+# scalar-affine) × ragged M>1 {3×200,7×91,4×100,4×40,3×130,2×65} × eager AND compiled.
+#   M==1: logical == physical (one row) → never had a drop → HW-passes. GREEN.
+#   M>1 : row-padded flatten → HW-passes. GREEN.
+#
+# ⚠️ CACHE NOTE (#168): a choices.py source edit does NOT invalidate the Inductor FxGraphCache /
+# Triton disk cache (keyed on FX graph + input meta, not choices source). A stale pre-fix kernel
+# briefly made this look "unfixed" (max_diff=11 on a box with an old cached kernel) — a false
+# "refuted" that was NOT a real geometry bug. The conftest fixture in tests/conftest.py
+# (_clear_compile_caches_for_ragged) clears those caches before these tests so HW observes the
+# current codegen. "eager" here is torch.compile(dynamic=False) under the hood (ops/eager.py),
+# so both entry points share the choices.py path and the same cache discipline.
 #
 # Operands: _small_pos/_signed_small use arange%8 — over a flat 1D stream every element is
 # distinct-per-position, so a dropped/duplicated tail element shows as a nonzero max_diff.
 _RAGGED_N_SHAPES = [
     ("sub_stick_1x40",   1,   40),    # N<eps: single partial stick (24 tail), decode
-    ("sub_stick_4x40",   4,   40),    # N<eps: multi-row sub-stick — M>1 (#167 tail-drop)
+    ("sub_stick_4x40",   4,   40),    # N<eps: multi-row sub-stick — M>1 (row-padded, #167 fixed)
     ("ragged_1x100",     1,   100),   # N>eps: 1 full + 36 tail, decode
-    ("ragged_4x100",     4,   100),   # N>eps: multi-row ragged — M>1 (#167 tail-drop)
-    ("ragged_3x200",     3,   200),   # N>eps: 3 full + 8 tail — M>1 (#167 tail-drop)
-    ("ragged_7x91",      7,   91),    # N>eps: 1 full + 27 tail, prime dims — M>1 (#167 tail-drop)
+    ("ragged_4x100",     4,   100),   # N>eps: multi-row ragged — M>1 (row-padded, #167 fixed)
+    ("ragged_3x200",     3,   200),   # N>eps: 3 full + 8 tail — M>1 (row-padded, #167 fixed)
+    ("ragged_7x91",      7,   91),    # N>eps: 1 full + 27 tail, prime dims — M>1 (#167 fixed)
     ("tiny_1x5",         1,   5),     # N<<eps: 5 valid, 59 tail (smallest real case)
 ]
-
-# The ragged M>1 tail-element drop (#167). Op-agnostic: the physical row-pad sticks past the
-# logical stick count are never written → read 0, independent of the compute op. The wrong
-# elements are exactly the partial-tail columns of rows>0 (e.g. 3×200: cols 192-199 = the
-# 200%64=8 tail of rows 1,2; row 0 correct). xfail-strict so each case auto-flips
-# (XPASS → strict failure) the moment a real fix lands + HW-verifies.
-#
-# ⚠️ NOT fixed by "Fix A" (the Inductor choices.py tiling hook): a 2026-07-17 HW probe with
-# Fix A present measured add-ragged_3x200 = max_diff=11 on BOTH eager and compiled, BYTE-
-# IDENTICAL to pre-fix. Eager never routes through choices.py yet is broken identically →
-# the controlling stick-count is in the SHARED .to(spyre) device-layout / kernel-stick-write
-# layer, NOT the Inductor tiling hook. #167 is reopened for a real fix at that shared layer.
-_RAGGED_M_GT1_REASON = (
-    "#167 ragged M>1 tail-element drop: 1D-flatten writes ceil(M·N/64) logical sticks but "
-    ".to(spyre) row-pads to M·ceil(N/64) physical sticks; when N%64!=0 and M>1 the trailing "
-    "physical sticks are never written → read 0 (HW add=11/mul=28/sub=7 at the operand maxima; "
-    "reproduced pre-SP1/SP2 AND with Fix A present, byte-identical → the bug is in the shared "
-    ".to(spyre) stick-write layer, NOT Inductor tiling; #167 reopened). Auto-flips when a real "
-    "fix HW-verifies."
-)
 
 
 @requires_hw
@@ -351,7 +335,8 @@ _RAGGED_M_GT1_REASON = (
 @pytest.mark.parametrize("op_id,fn", _UNARY_OPS, ids=[o[0] for o in _UNARY_OPS])
 def test_pointwise_unary_ragged_n(op_id, fn, shape_id, M, N):
     """Unary pointwise op at ragged N (N % 64 != 0) must be exact — the tail must not
-    corrupt the logical output. Regression-lock for the sub-stick support path."""
+    corrupt the logical output. Regression-lock for the sub-stick support path (#167:
+    M>1 row-padded flatten, HW-verified max_diff=0)."""
     if op_id not in _SUPPORTED_OPS:
         pytest.xfail(f"{op_id}: no HW-verified SFP binary yet (Part A fail-loud).")
     x = _signed_small((M, N)) if op_id == "relu" else _small_pos((M, N))
@@ -367,15 +352,12 @@ def test_pointwise_unary_ragged_n(op_id, fn, shape_id, M, N):
 @requires_hw
 @pytest.mark.parametrize("shape_id,M,N", _RAGGED_N_SHAPES, ids=[s[0] for s in _RAGGED_N_SHAPES])
 @pytest.mark.parametrize("op_id,fn", _BINARY_OPS, ids=[o[0] for o in _BINARY_OPS])
-def test_pointwise_binary_ragged_n(op_id, fn, shape_id, M, N, request):
-    """Binary pointwise op at ragged N (N % 64 != 0). M==1 must be exact (HW-passes; no
-    tail drop when logical==physical). M>1 is xfail-strict on the #167 tail-element drop
-    (HW-proven this session; auto-flips when Fix A HW-verifies)."""
+def test_pointwise_binary_ragged_n(op_id, fn, shape_id, M, N):
+    """Binary pointwise op at ragged N (N % 64 != 0) must be exact, M==1 and M>1 alike.
+    #167 (row-padded 1D flatten in choices.py) fixed the M>1 tail-element drop; HW-verified
+    max_diff=0 for add/mul/sub across the ragged M>1 shapes. Regression-lock."""
     if op_id not in _SUPPORTED_OPS:
         pytest.xfail(f"{op_id}: no HW-verified SFP binary yet (Part A fail-loud).")
-    # M>1 ragged drops the trailing physical stick(s) (#167). Op-agnostic; verified add/mul/sub.
-    if M > 1:
-        request.node.add_marker(pytest.mark.xfail(reason=_RAGGED_M_GT1_REASON, strict=True))
     a = _small_pos((M, N))
     b = (_small_pos((M, N)) % 4 + 1)  # 1..4, keeps sums/products <= 1024
     out_dev = fn(a.to("spyre"), b.to("spyre")).cpu()
@@ -628,23 +610,15 @@ def test_pointwise_fused_single_input_chain(
     scalar-affine ops. Only the four chains × four shapes silicon-verified 2026-07-16 are
     expected-pass; every other (chain, shape) is xfail-strict so it auto-flips (XPASS →
     strict failure) once the HW sweep extends the verified envelope."""
-    verified = hw_verified and shape_id in _FUSED_HW_VERIFIED_SHAPES
+    # Ragged N × M>1 for a fused single-input chain is HW-VERIFIED (#167): the chain produces a
+    # binary and rides the choices.py row-padded flatten, so the tail no longer drops. Sweep
+    # 2026-07-17 (caches cleared): 2*x+3 / 5*x-2 / relu(x-5) × {3×200,4×100,7×91} × eager+compiled
+    # all max_diff=0.0. So the ragged×M>1 case is EXPECTED-PASS and takes NO xfail marker below.
+    verified = (hw_verified and shape_id in _FUSED_HW_VERIFIED_SHAPES) or (
+        N % _EPS != 0 and M > 1
+    )
     if not verified:
-        if N % _EPS != 0 and M > 1:
-            # Ragged N × M>1: the fused single-input chain DOES produce a binary (unlike
-            # multi-tensor DAGs), so it rides the SAME shared .to(spyre) stick-write layer as
-            # bare pointwise → PREDICTED to hit the same #167 physical>logical tail-drop
-            # (trailing physical sticks unwritten → read 0). NOT separately HW-measured for
-            # fused chains (the binary 11/28/7 is the sibling measurement, not this one). This
-            # is the meaningful "torch.compile + fused at ragged M>1" coverage; auto-flips when
-            # a real fix HW-verifies (Fix A / Inductor choices.py was refuted — see #167).
-            reason = (
-                f"{chain_id} {shape_id}: fused single-input chain at ragged M>1 — predicted "
-                "#167 tail-drop in the shared .to(spyre) stick-write layer (bare-pointwise "
-                "sibling HW-measured at the operand maxima; fused not separately measured). "
-                "Auto-flips when a real #167 fix HW-verifies."
-            )
-        elif chain_id not in _FUSED_HW_VERIFIED_CHAINS:
+        if chain_id not in _FUSED_HW_VERIFIED_CHAINS:
             reason = (
                 f"{chain_id}: classifier accepts this fold but it was NOT on the "
                 "2026-07-16 fused-elementwise HW probe (fused-elementwise.md §6). "
@@ -653,9 +627,10 @@ def test_pointwise_fused_single_input_chain(
         else:
             reason = (
                 f"{chain_id} {shape_id}: fused chain HW-verified only at "
-                "[1,64]/[128,768]/[128,4096]/[512,4096] single-core (2026-07-16); this "
-                "shape (decode-wide / multi-core) is out of the verified envelope. "
-                ">2-node/multi-core fused are pending (fused-elementwise.md §6)."
+                "[1,64]/[128,768]/[128,4096]/[512,4096] single-core (2026-07-16) plus "
+                "ragged M>1 (#167, 2026-07-17); this shape (decode-wide / aligned multi-core) "
+                "is out of the verified envelope. >2-node/multi-core fused are pending "
+                "(fused-elementwise.md §6)."
             )
         request.node.add_marker(pytest.mark.xfail(reason=reason, strict=True))
     x = _signed_small((M, N)) if needs_signed else _small_pos((M, N))
@@ -780,29 +755,20 @@ _RAGGED_M_GT1_BINARY = [
     ("mul", lambda a, b: a * b),
     ("sub", lambda a, b: a - b),
 ]
-# Binary: the #167 fix task (choices.py 1D-flatten), HW-measured add=11/mul=28/sub=7.
-_RAGGED_167_REASON = _RAGGED_M_GT1_REASON
-# Unary: op-agnostic mechanism, PREDICTED to drop but not yet HW-measured for neg/relu.
-_RAGGED_166_REASON = (
-    "#166 op-independent ragged M>1 tail-drop (predicted op-agnostic; unary neg/relu NOT "
-    "yet HW-measured — do not read the binary 11/28/7 as a unary measurement). Same "
-    "physical>logical stick-drop as the binary #167 case, in the SHARED .to(spyre) "
-    "stick-write layer (Fix A / Inductor choices.py was REFUTED — binary stayed 11 with it "
-    "present), so unary should ride the same real fix and auto-flip together. Labeled #166 "
-    "(not #167) so a unary-specific need surfaces if it does NOT auto-flip. Auto-flips when "
-    "a real fix HW-verifies for these ops."
-)
+# Ragged M>1 is HW-VERIFIED FIXED (#167, choices.py row-padded 1D flatten): sweep 2026-07-17
+# (caches cleared) gave max_diff=0.0 for binary add/mul/sub AND unary neg/relu × {3×200,7×91,
+# 4×100,4×40,3×130,2×65} × eager+compiled. Both dedicated tests below are now EXPECTED-PASS
+# (no xfail markers) and serve as the regression-lock. The de-periodized operands (period 20/7,
+# coprime-to-64) additionally guard against a per-stick/per-core feed regression.
 
 
 @requires_hw
 @pytest.mark.parametrize("entry", ("eager", "compiled"))
 @pytest.mark.parametrize("shape_id,M,N", _RAGGED_M_GT1_SHAPES, ids=[s[0] for s in _RAGGED_M_GT1_SHAPES])
 @pytest.mark.parametrize("op_id,fn", _RAGGED_M_GT1_UNARY, ids=[o[0] for o in _RAGGED_M_GT1_UNARY])
-def test_pointwise_unary_ragged_m_gt1(op_id, fn, shape_id, M, N, entry, request):
-    """Unary neg/relu at ragged N × M>1 via eager AND compiled — the coverage gap that
-    let the ragged M>1 bug hide. xfail-strict on #166 (op-agnostic tail-drop predicted for
-    unary, not yet HW-measured; auto-flips when Fix A HW-verifies)."""
-    request.node.add_marker(pytest.mark.xfail(reason=_RAGGED_166_REASON, strict=True))
+def test_pointwise_unary_ragged_m_gt1(op_id, fn, shape_id, M, N, entry):
+    """Unary neg/relu at ragged N × M>1 via eager AND compiled — the coverage gap that let
+    the ragged M>1 bug hide, now HW-verified fixed (#167 row-padded flatten, max_diff=0)."""
     x = _signed_small((M, N)) if op_id == "relu" else _small_pos((M, N))
     out_dev = _run_unary_via(entry, fn, x.to("spyre"))
     out_ref = fn(x)
@@ -818,14 +784,14 @@ def test_pointwise_unary_ragged_m_gt1(op_id, fn, shape_id, M, N, entry, request)
 @pytest.mark.parametrize("entry", ("eager", "compiled"))
 @pytest.mark.parametrize("shape_id,M,N", _RAGGED_M_GT1_SHAPES, ids=[s[0] for s in _RAGGED_M_GT1_SHAPES])
 @pytest.mark.parametrize("op_id,fn", _RAGGED_M_GT1_BINARY, ids=[o[0] for o in _RAGGED_M_GT1_BINARY])
-def test_pointwise_binary_ragged_m_gt1(op_id, fn, shape_id, M, N, entry, request):
-    """Binary add/mul/sub at ragged N × M>1 via eager AND compiled — the exact
-    fused-with-ragged residual of Fix A #167. Distinct-per-stick operands (period 20 / 7,
-    both coprime-to-64) so a per-stick/per-core feed bug is CAUGHT. xfail-strict on #167.
+def test_pointwise_binary_ragged_m_gt1(op_id, fn, shape_id, M, N, entry):
+    """Binary add/mul/sub at ragged N × M>1 via eager AND compiled — the ragged M>1 case that
+    Fix A #167 (choices.py row-padded flatten) fixed; HW-verified max_diff=0. Distinct-per-stick
+    operands (period 20 / 7, both coprime-to-64) so a per-stick/per-core feed regression is
+    CAUGHT.
 
     sub (non-commutative) is the sensitive canary: an operand swap/misfeed that add/mul
     absorb changes a-b. Result stays DL16-exact: mul<=140, sub in [-6,19], add in [2,27]."""
-    request.node.add_marker(pytest.mark.xfail(reason=_RAGGED_167_REASON, strict=True))
     a = _distinct_per_stick((M, N), period=20)
     b = _distinct_per_stick((M, N), period=7)
     if entry == "eager":

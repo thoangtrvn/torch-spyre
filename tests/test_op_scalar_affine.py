@@ -237,31 +237,24 @@ _RAGGED_AFFINE_SHAPES = [
     ("aff_ragged_3x130",  3,  130),   # M>1 ragged
     ("aff_subsz_2x65",    2,  65),    # M>1 just-over-one-stick
 ]
-_RAGGED_AFFINE_166_REASON = (
-    "#166 op-independent ragged M>1 tail-drop: scalar-affine rides the shared unary datapath, "
-    "so the physical>logical stick-drop in the SHARED .to(spyre) stick-write layer applies "
-    "identically — trailing physical sticks past ceil(M·N/64) logical sticks are never written "
-    "→ read 0. PREDICTED op-agnostic (the add/mul/sub sibling was HW-measured failing at the "
-    "operand maxima), NOT yet HW-measured for scalar-affine. NOTE: 'Fix A' (Inductor choices.py) "
-    "was REFUTED for the binary case (stayed 11 with it present) — the real fix is at the shared "
-    "layer; #167 reopened. Auto-flips when a real fix HW-verifies for these ops."
-)
+# Ragged M>1 scalar-affine is HW-VERIFIED FIXED (#167 choices.py row-padded flatten): sweep
+# 2026-07-17 (caches cleared) gave max_diff=0.0 for mul_0p5/add_7/rsub_10 × {4×100,3×130,2×65}
+# × eager+compiled. scalar-affine rides the same choices.py path as bare pointwise, so the
+# row-padded flatten fixes its tail identically. M>1 is now EXPECTED-PASS (no xfail marker).
 
 
 @requires_hw
 @pytest.mark.parametrize("entry", ("eager", "compiled"))
 @pytest.mark.parametrize("shape_id,M,N", _RAGGED_AFFINE_SHAPES, ids=[s[0] for s in _RAGGED_AFFINE_SHAPES])
 @pytest.mark.parametrize("op_id,fn,exact", _SCALAR_AFFINE_OPS, ids=[o[0] for o in _SCALAR_AFFINE_OPS])
-def test_scalar_affine_ragged_n(op_id, fn, exact, shape_id, M, N, entry, request):
-    """`x ∘ c` at ragged N via eager AND compiled. M==1 ragged is expected-pass for the
-    HW-verified subforms (no tail drop when logical==physical); M>1 ragged is xfail-strict
-    on the #166 op-agnostic tail-drop (auto-flips when Fix A HW-verifies)."""
+def test_scalar_affine_ragged_n(op_id, fn, exact, shape_id, M, N, entry):
+    """`x ∘ c` at ragged N via eager AND compiled. Both M==1 and M>1 must be exact for the
+    HW-verified subforms: #167 (choices.py row-padded flatten) fixed the M>1 tail-element drop;
+    HW-verified max_diff=0 for scalar-affine at ragged M>1."""
     if op_id not in _HW_VERIFIED_AFFINE_OPS:
         pytest.xfail(_xfail_reason(op_id, shape_id))
     if op_id not in _MULTISTICK_VERIFIED_AFFINE_OPS:
         pytest.xfail(f"{op_id} {shape_id}: multi-stick scalar-affine not yet HW-verified.")
-    if M > 1:
-        request.node.add_marker(pytest.mark.xfail(reason=_RAGGED_AFFINE_166_REASON, strict=True))
     x = _small_pos((M, N))
     if entry == "eager":
         out_dev = fn(x.to("spyre")).cpu()
