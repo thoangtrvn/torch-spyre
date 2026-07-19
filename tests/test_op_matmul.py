@@ -137,11 +137,16 @@ _MATMUL_CASES = [
     #     INJECTION only; torch-level they still xfail on SP5 routing. ---
     ("sp1_2x64x64",      2,   64,   64,   1, _SP1, ("identity", "ones")),
     ("sp1_4x64x64",      4,   64,   64,   1, _SP1, ("identity", "ones")),
-    # --- Multi-core SP2 envelope (C>1). spc=1: (M=2,C=2); spc=2: (M=4,C=2),(M=8,C=4).
-    #     Blocked on SP5 routing AND #164 (0x7b1b silicon fault). ---
+    # --- Multi-core SP2 envelope (C>1). Routed C via choose_cores: M=2->C=1,
+    #     M=4->C=2, M=8->C=4, M=16->C=8 (all spc=2 except M=2->spc=2 at routed C=1).
+    #     The SP2 emitter is spc-invariant per core; only core_mask + the C-1 PatchInit
+    #     fold move with C, so C=8 rides the UNCHANGED emitter (byte-matched the C=8
+    #     deeptools goldens offline; HW-verified max_diff=0 via BOTH binary-injection AND
+    #     the torch path — eager + torch.compile, first 8-core matmul on silicon). ---
     ("sp2_2x64x64_c2",   2,   64,   64,   2, _SP2, ("identity", "ones")),   # spc=1
     ("sp2_4x64x64_c2",   4,   64,   64,   2, _SP2, ("identity", "ones")),   # spc=2
     ("sp2_8x64x64_c4",   8,   64,   64,   4, _SP2, ("identity", "ones")),   # spc=2
+    ("sp2_16x64x64_c8",  16,  64,   64,   8, _SP2, ("identity", "ones")),   # spc=2, routes C=8
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 (SP3) and N>64
     #     (SP4) both unbuilt, on top of SP5 routing. ones would overflow DL16
     #     (K=4096>1024) so only the identity known-answer is DL16-exact here. ---
@@ -161,7 +166,7 @@ _MATMUL_CASES = [
 # _MULTICORE_HW_VERIFIED_MATMUL (so sp1_4x64x64 lives here despite routing to C=2).
 _HW_VERIFIED_MATMUL: set[str] = {"sp1_2x64x64", "sp1_4x64x64"}
 _MULTICORE_HW_VERIFIED_MATMUL: set[str] = {
-    "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4"}
+    "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8"}
 
 
 def _sp5_reason(case_id, M, K, N):
@@ -277,9 +282,9 @@ def test_matmul_verified_membership_locked():
         "widening, then update this lock."
     )
     assert _MULTICORE_HW_VERIFIED_MATMUL == {
-        "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4"}, (
+        "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8"}, (
         "Multi-core-tier verified set changed. Only the K=N=64 SP2-tier ids (routed "
-        "C=1/2/4) are HW-verified. Confirm max_diff==0 on silicon before widening, then "
+        "C=1/2/4/8) are HW-verified. Confirm max_diff==0 on silicon before widening, then "
         "update this lock."
     )
 
@@ -317,7 +322,7 @@ def test_matmul_shape_model():
 
 # Routed core count: choose_cores picks C from M at the default SENCORES budget (32).
 # The test-case C column DOCUMENTS the intended spc regime; the ROUTED C is what runs.
-_ROUTED_CORES = {2: 1, 4: 2, 8: 4}  # M -> choose_cores(M,64,64,32)
+_ROUTED_CORES = {2: 1, 4: 2, 8: 4, 16: 8}  # M -> choose_cores(M,64,64,32)
 
 
 def test_matmul_routed_cores_contract():
