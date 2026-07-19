@@ -1,48 +1,46 @@
 """Living coverage CONTRACT for matmul (aten.mm / torch.matmul / ``a @ b``) on spyre.
 
-⚠️ THIS FILE ADDS ZERO VERIFICATION VALUE TODAY — EVERY CASE XFAILS.
+STATUS (2026-07-18): SP5 frontend routing is LIVE and the K=N=64 envelope is
+HW-VERIFIED via torch.compile AND eager.
 ================================================================================
-matmul is NOT wired to the codegen emitter through torch.compile/eager yet (the
-"SP5" milestone gap), so a real ``a @ b`` compile can never reach the HW-verified
-seg-relative matmul path — it fails loud instead. There is therefore NO matmul
-result this file can assert as PASSING without manufacturing false confidence in
-an unbuilt (and, for multi-core, HW-FAULTING) path. So every case here is xfail.
+A real ``a @ b`` in the seg-relative envelope (K<=64, N<=64) now routes end-to-end
+to the HW-verified MATMUL_SEG_RELATIVE emitter: resolve_matmul_structure claims
+matmul_strategy + num_cores, the _compute_tiling resolver registry dispatches it,
+and SENCORES (default 32) is the choose_cores core-budget ceiling. All five
+in-envelope cases pass their DL16-exact known-answers with max_diff==0 (D1 identity,
+D3 ones) at the choose_cores-ROUTED C — M=2->C=1, M=4->C=2, M=8->C=4. Out-of-envelope
+LLM shapes (K>64 SP3 / N>64 SP4) remain unbuilt and stay xfail.
 
-The file's value is entirely as a LIVING CONTRACT (mirrors tests/test_op_pointwise.py
-and tests/test_op_scalar_affine.py):
-  (a) it DOCUMENTS the intended matmul coverage — the single-core SP1 tile, the
-      multi-core SP2 M-tiling envelope, and the real LLM projection shapes — as an
-      executable table, and
-  (b) it AUTO-FLIPS to real known-answer tests the moment the blockers clear: add a
-      case to _HW_VERIFIED_MATMUL (single-core) / _MULTICORE_HW_VERIFIED_MATMUL
-      (multi-core) and the guarded assertion below starts running. No test rewrite.
+The file's value as a LIVING CONTRACT (mirrors tests/test_op_pointwise.py and
+tests/test_op_scalar_affine.py):
+  (a) it DOCUMENTS the matmul coverage — the SP1 tile, the multi-core SP2 M-tiling
+      envelope, and the real LLM projection shapes — as an executable table, and
+  (b) it AUTO-FLIPS a case to a real known-answer test the moment its id is added to
+      _HW_VERIFIED_MATMUL (SP1 tier) / _MULTICORE_HW_VERIFIED_MATMUL (SP2 tier) after
+      a max_diff==0 HW pass — no test rewrite. The remaining xfail (LLM) flips when
+      SP3/SP4 land + HW-verify.
 
-TWO DISTINCT BLOCKERS (the xfail reasons keep them separate — see codegen
+BLOCKER HISTORY (both cleared for the K=N=64 envelope — see codegen
 docs/op-milestones/matmul.md, the SP1→SP5 roadmap):
-  1. SP5 FRONTEND ROUTING (blocks ALL torch-level matmul cases). TilingConfig.
-     matmul_strategy defaults to SINGLE_TILE and is NEVER assigned MATMUL_SEG_RELATIVE
-     / emit_sp2_matmul from a production compile, so ``a @ b`` never selects the
-     HW-verified seg-relative emitter. It hits the SINGLE_TILE guard in
-     scheduler/engine.py which raises UnsupportedMatmulShapeError for any real shape
-     (tile_k<K or tile_n<N). ``choose_cores`` (matmul_tiling_policy.py) has zero
-     callers. The SP1 single tile (K=N=64, 1-core, M·ceil(K/64)≤32) IS HW-verified —
-     but only via BINARY INJECTION (launch_kernel_from_bytes), NOT via torch.compile.
-     So torch-level, even SP1 shapes still xfail on routing.
-  2. #164 MULTI-CORE HW FAULT (additionally blocks every C>1 case). The SP2
-     multi-core emitter byte-matches the legacy goldens offline, but the first
-     silicon probe FAULTED (RAS 0x7b1b, box wedged) — HW-UNVERIFIED. Even after SP5
-     routing lands, multi-core known-answers stay unproven until #164 is resolved.
-  (Real LLM shapes carry a THIRD documentation note: K>64 needs SP3 (within-core
+  1. SP5 FRONTEND ROUTING — CLEARED. Previously TilingConfig.matmul_strategy defaulted
+     to SINGLE_TILE and was never assigned MATMUL_SEG_RELATIVE from a production
+     compile, so ``a @ b`` hit the SINGLE_TILE guard in scheduler/engine.py
+     (UnsupportedMatmulShapeError) and ``choose_cores`` had zero callers. SP5 wired
+     resolve_matmul_structure + the _compute_tiling resolver registry + the SENCORES
+     core-budget bridge, so an in-envelope ``a @ b`` now routes to the HW-verified
+     seg-relative emitter at the choose_cores-routed C.
+  2. #164 MULTI-CORE HW FAULT — RESOLVED. The first SP2 silicon probe FAULTED
+     (RAS 0x7b1b, box wedged); root cause was a stale init_packet.py on the box, NOT
+     the codegen. Multi-core (routed C=2/4) is now HW-verified (max_diff==0).
+  (Real LLM shapes carry a THIRD blocker that is STILL OPEN: K>64 needs SP3 (within-core
    K-accumulation) and N>64 needs SP4 (output-column N-tiling), both unbuilt.)
 
 WHEN DO CASES FLIP GREEN?
-  single-core SP1 tile  -> when SP5 wires matmul_strategy=MATMUL_SEG_RELATIVE
-                           selection into the tiling path (routing), then add the
-                           case id to _HW_VERIFIED_MATMUL after a torch.compile
-                           HW known-answer passes (max_diff==0).
-  multi-core SP2 tile   -> ADDITIONALLY requires #164's HW fault resolved; then add
-                           to _MULTICORE_HW_VERIFIED_MATMUL.
-  real LLM shapes       -> ADDITIONALLY require SP3/SP4 (K>64 / N>64 tiling) built.
+  SP1 / SP2 K=N=64 tile -> DONE (2026-07-18): in _HW_VERIFIED_MATMUL /
+                           _MULTICORE_HW_VERIFIED_MATMUL after torch.compile + eager
+                           HW known-answers passed max_diff==0 at the routed C.
+  real LLM shapes       -> STILL require SP3/SP4 (K>64 / N>64 tiling) built + HW-verify;
+                           add the id to _HW_VERIFIED_MATMUL then.
 
 KNOWN ANSWERS are the D1/D3 references from the SP1/SP2 HW probe (DL16-exact):
   D1 (identity):  B = I  ->  C = A @ I == A         (exact for ANY K, values <= 1024)
@@ -51,11 +49,13 @@ AIU 1.0 is DL16 (1-6-9): integers > 1024 are not represented exactly, so operand
 and results are kept <= 1024 and the check is max_diff == 0 (see the project DL16
 note). 1p0 dtype is torch.float16 (DL16); never bf16 (that is 1p5).
 
-NOTE ON C (num_cores): C is NOT a torch-level knob today — a user writes ``a @ b``
-and the (absent) SP5 tiling path would choose cores internally (via the currently
-uncalled choose_cores). The multi-core rows below express the M/K/N shapes the SP2
-emitter TARGETS at a given core split, carrying C only as documentation of which
-spc regime (spc = M·ceil(N/64) / C) they exercise once SP5 + #164 land.
+NOTE ON C (num_cores): C is NOT a torch-level knob — a user writes ``a @ b`` and the
+SP5 tiling path chooses cores internally via choose_cores(M,K,N,SENCORES-budget). The
+declared C in the case rows below is DOCUMENTATION of the intended spc regime
+(spc = M·ceil(N/64) / C); the ROUTED C (what actually runs) is choose_cores' pick at
+the default budget 32: M=2->C=1, M=4->C=2, M=8->C=4. Where a row's declared C differs
+from the routed C (e.g. sp2_2x64x64_c2 declares C=2 but M=2 routes to C=1), the routed
+C is authoritative and is what the HW known-answer verified.
 
 Cross-ref: codegen/docs/op-milestones/matmul.md (SP1 HW-verified 2026-07-16, commit
 4755ab7; SP2–SP5 roadmap), matmul-1core-recipe / matmul-sp2-multicore-recipe memories.
@@ -149,36 +149,40 @@ _MATMUL_CASES = [
 ]
 
 
-# --- HW-verified sets: EMPTY today. A case flips to a REAL test the moment its id is
-#     added here (mirrors _SUPPORTED_OPS / _HW_VERIFIED_AFFINE_OPS discipline). ------
-# Populate _HW_VERIFIED_MATMUL when SP5 routes matmul_strategy=MATMUL_SEG_RELATIVE and a
-# torch.compile HW known-answer passes (max_diff==0). Multi-core (C>1) ids go in
-# _MULTICORE_HW_VERIFIED_MATMUL, which ALSO requires #164's HW fault resolved.
-_HW_VERIFIED_MATMUL: set[str] = set()
-_MULTICORE_HW_VERIFIED_MATMUL: set[str] = set()
+# --- HW-verified sets: a case flips to a REAL known-answer test the moment its id is
+#     added here (mirrors _SUPPORTED_OPS / _HW_VERIFIED_AFFINE_OPS discipline). --------
+# SP5 frontend routing is LIVE (resolve_matmul_structure + resolver registry + SENCORES
+# bridge): `a @ b` in the K=N=64 envelope routes to MATMUL_SEG_RELATIVE at the
+# choose_cores-routed C. All five in-envelope cases are HW-VERIFIED (2026-07-18,
+# max_diff==0, D1 identity + D3 ones, EAGER and torch.compile) at their ROUTED C:
+#   sp1_2x64x64 (M=2)->C=1, sp1_4x64x64 (M=4)->C=2, sp2_2x64x64_c2 (M=2)->C=1,
+#   sp2_4x64x64_c2 (M=4)->C=2, sp2_8x64x64_c4 (M=8)->C=4 (first C=4 silicon coverage).
+# Tier (not routed C) picks the set: _SP1 ids -> _HW_VERIFIED_MATMUL, _SP2 ids ->
+# _MULTICORE_HW_VERIFIED_MATMUL (so sp1_4x64x64 lives here despite routing to C=2).
+_HW_VERIFIED_MATMUL: set[str] = {"sp1_2x64x64", "sp1_4x64x64"}
+_MULTICORE_HW_VERIFIED_MATMUL: set[str] = {
+    "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4"}
 
 
 def _sp5_reason(case_id, M, K, N):
     return (
-        f"{case_id} [{M}x{K}x{N}]: matmul is UNWIRED to the codegen emitter (SP5 gap). "
-        "TilingConfig.matmul_strategy defaults to SINGLE_TILE and is never assigned "
-        "MATMUL_SEG_RELATIVE/emit_sp2_matmul from a production compile, so `a @ b` never "
-        "selects the HW-verified seg-relative path — it hits the SINGLE_TILE guard in "
-        "scheduler/engine.py which raises UnsupportedMatmulShapeError (tile_k<K or "
-        "tile_n<N). choose_cores has zero callers. The SP1 tile (K=N=64, 1-core) is "
-        "HW-verified only via binary injection (launch_kernel_from_bytes), NOT via "
-        "torch.compile. Flip into _HW_VERIFIED_MATMUL when SP5 routing lands + is "
-        "HW-verified (max_diff==0)."
+        f"{case_id} [{M}x{K}x{N}]: SP5 frontend routing is LIVE (resolve_matmul_structure "
+        "+ resolver registry route `a @ b` in the K<=64,N<=64 envelope to "
+        "MATMUL_SEG_RELATIVE), and the K=N=64 shapes are HW-verified. This SP1-tier id "
+        "is in the table but NOT yet in _HW_VERIFIED_MATMUL — its torch.compile "
+        "known-answer has not been confirmed max_diff==0 on silicon. Flip it in once a "
+        "HW probe passes (max_diff==0, D1 identity + D3 ones, eager + compiled)."
     )
 
 
 def _multicore_164_reason(case_id, M, K, N, C):
     return (
-        f"{case_id} [{M}x{K}x{N}, routed C via choose_cores]: BLOCKED on SP5 routing only. "
-        f"The SP2 multi-core seg-relative emitter is HW-VERIFIED (commit bf7339b: C=2 spc=1/spc=2 "
-        f"D1/D3 max_diff=0); #164 (the 0x7b1b stale-file fault) is RESOLVED. These cases flip into "
-        f"_MULTICORE_HW_VERIFIED_MATMUL once SP5 frontend routing lands AND a torch.compile "
-        f"known-answer passes (max_diff==0) at the choose_cores-routed C."
+        f"{case_id} [{M}x{K}x{N}, routed C via choose_cores]: SP5 routing is LIVE and the "
+        f"SP2 multi-core seg-relative emitter is HW-VERIFIED (K=N=64 routed C=1/2/4, "
+        f"max_diff==0; #164 the 0x7b1b stale-file fault is RESOLVED). This SP2-tier id is "
+        f"in the table but NOT yet in _MULTICORE_HW_VERIFIED_MATMUL — its torch.compile "
+        f"known-answer has not been confirmed max_diff==0 at the choose_cores-routed C. "
+        f"Flip it in once a HW probe passes."
     )
 
 
@@ -260,18 +264,23 @@ def test_matmul_compiled(case_id, M, K, N, C, tier, ka_modes):
 # HW-independent guards (run everywhere, incl. CI without a board) — document the
 # contract's structural invariants so a future shortcut can't silently subvert it.
 # ---------------------------------------------------------------------------
-def test_all_matmul_cases_xfail_today():
-    """Contract invariant: NOTHING is torch-routed matmul-verified yet, so both
-    HW-verified sets MUST be empty. This test is the tripwire — when SP5 (and #164 for
-    multi-core) land and a case is added to a verified set, this guard flags that the
-    living contract has genuinely flipped, prompting a review of the xfail markers."""
-    assert _HW_VERIFIED_MATMUL == set(), (
-        "A single-core matmul case is now HW-verified via torch.compile — SP5 has "
-        "landed. Confirm the known-answer passes on silicon, then update this guard."
+def test_matmul_verified_membership_locked():
+    """Contract lock: SP5 routing has LANDED and the K=N=64 envelope is HW-verified
+    (2026-07-18, max_diff==0 eager + torch.compile at the choose_cores-routed C). This
+    guard pins EXACTLY which ids are verified so a future edit can't silently widen the
+    verified set past what has actually passed on silicon (e.g. add an SP3/SP4 shape).
+    Every _MATMUL_CASES id not listed here MUST still be xfail. When a new SP builds and
+    a shape HW-verifies, add its id to the matching set AND here in the same change."""
+    assert _HW_VERIFIED_MATMUL == {"sp1_2x64x64", "sp1_4x64x64"}, (
+        "Single-core-tier verified set changed. Only the K=N=64 SP1-tier ids are "
+        "HW-verified via torch.compile (SP5). Confirm max_diff==0 on silicon before "
+        "widening, then update this lock."
     )
-    assert _MULTICORE_HW_VERIFIED_MATMUL == set(), (
-        "A multi-core matmul case is now HW-verified — SP5 routing AND #164 have both "
-        "cleared. Confirm on silicon, then update this guard."
+    assert _MULTICORE_HW_VERIFIED_MATMUL == {
+        "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4"}, (
+        "Multi-core-tier verified set changed. Only the K=N=64 SP2-tier ids (routed "
+        "C=1/2/4) are HW-verified. Confirm max_diff==0 on silicon before widening, then "
+        "update this lock."
     )
 
 
