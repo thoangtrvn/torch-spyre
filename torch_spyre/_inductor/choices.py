@@ -154,19 +154,37 @@ class SpyreHeuristics(InductorChoices):
                 return None
 
         if is_matmul:
-            # Matmul: YBLOCK=tile_m, R0_BLOCK=tile_k, XBLOCK=tile_n
+            # Matmul (tl.dot): YBLOCK/XBLOCK always; R0_BLOCK ONLY for looped (non-persistent)
+            # kernels — SAME persistence split as the reduction branch below. When the
+            # K-contraction fits one block (K<=64), Inductor makes the tl.dot reduction
+            # PERSISTENT and bakes R0_BLOCK as an in-body `tl.constexpr` — it is NOT a
+            # signature parameter, so injecting it makes Triton's ASTSource do
+            # `arg_names.index("R0_BLOCK")` on a signature that lacks it ->
+            # `ValueError: 'R0_BLOCK' is not in list` (HW-observed for sp1_2x64x64: signature
+            # was {XBLOCK,YBLOCK} only). Gate R0_BLOCK on should_use_persistent_reduction
+            # (Inductor's own kernel-shape decision) so the fixed_config key-set matches the
+            # generated signature exactly — the same rule that fixed reduction #193.
+            #
+            # Separately, the prior `m_val>=32` guard installed NO fixed_config for SP5's
+            # small-M matmul (M=2/4) -> Inductor KeyError:'XBLOCK' (_has_constant_mask ->
+            # max_block("X") -> fixed_config["XBLOCK"]). Dropping that guard (install
+            # unconditionally within is_matmul) fixes small-M routing; block >= dim is masked
+            # (same as the reduction branch's XBLOCK=64 for small x_val).
+            #
+            # Block sizes stay stick-const (YBLOCK=32 matches codegen MICRO_M=32; do NOT
+            # clamp below it, or the Triton block desyncs from the seg-relative tile).
+            # Systematic key-derivation from the tiling-dict prefixes is deferred (#178).
             tile_m, tile_k, tile_n = 32, elements_per_stick, elements_per_stick
             m_val = _resolve_dim("y") or 0
             k_val = _resolve_dim("r0_") or 0
             n_val = _resolve_dim("x") or 0
             problem_dims = {"M": m_val, "K": k_val, "N": n_val}
-
-            if m_val >= tile_m and k_val >= tile_k and n_val >= tile_n:
-                kernel_kwargs["fixed_config"] = FixedTritonConfig({
-                    "YBLOCK": tile_m,
-                    "R0_BLOCK": tile_k,
-                    "XBLOCK": tile_n,
-                })
+            persistent = self.should_use_persistent_reduction(
+                features, cooperative_reduction=False)
+            block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
+            if not persistent:
+                block_config["R0_BLOCK"] = tile_k
+            kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
 
         elif is_reduction:
             # Reduction: XBLOCK always; R0_BLOCK ONLY for looped (non-persistent) kernels.
