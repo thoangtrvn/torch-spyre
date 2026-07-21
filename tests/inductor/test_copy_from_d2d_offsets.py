@@ -39,9 +39,12 @@ surfaces this rejection early with an actionable message; see
 test_unaligned_offset_raises{,_select} and
 test_stick_multiple_offset_unaligned_inner_dim_ok.
 
-The one remaining silent-wrong-data case is an offset that falls INSIDE the
-stick dim (a column narrow) — see test_column_slice_inner_offset, a documented
-known limitation tracked for the follow-up PR.
+An offset that falls INSIDE the stick dim (a column narrow) is also rejected:
+it is stick-aligned by (1) but offset % stride[-2] != 0, detectable from the
+view's own stride — see test_column_slice_inner_offset_raises. The underlying
+stick-dim copy is still unsupported (tracked for the follow-up PR); the guard
+just makes the failure clean rather than silent. With both checks there is no
+remaining silent-wrong-data path for these views.
 
 The transpose / permute / strided cases below deliberately exercise
 NON-contiguous views (see TestCopyFromD2DStridedViews). permute / select at
@@ -99,24 +102,25 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         torch.testing.assert_close(out[1:2], torch.full((1, 64), -1.0, dtype=DTYPE))
         torch.testing.assert_close(out[3:4], torch.full((1, 64), -1.0, dtype=DTYPE))
 
-    @unittest.expectedFailure
-    def test_column_slice_inner_offset(self):
-        """Offset along the last (stick) dim: narrow columns at an offset.
+    def test_column_slice_inner_offset_raises(self):
+        """Offset inside the stick dim (column narrow) is rejected, not silent.
 
-        KNOWN LIMITATION — the SOLE remaining silent-wrong-data case. Here the
-        offset (64) IS a stick multiple, so _validate_reoffset_supported accepts
-        it, but it falls inside the stick DIMENSION: superdsc decomposes per-dim
-        offsets against device_size and does not split a stick-dim offset
-        correctly, so the read is off by the stick-dim component (measured WRONG
-        in sweep_d2d_offsets.py: got 0.0, expected 64.0). The offset%eps guard
-        cannot catch this (the offset is aligned); detecting it needs the
-        base-storage layout, which is unavailable at lowering. Tracked for the
-        follow-up PR (stick-dim offset handling), distinct from the row-offset
-        bug fixed here."""
+        Here the offset (64) IS a stick multiple, so the offset % eps check
+        passes, but it falls inside the stick DIMENSION: it starts partway into
+        a row (size=(2, 64), stride=(128, 1), offset=64), which superdsc bakes
+        incorrectly — measured WRONG in sweep_d2d_offsets.py (got 0.0, expected
+        64.0). This was previously the sole remaining silent-wrong-data case.
+
+        _validate_reoffset_supported now detects it from the view's OWN stride:
+        offset % stride[-2] == 64 % 128 != 0 means the offset is not on an outer-
+        dimension boundary, so it raises Unsupported instead of miscompiling. The
+        underlying stick-dim copy is still unsupported (tracked for the follow-up
+        PR); this test asserts the failure is clean, not silent."""
         x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
-        # columns [64:128) -> nonzero offset within a row
-        out = x.narrow(1, 64, 64).clone()
-        torch.testing.assert_close(out.cpu(), x.cpu()[:, 64:128])
+        # columns [64:128) -> offset 64 lands inside the row (stride 128)
+        with self.assertRaises(Exception) as cm:
+            x.narrow(1, 64, 64).clone()
+        self.assertIn("stick", str(cm.exception).lower())
 
     def test_unaligned_offset_raises(self):
         """A storage_offset that is not a whole number of sticks is rejected.
@@ -236,6 +240,36 @@ class TestCopyFromD2DStridedViews(unittest.TestCase):
                 x.cpu().t()[:, c : c + 1],
                 msg=f"transpose col {c}",
             )
+
+
+class TestValidateReoffsetUnit(unittest.TestCase):
+    """Direct unit test for the one guard branch with no e2e equivalent.
+
+    The stick-alignment, stick-dim, accept, and zero-offset branches are all
+    covered end-to-end (test_unaligned_offset_raises,
+    test_column_slice_inner_offset_raises, the passing contiguous tests). The
+    symbolic-offset branch is NOT: specialize_int bakes every offset as a
+    concrete int, so a symbolic offset never reaches the guard through the
+    normal path — it is a fail-loud guard against silently reintroducing the
+    #3236 read-from-base bug if that invariant ever breaks. We exercise it
+    directly with a minimal stand-in layout."""
+
+    class _FakeLayout:
+        def __init__(self, dtype, stride):
+            self.dtype = dtype
+            self.stride = stride
+
+    def test_symbolic_offset_raises(self):
+        """A symbolic (non-int) offset must raise, not silently bake 0."""
+        import sympy
+
+        from torch_spyre._inductor.lowering import _validate_reoffset_supported
+
+        with self.assertRaises(Exception) as cm:
+            _validate_reoffset_supported(
+                self._FakeLayout(DTYPE, [64, 1]), sympy.Symbol("s0")
+            )
+        self.assertIn("symbolic", str(cm.exception).lower())
 
 
 if __name__ == "__main__":

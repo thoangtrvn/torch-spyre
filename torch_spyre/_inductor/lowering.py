@@ -852,12 +852,16 @@ def _reoffset(node, offset):
     multiple) still copies correctly at offset 192 (== 3 sticks) but errors at
     offset 96 (== 1.5 sticks).
 
-    ``_validate_reoffset_supported`` converts the unaligned case into a clean,
-    actionable ``Unsupported`` at lowering time instead of the cryptic
-    restickify error deeper in the pipeline. It does NOT guard the separate
+    ``_validate_reoffset_supported`` converts every unsupported offset into a
+    clean, actionable ``Unsupported`` at lowering time instead of the cryptic
+    restickify error deeper in the pipeline or (worse) a silent miscompile. It
+    covers both the unaligned case above and the separate
     offset-*within*-the-stick-dim case (a column narrow, e.g.
-    ``x.narrow(1, 64, 64)``), which the backend still miscompiles silently — see
-    ``test_column_slice_inner_offset`` (tracked for the follow-up PR).
+    ``x.narrow(1, 64, 64)``): the latter is stick-aligned yet
+    ``offset % stride[-2] != 0``, detectable from the view's own stride. The
+    underlying stick-dim copy is still unsupported (tracked for the follow-up
+    PR); the guard only ensures the failure is loud, not silent. See
+    ``test_column_slice_inner_offset_raises``.
     """
     if offset == 0:
         return node
@@ -886,21 +890,42 @@ def _validate_reoffset_supported(layout, offset) -> None:
     earlier with an actionable message rather than silently miscompiling or
     emitting a cryptic downstream error.
 
-    Scope — this rule is keyed on the OFFSET alone, so it holds regardless of
-    rank reduction (``select`` drops the outer dim but the flat offset is
-    unchanged) and does not need the device layout, which is not attached to the
-    placeholder yet. It deliberately does NOT cover an offset that falls *inside*
-    the stick dimension itself (a column narrow): that case is
-    ``offset % elems_per_stick == 0`` yet still miscompiles, and detecting it
-    would require the base-storage layout that is unavailable here. It stays a
-    documented known limitation (``test_column_slice_inner_offset``).
+    Two conditions are checked, both derived from the view's own layout (no
+    device layout is needed — it is not attached to the placeholder yet):
+
+    1. ``offset % elems_per_stick == 0`` — the offset steps by whole sticks.
+       Measured behavior (``sweep_d2d_offsets.py``) is unambiguous: across
+       contiguous ``narrow`` / ``select`` views of every inner size, the copy is
+       correct iff this holds; every unaligned offset otherwise raises deep in
+       the restickify pass ("no mechanism to resolve stick incompatibility").
+
+    2. ``offset % stride[-2] == 0`` (rank >= 2) — the offset lands on an
+       outer-dimension boundary, i.e. does NOT fall *inside* the innermost
+       (stick) dimension. A column narrow (e.g. ``x.narrow(1, 64, 64)`` →
+       ``size=(2, 64), stride=(128, 1), offset=64``) is stick-aligned by (1) yet
+       ``64 % 128 != 0``: the offset starts partway into a row, which superdsc
+       bakes incorrectly (it does not split a stick-dim offset). This was the
+       last silent-wrong-data path; the view's own stride reveals it, so we
+       reject it here rather than miscompile.
+
+    The checks hold regardless of rank reduction (``select`` drops the outer dim
+    but the flat offset is unchanged) and are the safe failure direction: a
+    mis-tuned check false-rejects a working copy, never silently corrupts.
     """
     try:
         off = int(offset)
     except (TypeError, ValueError):
-        # Symbolic offset: cannot check statically, let it through
-        # (specialize_int bakes concrete offsets, so this is the rare path).
-        return
+        # A symbolic offset cannot be baked into the kernel coordinate: superdsc
+        # reads only the constant term (as_coeff_Add()[0]), which is 0 for a bare
+        # symbol, silently reintroducing the #3236 read-from-base bug.
+        # specialize_int is meant to bake every offset as a concrete int, so this
+        # branch should be unreachable — fail loudly rather than risk corruption.
+        raise Unsupported(
+            "spyre::copy_from_d2d received a symbolic storage_offset "
+            f"({offset!r}); a concrete int is required (specialize_int should "
+            "bake it). A symbolic offset cannot be baked into the kernel "
+            "coordinate and would silently read from the storage base."
+        )
     if off == 0:
         return
     eps = get_elem_in_stick(layout.dtype)
@@ -912,6 +937,23 @@ def _validate_reoffset_supported(layout, offset) -> None:
             "offset landing inside a stick cannot be baked into the kernel "
             "coordinate. Re-slice on a stick-aligned boundary (a multiple of "
             f"{eps} elements), or copy the full (unsliced) tensor."
+        )
+    # Offset must land on an outer-dimension boundary; a remainder smaller than
+    # the innermost dim's stride means it falls inside the stick dim (a column
+    # narrow), which superdsc bakes incorrectly. Detectable from the view stride.
+    try:
+        stride = [int(s) for s in layout.stride]
+    except (TypeError, ValueError):
+        return  # symbolic strides: the stick-aligned check above still applied
+    if len(stride) >= 2 and stride[-2] and off % stride[-2] != 0:
+        raise Unsupported(
+            "spyre::copy_from_d2d of a sliced view requires an offset on an "
+            f"outer-dimension boundary: storage_offset {off} leaves a remainder "
+            f"of {off % stride[-2]} within the innermost dimension "
+            f"(stride {stride[-2]}), i.e. it falls inside the stick dimension "
+            "and cannot be baked into the kernel coordinate. This happens for a "
+            "column slice (narrow on the last dim); copy the full rows instead, "
+            "or make the sliced region contiguous first."
         )
 
 
