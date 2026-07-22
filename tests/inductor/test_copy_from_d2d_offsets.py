@@ -56,6 +56,7 @@ regression from this fix).
 import unittest
 
 import torch
+from torch._inductor.exc import InductorError
 
 import torch_spyre  # noqa: F401
 
@@ -118,7 +119,7 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         PR); this test asserts the failure is clean, not silent."""
         x = torch.arange(2 * 128, dtype=DTYPE, device=DEVICE).reshape(2, 128)
         # columns [64:128) -> offset 64 lands inside the row (stride 128)
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(InductorError) as cm:
             x.narrow(1, 64, 64).clone()
         self.assertIn("stick", str(cm.exception).lower())
 
@@ -143,7 +144,7 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         a = x.narrow(0, 0, 1).clone()
         torch.testing.assert_close(a.cpu(), x.cpu()[0:1])
         # offset 200 is not a stick multiple -> clean compile-time error
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(InductorError) as cm:
             x.narrow(0, 2, 1).clone()
         self.assertIn("stick", str(cm.exception).lower())
 
@@ -159,7 +160,7 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         correctly or errors)."""
         x = torch.arange(4 * 100, dtype=DTYPE, device=DEVICE).reshape(4, 100)
         torch.testing.assert_close(x.select(0, 0).clone().cpu(), x.cpu()[0])
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(InductorError) as cm:
             x.select(0, 2).clone()
         self.assertIn("stick", str(cm.exception).lower())
 
@@ -263,11 +264,32 @@ class TestValidateReoffsetUnit(unittest.TestCase):
         """A symbolic (non-int) offset must raise, not silently bake 0."""
         import sympy
 
+        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.lowering import _validate_reoffset_supported
 
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(Unsupported) as cm:
             _validate_reoffset_supported(
                 self._FakeLayout(DTYPE, [64, 1]), sympy.Symbol("s0")
+            )
+        self.assertIn("symbolic", str(cm.exception).lower())
+
+    def test_symbolic_stride_raises(self):
+        """A symbolic stride[-2] must raise, not bypass the boundary check.
+
+        A concrete, stick-aligned offset still cannot be proven to land outside
+        the stick dim when stride[-2] is symbolic, so bypassing the check could
+        re-enable the silent column-offset miscompile. The guard fails loudly
+        instead, like the symbolic-offset branch."""
+        import sympy
+
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.lowering import _validate_reoffset_supported
+
+        # offset 128 is stick-aligned (128 % 64 == 0) so it clears branch (1);
+        # the symbolic stride[-2] then cannot prove the boundary condition.
+        with self.assertRaises(Unsupported) as cm:
+            _validate_reoffset_supported(
+                self._FakeLayout(DTYPE, [sympy.Symbol("s0"), 1]), 128
             )
         self.assertIn("symbolic", str(cm.exception).lower())
 

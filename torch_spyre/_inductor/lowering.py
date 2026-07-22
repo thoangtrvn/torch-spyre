@@ -944,7 +944,17 @@ def _validate_reoffset_supported(layout, offset) -> None:
     try:
         stride = [int(s) for s in layout.stride]
     except (TypeError, ValueError):
-        return  # symbolic strides: the stick-aligned check above still applied
+        # A symbolic stride[-2] cannot prove off % stride[-2] == 0, so a concrete
+        # stick-aligned offset could still fall inside the stick dim and silently
+        # miscompile (the column-offset case). Fail loudly rather than bypass the
+        # boundary check, mirroring the symbolic-offset branch above.
+        raise Unsupported(
+            "spyre::copy_from_d2d of a sliced view received a symbolic stride "
+            f"({list(layout.stride)!r}); a concrete stride is required to prove "
+            f"the storage_offset {off} lands on an outer-dimension boundary and "
+            "not inside the stick dimension. A symbolic stride cannot rule out "
+            "the silent column-offset miscompile, so it is rejected."
+        )
     if len(stride) >= 2 and stride[-2] and off % stride[-2] != 0:
         raise Unsupported(
             "spyre::copy_from_d2d of a sliced view requires an offset on an "
