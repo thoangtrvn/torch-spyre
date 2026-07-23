@@ -147,6 +147,17 @@ _MATMUL_CASES = [
     ("sp2_4x64x64_c2",   4,   64,   64,   2, _SP2, ("identity", "ones")),   # spc=2
     ("sp2_8x64x64_c4",   8,   64,   64,   4, _SP2, ("identity", "ones")),   # spc=2
     ("sp2_16x64x64_c8",  16,  64,   64,   8, _SP2, ("identity", "ones")),   # spc=2, routes C=8
+    # --- SP3 rows>32 single-core (M>32, K=N=64). Phase 0 (#198) routes these to
+    #     C=1 (spc=M<=200); the R3.1-R3.4 OUTER-band builders emit them, byte-matched
+    #     offline + HW-verified where probed (M=193/194/195 D1/D3 max_diff=0). Exercised
+    #     end-to-end here (eager + torch.compile). _SP1 tier (single-core). ---
+    ("sp3_96x64x64",  96,  64, 64, 1, _SP1, ("identity", "ones")),
+    ("sp3_160x64x64", 160, 64, 64, 1, _SP1, ("identity", "ones")),
+    ("sp3_192x64x64", 192, 64, 64, 1, _SP1, ("identity", "ones")),
+    # --- SP3 rows>32 MULTI-core: M=512 routes to C=16 (spc=32, the SP2 HW-verified
+    #     ladder — spc=M=512>OUTER_SPC_MAX=200 excludes C=1). Exercises the SP2 emitter
+    #     end-to-end for a rows>32 shape. _SP2 tier (multi-core). ---
+    ("sp3_512x64x64_c16", 512, 64, 64, 16, _SP2, ("identity", "ones")),
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 (SP3) and N>64
     #     (SP4) both unbuilt, on top of SP5 routing. ones would overflow DL16
     #     (K=4096>1024) so only the identity known-answer is DL16-exact here. ---
