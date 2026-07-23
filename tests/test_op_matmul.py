@@ -175,9 +175,16 @@ _MATMUL_CASES = [
 #   sp2_4x64x64_c2 (M=4)->C=2, sp2_8x64x64_c4 (M=8)->C=4 (first C=4 silicon coverage).
 # Tier (not routed C) picks the set: _SP1 ids -> _HW_VERIFIED_MATMUL, _SP2 ids ->
 # _MULTICORE_HW_VERIFIED_MATMUL (so sp1_4x64x64 lives here despite routing to C=2).
-_HW_VERIFIED_MATMUL: set[str] = {"sp1_2x64x64", "sp1_4x64x64"}
+_HW_VERIFIED_MATMUL: set[str] = {
+    "sp1_2x64x64", "sp1_4x64x64",
+    # SP3 rows>32 single-core (Phase 0 #198 routes M=96/160/192 -> C=1). HW-verified
+    # 2026-07-23: eager + torch.compile, D1 identity + D3 ones, max_diff==0 on silicon.
+    "sp3_96x64x64", "sp3_160x64x64", "sp3_192x64x64"}
 _MULTICORE_HW_VERIFIED_MATMUL: set[str] = {
-    "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8"}
+    "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8",
+    # SP3 rows>32 multi-core (Phase 0 #198 routes M=512 -> C=16 ladder). HW-verified
+    # 2026-07-23: eager + torch.compile, D1 identity + D3 ones, max_diff==0 on silicon.
+    "sp3_512x64x64_c16"}
 
 
 def _sp5_reason(case_id, M, K, N):
@@ -287,16 +294,23 @@ def test_matmul_verified_membership_locked():
     verified set past what has actually passed on silicon (e.g. add an SP3/SP4 shape).
     Every _MATMUL_CASES id not listed here MUST still be xfail. When a new SP builds and
     a shape HW-verifies, add its id to the matching set AND here in the same change."""
-    assert _HW_VERIFIED_MATMUL == {"sp1_2x64x64", "sp1_4x64x64"}, (
-        "Single-core-tier verified set changed. Only the K=N=64 SP1-tier ids are "
-        "HW-verified via torch.compile (SP5). Confirm max_diff==0 on silicon before "
-        "widening, then update this lock."
+    assert _HW_VERIFIED_MATMUL == {
+        "sp1_2x64x64", "sp1_4x64x64",
+        # SP3 rows>32 single-core (Phase 0 #198, routed C=1) — HW-verified 2026-07-23,
+        # max_diff==0 eager + torch.compile, D1 identity + D3 ones.
+        "sp3_96x64x64", "sp3_160x64x64", "sp3_192x64x64"}, (
+        "Single-core-tier verified set changed. Only the K=N=64 SP1-tier ids + the "
+        "HW-verified SP3 rows>32 shapes (M=96/160/192, C=1) are verified. Confirm "
+        "max_diff==0 on silicon before widening, then update this lock."
     )
     assert _MULTICORE_HW_VERIFIED_MATMUL == {
-        "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8"}, (
+        "sp2_2x64x64_c2", "sp2_4x64x64_c2", "sp2_8x64x64_c4", "sp2_16x64x64_c8",
+        # SP3 rows>32 multi-core (Phase 0 #198, M=512 routed C=16) — HW-verified
+        # 2026-07-23, max_diff==0 eager + torch.compile, D1 identity + D3 ones.
+        "sp3_512x64x64_c16"}, (
         "Multi-core-tier verified set changed. Only the K=N=64 SP2-tier ids (routed "
-        "C=1/2/4/8) are HW-verified. Confirm max_diff==0 on silicon before widening, then "
-        "update this lock."
+        "C=1/2/4/8) + the HW-verified SP3 M=512->C=16 shape are verified. Confirm "
+        "max_diff==0 on silicon before widening, then update this lock."
     )
 
 
