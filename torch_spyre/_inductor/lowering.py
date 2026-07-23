@@ -908,6 +908,13 @@ def _validate_reoffset_supported(layout, offset) -> None:
        last silent-wrong-data path; the view's own stride reveals it, so we
        reject it here rather than miscompile.
 
+       This check applies only when ``stride[-2]`` is concrete. Under automatic-
+       dynamic shapes it may be symbolic, so the modulo is undecidable at
+       lowering time; we then fall back to check (1) only, matching upstream,
+       which already documents the column-narrow case as a known limitation.
+       Rejecting on a symbolic stride would regress legitimate dynamic-shape row
+       and permute copies whose offset does land on a boundary.
+
     The checks hold regardless of rank reduction (``select`` drops the outer dim
     but the flat offset is unchanged) and are the safe failure direction: a
     mis-tuned check false-rejects a working copy, never silently corrupts.
@@ -944,17 +951,14 @@ def _validate_reoffset_supported(layout, offset) -> None:
     try:
         stride = [int(s) for s in layout.stride]
     except (TypeError, ValueError):
-        # A symbolic stride[-2] cannot prove off % stride[-2] == 0, so a concrete
-        # stick-aligned offset could still fall inside the stick dim and silently
-        # miscompile (the column-offset case). Fail loudly rather than bypass the
-        # boundary check, mirroring the symbolic-offset branch above.
-        raise Unsupported(
-            "spyre::copy_from_d2d of a sliced view received a symbolic stride "
-            f"({list(layout.stride)!r}); a concrete stride is required to prove "
-            f"the storage_offset {off} lands on an outer-dimension boundary and "
-            "not inside the stick dimension. A symbolic stride cannot rule out "
-            "the silent column-offset miscompile, so it is rejected."
-        )
+        # Symbolic stride[-2] (automatic-dynamic shapes): off % stride[-2] cannot
+        # be evaluated, so the column-narrow check below is undecidable here. Fall
+        # back to check (1) only, matching upstream, which already documents the
+        # column-narrow-inside-the-stick-dim case as a known limitation. Rejecting
+        # on a symbolic stride would instead regress legitimate dynamic-shape row
+        # and permute copies the backend compiles correctly (their offset lands on
+        # a boundary; only the stride symbol, not the offset, is dynamic).
+        return
     if len(stride) >= 2 and stride[-2] and off % stride[-2] != 0:
         raise Unsupported(
             "spyre::copy_from_d2d of a sliced view requires an offset on an "

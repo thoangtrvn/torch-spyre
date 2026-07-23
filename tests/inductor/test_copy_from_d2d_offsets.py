@@ -248,12 +248,15 @@ class TestValidateReoffsetUnit(unittest.TestCase):
 
     The stick-alignment, stick-dim, accept, and zero-offset branches are all
     covered end-to-end (test_unaligned_offset_raises,
-    test_column_slice_inner_offset_raises, the passing contiguous tests). The
-    symbolic-offset branch is NOT: specialize_int bakes every offset as a
-    concrete int, so a symbolic offset never reaches the guard through the
-    normal path — it is a fail-loud guard against silently reintroducing the
-    #3236 read-from-base bug if that invariant ever breaks. We exercise it
-    directly with a minimal stand-in layout."""
+    test_column_slice_inner_offset_raises, the passing contiguous tests). Two
+    branches have no e2e equivalent and are exercised here with a minimal stand-
+    in layout: (a) the symbolic-offset branch — specialize_int bakes every offset
+    as a concrete int, so a symbolic offset never reaches the guard through the
+    normal path; it is a fail-loud guard against silently reintroducing the #3236
+    read-from-base bug if that invariant ever breaks. (b) the symbolic-stride
+    fallback — under automatic-dynamic shapes stride[-2] is a symbol, so the
+    column-narrow boundary check is undecidable and we fall back to the stick-
+    alignment check only."""
 
     class _FakeLayout:
         def __init__(self, dtype, stride):
@@ -273,25 +276,45 @@ class TestValidateReoffsetUnit(unittest.TestCase):
             )
         self.assertIn("symbolic", str(cm.exception).lower())
 
-    def test_symbolic_stride_raises(self):
-        """A symbolic stride[-2] must raise, not bypass the boundary check.
+    def test_symbolic_stride_falls_back_to_stick_check(self):
+        """A symbolic stride[-2] skips the boundary check (check 2), not raise.
 
-        A concrete, stick-aligned offset still cannot be proven to land outside
-        the stick dim when stride[-2] is symbolic, so bypassing the check could
-        re-enable the silent column-offset miscompile. The guard fails loudly
-        instead, like the symbolic-offset branch."""
+        Under automatic-dynamic shapes the inner-dim size becomes symbolic, so
+        stride[-2] is a symbol and `offset % stride[-2]` is undecidable at
+        lowering time. The column-narrow boundary check therefore applies only to
+        concrete strides; when the stride is symbolic we fall back to the stick-
+        alignment check (1) only, matching upstream (which documents the column-
+        narrow-inside-the-stick-dim case as a known limitation). A stick-aligned
+        offset is accepted; only an unaligned offset (caught by check 1 above,
+        which is stride-independent) still raises. Rejecting on a symbolic stride
+        would regress legitimate dynamic-shape row and permute copies whose
+        offset does land on a boundary (measured correct on hardware:
+        test_stick_multiple_offset_unaligned_inner_dim_ok,
+        test_permute_with_offset_clone)."""
+        import sympy
+
+        from torch_spyre._inductor.lowering import _validate_reoffset_supported
+
+        # stick-aligned offset + symbolic stride -> accepted (no raise).
+        _validate_reoffset_supported(
+            self._FakeLayout(DTYPE, [sympy.Symbol("s0"), 1]), 192
+        )
+
+    def test_symbolic_stride_unaligned_offset_still_raises(self):
+        """Check 1 is stride-independent: an unaligned offset raises even when
+        stride[-2] is symbolic."""
         import sympy
 
         from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.lowering import _validate_reoffset_supported
 
-        # offset 128 is stick-aligned (128 % 64 == 0) so it clears branch (1);
-        # the symbolic stride[-2] then cannot prove the boundary condition.
+        # offset 100 is not a stick multiple (100 % 64 != 0) -> check 1 raises
+        # before the stride is ever consulted.
         with self.assertRaises(Unsupported) as cm:
             _validate_reoffset_supported(
-                self._FakeLayout(DTYPE, [sympy.Symbol("s0"), 1]), 128
+                self._FakeLayout(DTYPE, [sympy.Symbol("s0"), 1]), 100
             )
-        self.assertIn("symbolic", str(cm.exception).lower())
+        self.assertIn("stick", str(cm.exception).lower())
 
 
 if __name__ == "__main__":
