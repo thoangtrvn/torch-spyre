@@ -103,16 +103,28 @@ def _small_pos_2d(M, K):
 def _known_answer(mode, M, K, N):
     """Return (a, b, expected) for a DL16-exact matmul known-answer.
 
-    mode == "identity" (D1): b = I[K,N] (requires K == N); expected = A (since N == K).
-                             Exact for ANY K because only one product term is nonzero.
+    mode == "identity" (D1): identity-BLOCK weight B[k,k]=1 for k<min(K,N), 0 else.
+                             With A's only nonzero column = column 0 (ramp A[i,0]=i+1),
+                             C[i,j] = A[i,0]·B[0,j] -> C[:,0] = ramp, C[:,j>0] = 0. This
+                             DISTINGUISHES per-K-tile / per-N-tile routing (a mis-routed
+                             tile shows a nonzero outside column 0, or column 0 goes
+                             wrong/zero) and works for ANY (K,N) — NOT just K==N (the SP1
+                             K=N=64 case reduces to A @ I == A since A has only col 0
+                             nonzero within the M<=... ramp). Exact for M<=1024 (ramp
+                             value i+1 <= M), and it is the SAME D1 the HW probe uses.
     mode == "ones"     (D3): a = ones[M,K], b = ones[K,N]; expected[m,n] = K.
                              Exact only while K <= 1024 (DL16 integer ceiling).
     """
     if mode == "identity":
-        assert K == N, "identity known-answer requires a square K==N tile"
-        a = _small_pos_2d(M, K)
-        b = torch.eye(K, dtype=torch.float16)          # [K, N] with N == K
-        expected = a.clone()                            # A @ I == A
+        # ramp in column 0 only (generalizes the old K==N eye() form to any K,N).
+        a = torch.zeros(M, K, dtype=torch.float16)
+        for i in range(M):
+            a[i, 0] = float(i + 1)
+        b = torch.zeros(K, N, dtype=torch.float16)
+        for k in range(min(K, N)):
+            b[k, k] = 1.0
+        expected = torch.zeros(M, N, dtype=torch.float16)
+        expected[:, 0] = a[:, 0]
         return a, b, expected
     if mode == "ones":
         assert K <= 1024, "ones known-answer overflows DL16 for K > 1024"
@@ -130,6 +142,7 @@ def _known_answer(mode, M, K, N):
 # for any K; ones only for K<=1024). spc = M·ceil(N/64) / C.
 _SP1 = "sp1_single_core"
 _SP2 = "sp2_multi_core"
+_SP3K = "sp3_clean_k"   # K>64 clean-K (K%64==0) within-core K-accumulation, C=1
 _LLM = "llm_real"
 
 _MATMUL_CASES = [
@@ -158,9 +171,28 @@ _MATMUL_CASES = [
     #     ladder — spc=M=512>OUTER_SPC_MAX=200 excludes C=1). Exercises the SP2 emitter
     #     end-to-end for a rows>32 shape. _SP2 tier (multi-core). ---
     ("sp3_512x64x64_c16", 512, 64, 64, 16, _SP2, ("identity", "ones")),
-    # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 (SP3) and N>64
-    #     (SP4) both unbuilt, on top of SP5 routing. ones would overflow DL16
-    #     (K=4096>1024) so only the identity known-answer is DL16-exact here. ---
+    # --- Phase-1 multi-core rows>32 (2026-07-24): clean-OUTER C>=2 (spc in {64,96,192})
+    #     and SPLIT-band C>=2 (spc in {128,256,512}) route via choose_cores Tier 3/4 and
+    #     are HW-verified (D1/D3 max_diff=0, sp2 probe + band sweep). Declared C is the
+    #     routed C. _SP2 tier. ---
+    ("p1a_384x64x64_c2",  384,  64, 64, 2,  _SP2, ("identity", "ones")),   # spc=192 clean-OUTER
+    ("p1a_288x64x64_c3",  288,  64, 64, 3,  _SP2, ("identity", "ones")),   # spc=96  clean-OUTER
+    ("p1c_256x64x64_c2",  256,  64, 64, 2,  _SP2, ("identity", "ones")),   # spc=128 SPLIT-MC
+    ("p1c_1024x64x64_c2", 1024, 64, 64, 2,  _SP2, ("identity", "ones")),   # spc=512 SPLIT-MC
+    # --- SP3 CLEAN-K K-tiling (K>64, K%64==0), single-core (C=1). Routes via
+    #     resolve_matmul_structure -> SEG_RELATIVE C=1 (within-core PE K-accumulation).
+    #     HW-verified 2026-07-24 (D1 identity-block + D3 ones, max_diff=0) at ks<=6 for
+    #     M=8 (spp=8) and M=32 (spp=32). ks=8 (K=512) fail-loud (TILE_SIZE overflow #311)
+    #     -> NOT a case here. ones exact (K<=384<=1024). _SP3K tier. ---
+    ("sp3k_8x128x64",   8,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2
+    ("sp3k_8x256x64",   8,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4
+    ("sp3k_8x384x64",   8,  384, 64, 1, _SP3K, ("identity", "ones")),   # ks=6
+    ("sp3k_32x128x64", 32,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=32
+    ("sp3k_32x256x64", 32,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=32
+    # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
+    #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
+    #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
+    #     (K=4096>1024) so only identity is DL16-exact. _LLM tier. ---
     ("llm_128x4096x4096", 128, 4096, 4096, 1, _LLM, ("identity",)),
 ]
 
@@ -185,6 +217,19 @@ _MULTICORE_HW_VERIFIED_MATMUL: set[str] = {
     # SP3 rows>32 multi-core (Phase 0 #198 routes M=512 -> C=16 ladder). HW-verified
     # 2026-07-23: eager + torch.compile, D1 identity + D3 ones, max_diff==0 on silicon.
     "sp3_512x64x64_c16"}
+    # NOTE: the Phase-1 multi-core rows>32 cases (p1a_*, p1c_*) are HW-verified at the
+    # BINARY-INJECTION level (sp2_matmul_hw_probe.py + band sweep, max_diff=0) but NOT
+    # yet through the torch eager/compile path — they stay xfail here until a torch-level
+    # HW run confirms max_diff==0, then their ids are added above (auto-flip).
+# SP3 clean-K (K>64, K%64==0) single-core. HW-verified 2026-07-24 END-TO-END through
+# the torch eager AND torch.compile paths (max_diff==0, D1 identity-block + D3 ones):
+# bare torch.matmul K>64 now classifies "matmul" (the K-accumulate addf is no longer
+# misread as a bias — ttir_analyzer._addf_feeds_loop_yield) and routes via
+# resolve_matmul_structure -> SEG_RELATIVE C=1 (the _matmul_resolver clean-K envelope).
+# ks<=6; ks=8 (K=512) stays fail-loud (TILE_SIZE overflow #311).
+_SP3K_HW_VERIFIED_MATMUL: set[str] = {
+    "sp3k_8x128x64", "sp3k_8x256x64", "sp3k_8x384x64",
+    "sp3k_32x128x64", "sp3k_32x256x64"}
 
 
 def _sp5_reason(case_id, M, K, N):
@@ -209,6 +254,16 @@ def _multicore_164_reason(case_id, M, K, N, C):
     )
 
 
+def _sp3k_reason(case_id, M, K, N):
+    return (
+        f"{case_id} [{M}x{K}x{N}]: SP3 clean-K (K%64==0, K>64) within-core K-accumulation "
+        f"is BUILT and HW-verified via BINARY INJECTION (max_diff==0, ks<=6). The torch "
+        f"eager/compile path routes it (resolve_matmul_structure -> SEG_RELATIVE C=1), but "
+        f"its torch-level HW known-answer has not yet been confirmed max_diff==0 on silicon. "
+        f"Flip it into _SP3K_HW_VERIFIED_MATMUL once a torch-path HW probe passes (D1/D3)."
+    )
+
+
 def _llm_reason(case_id, M, K, N):
     return (
         f"{case_id} [{M}x{K}x{N}]: BLOCKED on SP5 routing AND on SP3/SP4. Real LLM shapes "
@@ -226,6 +281,9 @@ def _xfail(case_id, M, K, N, C, tier):
     elif tier == _SP2:
         if case_id not in _MULTICORE_HW_VERIFIED_MATMUL:
             pytest.xfail(_multicore_164_reason(case_id, M, K, N, C))
+    elif tier == _SP3K:
+        if case_id not in _SP3K_HW_VERIFIED_MATMUL:
+            pytest.xfail(_sp3k_reason(case_id, M, K, N))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
@@ -311,6 +369,17 @@ def test_matmul_verified_membership_locked():
         "Multi-core-tier verified set changed. Only the K=N=64 SP2-tier ids (routed "
         "C=1/2/4/8) + the HW-verified SP3 M=512->C=16 shape are verified. Confirm "
         "max_diff==0 on silicon before widening, then update this lock."
+    )
+    assert _SP3K_HW_VERIFIED_MATMUL == {
+        # SP3 clean-K (K>64, K%64==0) single-core — HW-verified 2026-07-24 END-TO-END
+        # (eager + torch.compile, D1 identity-block + D3 ones, max_diff==0) after the
+        # ttir classifier fix (K-accumulate no longer misread as bias) + the clean-K
+        # dispatcher envelope. ks<=6 (K<=384); ks=8 (K=512) stays fail-loud (#311).
+        "sp3k_8x128x64", "sp3k_8x256x64", "sp3k_8x384x64",
+        "sp3k_32x128x64", "sp3k_32x256x64"}, (
+        "SP3 clean-K verified set changed. Only K in {128,192(N/A here),256,384} at "
+        "M in {8,32} (ks<=6, C=1) are torch-path HW-verified. ks>=8 (K>=512) is #311. "
+        "Confirm max_diff==0 on silicon before widening, then update this lock."
     )
 
 
