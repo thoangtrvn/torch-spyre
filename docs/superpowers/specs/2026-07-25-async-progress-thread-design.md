@@ -178,17 +178,19 @@ Caller thread (c10d entry, e.g. allreduce)              Process-global progress 
 abort_guard(); validate tensors                          loop:
 buf = prepare_buffer_desc(t)      // local                 req = queue.pop()                 // blocks; FIFO
 aux = prepare output-slot descs   // C4, caller thread      if req.state->cancelled: continue           // R3
-caller_stream = getCurrentStream(t.device())  // TLS!       if req.aborted_flag: state -> DONE_ERROR("aborted"); continue
+caller_stream = getCurrentStream(t.device())  // TLS!       if req.is_aborted(): state -> DONE_ERROR("aborted"); dec_inflight; continue  // pre-launch only
 hold refs to input/output tensors                          try:
-enqueue Request{op, ctx, buf, aux, params,                   ws = req.context->OP(req.buf, req.aux, ...)  // BUILD: OOB pre-exchange
-       caller_stream, op_timeout, aborted_flag, state}       req.caller_stream.synchronize()    // producer->collective fence
+enqueue Request{op, ctx, buf, aux, params, caller_stream,    ws = req.context->OP(req.buf, req.aux, ...)  // BUILD: OOB pre-exchange
+       op_timeout, is_aborted, on_error, state}              req.caller_stream.synchronize()    // producer->collective fence
 seq_.fetch_add(1)                                            ws->SetStreamAffinity(get_comm_stream())
-return SpyreCCLWork(state, hold, result, op_timeout_)        state->ws = move(ws); state = LAUNCHED
-                                                             wait_interruptible(state->ws, req.op_timeout)  // start()+drain (§4.3 F5)
-                                                             state = terminal_from(ws)          // §4.3 F1 mapping
+return SpyreCCLWork(state, hold, result, op_timeout_)        {lock state->m: if cancelled {skip}; state->ws=move(ws); state=LAUNCHED}
+                                                             out = wait_interruptible(state->ws, req.op_timeout)  // start()+drain (§4.3 F5)
+                                                             map out -> DONE_SUCCESS/DONE_ERROR (§4.3 F1/M3)
                                                            catch (e):
-                                                             state->error_reason = e.what(); state = DONE_ERROR
-                                                             req.on_error(e)   // backend-local abort hook, NOT process-fatal (§5.2)
+                                                             set_terminal(DONE_ERROR, e.what())
+                                                             req.on_error(e)   // genuine error -> report_and_abort
+                                                           finally:
+                                                             dec_inflight (last action, release; §5.2 M2)
 ```
 
 ### 3.1 Invariants (priority order)
@@ -265,7 +267,7 @@ struct ProgressRequest {
   CollectiveParams params;                          // op-specific: root, reduceOp(SUM), tag, peer, sizes
   spyre::SpyreStream caller_stream;                  // captured on the caller thread (invariant 3)
   std::chrono::milliseconds op_timeout;              // the issuing backend's PG timeout (for wait_interruptible)
-  std::function<bool()> is_aborted;                  // reads the issuing backend's aborted_ (checked before build)
+  std::function<bool()> is_aborted;                  // reads issuing backend aborted_||local_abort_ (pre-launch check only, M1)
   std::function<void(const std::string&)> on_error;  // issuing backend's report_and_abort (GENUINE errors only)
   std::shared_ptr<WorkState> state;                  // shared with the SpyreCCLWork (§4.2)
 };
@@ -325,31 +327,49 @@ error state. `cv.notify_all()` on every terminal transition.
   (both carried per-request, §4.1) — it holds no single backend's members. It reads
   the process-global `comm_stream_` via `get_comm_stream()` (the same singleton every
   backend uses).
-- **F1-correct terminal mapping.** `WorkSchedule::wait()` does **not throw** on
-  failure — on `needsShutdown()` it sets `DONE_ERROR` and returns normally
-  (`work_schedule.cpp:91-106`). Therefore after the drain the worker MUST inspect
-  state, exactly as the current synchronous code does (spyre_ccl.cpp:1708,1793):
+- **F5 — interruptible worker wait, returning a discriminated outcome (M3).** The
+  worker must NOT use the raw `ws->wait()` unguarded (no deadline; blocks forever on
+  a dead peer, head-of-line-blocking the whole FIFO). `wait_interruptible` mirrors
+  `SpyreCCLWork::wait()`'s loop (spyre_ccl.cpp:1762-1787) — poll `ws->query()` with a
+  `needsShutdown()` check and the `request.op_timeout` deadline — but returns a
+  **discriminated result**, never a bare fall-through:
   ```
-  wait_interruptible(ws);   // §4.3 F5
-  if (ws->getState() == DONE_ERROR || comm_stream_->needsShutdown()) {
-     state->error_reason = ws->getShutdownReason();   // may be empty
-     set_state(DONE_ERROR);
-  } else {
-     set_state(DONE_SUCCESS);
+  enum class WaitOutcome { COMPLETED, SHUTDOWN, TIMED_OUT };
+  WaitOutcome wait_interruptible(ws, op_timeout):
+     loop:
+       if ws->query():                     return COMPLETED;   // ws reached its own terminal
+       if comm_stream_->needsShutdown():   return SHUTDOWN;     // genuine fault (peer/RAS/report_and_abort)
+       if now >= deadline:                 return TIMED_OUT;
+       sleep(1ms);
+  ```
+  Note `local_abort_` is deliberately **not** polled here — a LAUNCHED transfer must
+  never be abandoned while its DMA is live on the shared stream (see M1 in §5.2(a)).
+- **F1/M3-correct terminal mapping.** `WorkSchedule::wait()`/`query()` do **not
+  throw** on failure — on `needsShutdown()` the schedule sets `DONE_ERROR` and
+  returns normally (`work_schedule.cpp:91-106`). The worker maps the *outcome*, never
+  re-deriving success from `ws->getState()` alone (that was the F1/M3 false-success
+  bug — an interrupt/deadline on a healthy stream with a still-RUNNING schedule would
+  otherwise map to `DONE_SUCCESS`):
+  ```
+  switch (wait_interruptible(state->ws, req.op_timeout)) {
+    case COMPLETED:
+      set_terminal(ws->getState()==DONE_ERROR ? DONE_ERROR : DONE_SUCCESS,
+                   ws->getShutdownReason());
+      break;
+    case SHUTDOWN:                          // fault: stream doomed; DMA will be torn down
+      set_terminal(DONE_ERROR, ws->getShutdownReason());  // reason may be empty
+      break;
+    case TIMED_OUT:                          // dead peer / hang; escalate as genuine fault
+      req.on_error("collective timed out after N ms");    // -> report_and_abort -> setShutdown
+      set_terminal(DONE_ERROR, "timed out");
+      break;
   }
   ```
-  Never map blindly to `DONE_SUCCESS`.
-- **F5 — interruptible worker wait.** The worker must NOT use the raw
-  `ws->wait()` unguarded (no deadline; blocks forever on a dead peer,
-  head-of-line-blocking the whole FIFO). `wait_interruptible` mirrors
-  `SpyreCCLWork::wait()`'s existing loop (spyre_ccl.cpp:1762-1787): poll
-  `ws->query()` with a `needsShutdown()` check, a `request.is_aborted()` check (which
-  covers both a genuine `report_and_abort` and the backend-local `local_abort_`
-  teardown interrupt, §5.2(a)), and the `request.op_timeout` deadline — so a peer
-  failure, a clean subgroup teardown, or a timeout unblocks the worker promptly and
-  the FIFO advances. On deadline with no
-  completion, fall through to the F1 mapping (which will record `DONE_ERROR`); do
-  not wedge the worker.
+  Only `COMPLETED` with a non-error `getState()` maps to `DONE_SUCCESS`. A timeout is
+  treated as a genuine fault (M1): the shared transport is presumed doomed, so it
+  escalates through `report_and_abort`/`setShutdown` (which also tears down the wedged
+  DMA), matching the current synchronous `wait()` that throws on timeout rather than
+  reporting success (spyre_ccl.cpp:1775-1785).
 
 ### 4.4 `SpyreCCLWork` changes
 
@@ -457,23 +477,39 @@ Two distinct teardown scenarios, deliberately separated (C2):
 
 **(a) One backend destructs while others live (subgroup teardown, the common case).**
 The process-global worker keeps running for the surviving PGs; it must NOT be
-stopped, and the shared `comm_stream_` must NOT be shut down (that is process-fatal
-across all groups — see [[spyre-subgroup-failure-isolation-boundary]], and the
-current dtor at spyre_ccl.cpp:183-192 deliberately avoids it). The destructing
-backend must instead:
-  1. Mark itself aborted **locally** (`aborted_=true`) so no new requests enqueue.
-  2. **Drain its own outstanding requests**: any `WorkState` it still has
-     in-flight must reach terminal before the backend object (and its `is_aborted`/
-     `on_error` lambdas capturing `this`) is freed. The `SpyreCCLWork` dtor already
-     blocks on `state->cv` (§4.4); the backend dtor additionally waits until all its
-     issued requests are terminal (tracked via a per-backend in-flight counter
-     decremented by the worker on terminal transition). To unblock a request stuck
-     on a dead peer **without** the process-fatal shared-stream shutdown, use a
-     **backend-local interrupt**: a per-backend `std::atomic<bool> local_abort_`
-     that `wait_interruptible` also polls (alongside `needsShutdown()` and the
-     deadline). This bounds the drain without poisoning siblings.
-  3. Join the per-backend **watchdog** (unchanged, spyre_ccl.cpp:183-192). Do NOT
-     touch the process-global worker or `comm_stream_`.
+stopped, and the shared `comm_stream_` must NOT be shut down on a *clean* teardown
+(that is process-fatal across all groups — see
+[[spyre-subgroup-failure-isolation-boundary]], and the current dtor at
+spyre_ccl.cpp:183-192 deliberately avoids it). The destructing backend:
+  1. Marks itself aborted **locally** (`aborted_ = true`, and sets `local_abort_`)
+     so `req.is_aborted()` returns true → the worker drops any of this backend's
+     **not-yet-launched** requests (ENQUEUED/BUILDING) to `DONE_ERROR` without
+     building. **`local_abort_` scope is pre-launch only (M1).** `wait_interruptible`
+     does **not** poll it: a LAUNCHED transfer whose DMA is live on the shared stream
+     must never be abandoned mid-flight, or (i) the hardware DMA stays wedged on the
+     shared stream and silently head-of-line-blocks every sibling PG anyway, and
+     (ii) the Work would be marked terminal while the DMA still reads
+     `hold_tensors_` → use-after-free.
+  2. **Drains its own launched requests to genuine terminal** before the backend
+     object (and its captured-`this` lambdas) is freed. A LAUNCHED request completes
+     the normal way (`query()==COMPLETED`). **If one is genuinely wedged on a dead
+     peer, that is a fault, not clean teardown** — the shared transport is already
+     doomed, so it correctly escalates via the timeout path (§4.3 F1/M3
+     `TIMED_OUT → report_and_abort → setShutdown`), which both unblocks the drain and
+     tears down the wedged DMA. **Stated plainly: a subgroup destroy whose own
+     collective is hung on a dead peer cannot complete without escalating to the
+     process-fatal fault path** — there is no sibling-safe way to abandon a live
+     shared-stream DMA on 1p5. The healthy case (no wedge) is fully sibling-safe.
+  3. **Counter/lifetime ordering (M2).** The per-backend in-flight counter is
+     decremented by the worker as its **last** action for each request, *after* all
+     use of `req.on_error`/`req.is_aborted` and after the `ProgressRequest` is
+     cleared, with a `release` store paired against the backend dtor's `acquire`
+     wait. This guarantees the dtor cannot observe count==0 and free `this` while the
+     worker is still mid-call into a captured lambda. As a belt-and-braces
+     alternative the lambdas may instead capture a `weak_ptr` to a backend-owned
+     control block; the decrement-last ordering is the primary mechanism.
+  4. Joins the per-backend **watchdog** (unchanged, spyre_ccl.cpp:183-192). Does NOT
+     touch the process-global worker.
 
 **(b) Last backend / process finalize.** When the refcount reaches zero
 (`finalize_library` count-0 path): (1) set the worker's `progress_stop_`,
@@ -485,10 +521,12 @@ tears down the stream). The worker must exit before that teardown (it touches
 `comm_stream_`). Queued, never-built requests transition to
 `DONE_ERROR("process shutting down")`.
 
-- `abort()`/`shutdown()` (spyre_ccl.cpp:1545-1569) still set `aborted_` (+ now
-  `local_abort_`); genuine error aborts still go through `report_and_abort()`
-  (idempotent, 1571-1609), which remains the ONLY path that flips the shared
-  `comm_stream_->setShutdown` — reserved for real faults, never clean teardown (C2).
+- `abort()`/`shutdown()` (spyre_ccl.cpp:1545-1569) set `aborted_` + `local_abort_`
+  (stopping new enqueues + dropping un-launched requests). `report_and_abort()`
+  (idempotent, 1571-1609) remains the ONLY path that flips the shared
+  `comm_stream_->setShutdown`, reserved for **genuine faults** — a peer failure
+  (watchdog, §5.4), a build/run exception, or a launched-request timeout (§4.3 M3).
+  Clean teardown of a backend with no wedged launched request never touches it (C2).
 
 ### 5.3 Error propagation
 Surface unchanged: `Work::wait()` throws on `DONE_ERROR`, `isSuccess()` reflects it,
@@ -502,8 +540,11 @@ Unchanged per-backend independent thread. On peer failure it calls
 genuine fault, so the process-fatal shared-stream shutdown is correct here — a peer
 failure legitimately dooms the shared transport). The worker's interruptible wait
 (§4.3 F5) and the `SpyreCCLWork` dtor's `cv.wait` (§4.4) both observe it and unblock
-promptly. Contrast §5.2(a): *clean* subgroup teardown must NOT reach this path — it
-uses the backend-local `local_abort_` interrupt instead.
+promptly. Contrast §5.2(a): *clean* subgroup teardown must NOT reach this path for
+its un-launched requests — those are dropped via the pre-launch `local_abort_` check
+without touching `comm_stream_`. A *launched* request that is genuinely wedged,
+however, has no sibling-safe abandon on 1p5 and does escalate here via the timeout
+fault path (§4.3 M3 / R9) — that is a genuine fault, not clean teardown.
 
 ---
 
@@ -527,14 +568,20 @@ uses the backend-local `local_abort_` interrupt instead.
   thread — standard c10d SPMD. Enqueue is internally locked so the queue can't
   corrupt, but multi-threaded issue would break ordering and is out of scope for
   Phase 1.
-- **R8 — backend lifetime vs process-global worker.** The worker outlives
+- **R8 — backend lifetime vs process-global worker (M2).** The worker outlives
   individual backends and holds requests whose `is_aborted`/`on_error` lambdas
-  capture a backend `this`. A backend must not be freed while the worker still holds
-  a live request of its own → the backend dtor drains its own in-flight requests to
-  terminal first (§5.2(a), per-backend in-flight counter + backend-local interrupt).
-  The process-global worker's own lifetime is refcounted to
-  `initialize_library`/`finalize_library` (§4.3), so it outlives every backend and
-  is torn down only at count-0.
+  capture a backend `this`. A backend must not be freed while the worker is still
+  mid-call into those lambdas → the per-backend in-flight counter is decremented as
+  the worker's **last** action per request (after all lambda use, `release` store),
+  paired with the dtor's `acquire` drain-wait (§5.2(a).3). The process-global
+  worker's own lifetime is refcounted to `initialize_library`/`finalize_library`
+  (§4.3), so it outlives every backend and is torn down only at count-0.
+- **R9 — dead-peer subgroup teardown escalates to process-fatal (M1).** On 1p5
+  there is no sibling-safe way to abandon a live DMA on the shared `comm_stream_`, so
+  a backend destructing while its *own* collective is genuinely hung on a dead peer
+  must escalate through the fault path (`setShutdown`), which does affect siblings.
+  This is honest and unavoidable: the shared transport is already doomed by the dead
+  peer. The healthy teardown case (no wedged launched request) is fully sibling-safe.
 - **R6 — host-reduce UAF**: excluded and *enforced* by the §4.6 worker guard, not
   merely asserted.
 - **R7 — latency for a lone collective.** Moving BUILD to the worker adds a
@@ -566,8 +613,12 @@ uses the backend-local `local_abort_` interrupt instead.
   matcher/OOB/HDMA deadlock (validates the process-global FIFO serializes cross-PG
   traffic correctly). Then **destroy the TP subgroup backend while the world PG is
   still live and issuing** — confirm the world PG keeps working and its collectives
-  still succeed (validates C2: subgroup teardown does not shut down the shared
-  `comm_stream_`). This is the single most important new test for v3.
+  still succeed (validates C2: *healthy* subgroup teardown does not shut down the
+  shared `comm_stream_`). This is the single most important new test for v3. Include
+  the M1 case: destroy a subgroup while its *own* collective is genuinely
+  outstanding (not merely idle) and assert the documented behavior — a completing
+  collective drains sibling-safe; a dead-peer-wedged one escalates to the fault path
+  (R9), it is not silently abandoned (which would UAF `hold_tensors_`).
 - **Failure paths:** (a) abort mid-flight → queued requests fail to `DONE_ERROR`,
   destructor joins cleanly (no hang) — validates F4/§5.2(b); (b) inject a
   `DONE_ERROR` schedule state → Work throws, no false success — validates F1;
