@@ -31,6 +31,14 @@
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
 #include "types_mapping.h"
+// NOTE(task-6): global_info.hpp declares `spyre_comms_global` (used below for
+// is_last / getInits()). It currently lives under spyre-comms/src/, which is
+// NOT on torch-spyre's include path (only SPYRE_COMMS_DIR/include is added by
+// setup.py) -- so this include will fail to resolve until either (a) the
+// header is exposed publicly, or (b) an include dir is added. Flagged for
+// Task 9 (which owns the is_last reconciliation) to resolve; left as
+// specified by the Task-6 brief.
+#include "global_info.hpp"
 
 namespace c10d {
 
@@ -114,6 +122,11 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
   // of the compute stream, enabling compute/communication overlap.
   comm_stream_ = spyre_comms::get_comm_stream();
 
+  // Start (or ref) the one process-global progress worker. Refcounted so the
+  // Nth backend reuses the running worker; only the last unref (dtor) joins
+  // it.
+  torch_spyre::distributed::spyre_global_progress_ref();
+
   // Phase 1a cross-rank fail-fast: retain the Store (previously discarded
   // after construction) and start the background watchdog that polls it for
   // a peer's failure. See report_and_abort()/watchdog_loop().
@@ -122,13 +135,30 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
 }
 
 SpyreCCLBackend::~SpyreCCLBackend() {
-  // Stop and join the watchdog thread before finalize_library() so nothing
-  // touches this backend's members (store_, comm_stream_, aborted_) once
-  // destruction has begun.
+  // (§5.2a) Stop new enqueues + let the worker drop this backend's
+  // un-launched requests. Backend-local: does NOT shut down the shared
+  // comm_stream_.
+  aborted_.store(true, std::memory_order_release);
+  local_abort_.store(true, std::memory_order_release);
+  // Drain: wait until every request this backend issued has reached
+  // terminal, so the worker is no longer calling into our
+  // on_error/on_terminal/is_aborted lambdas (which capture `this`) and no DMA
+  // is still reading held tensors.
+  {
+    std::unique_lock<std::mutex> lk(inflight_mu_);
+    inflight_cv_.wait(
+        lk, [&] { return inflight_.load(std::memory_order_acquire) == 0; });
+  }
+  // Stop + join the watchdog (unchanged).
   watchdog_stop_.store(true, std::memory_order_release);
   if (watchdog_thread_.joinable()) {
     watchdog_thread_.join();
   }
+  // Unref the process-global worker; is_last is true only on the count-0
+  // finalize path. finalize_library() itself is refcounted; the worker join
+  // must precede the count-0 comm-stream teardown.
+  const bool is_last = (spyre_comms_global.getInits() == 1);
+  torch_spyre::distributed::spyre_global_progress_unref(is_last);
   spyre_comms::finalize_library();
 }
 

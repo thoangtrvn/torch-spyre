@@ -20,6 +20,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <spyre_comms.hpp>
 #include <string>
 #include <thread>
@@ -238,6 +240,17 @@ class SpyreCCLBackend : public c10d::Backend {
   c10::intrusive_ptr<::c10d::Store> store_;
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_stop_{false};
+
+  // Backend-local teardown interrupt: gates ONLY pre-launch request drops (M1).
+  // wait_interruptible never consults it — a launched DMA on the shared stream
+  // is never abandoned. Set in the destructor / abort().
+  std::atomic<bool> local_abort_{false};
+  // Count of this backend's requests the worker has not yet driven to terminal.
+  // Decremented (release) by the worker's on_terminal hook; the destructor
+  // waits (acquire) for it to reach 0 before freeing this backend (M2/R8).
+  std::atomic<int> inflight_{0};
+  std::mutex inflight_mu_;
+  std::condition_variable inflight_cv_;
 
   [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
       const at::Tensor& input_tensor);
