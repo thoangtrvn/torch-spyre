@@ -527,6 +527,57 @@ void SpyreCCLBackend::check_vector_tensor(
   }
 }
 
+/**
+ * @brief Build a ProgressRequest wired to this backend and enqueue it onto
+ * the process-global async progress worker.
+ *
+ * Increments inflight_ BEFORE enqueue so the destructor's drain-wait never
+ * races a request that has not yet been counted. The worker's on_terminal
+ * hook decrements (release) and notifies inflight_cv_ once the op reaches a
+ * terminal state. Everything captured into the ProgressRequest (buf,
+ * aux_bufs, params, caller_stream) is a plain value/BufferDesc/scalar --
+ * no at::Tensor crosses to the worker (C4). hold/result tensors live on the
+ * returned SpyreCCLWork, observed only by the calling thread.
+ *
+ * DISJOINT-MUTEX: on_terminal locks inflight_mu_ only, never state->m -- the
+ * worker may call on_terminal while already holding state->m, so touching
+ * state->m here would deadlock.
+ */
+c10::intrusive_ptr<Work> SpyreCCLBackend::enqueue_async(
+    OpType op, const spyre_comms::BufferDesc& buf,
+    std::vector<spyre_comms::BufferDesc> aux_bufs,
+    torch_spyre::distributed::CollectiveParams params,
+    const spyre::SpyreStream& caller_stream, std::vector<at::Tensor> hold,
+    std::vector<at::Tensor> result) {
+  auto state = std::make_shared<torch_spyre::distributed::WorkState>();
+  inflight_.fetch_add(1, std::memory_order_acq_rel);
+  torch_spyre::distributed::ProgressRequest req{
+      .op = op,
+      .context = group_context_,
+      .buf = buf,
+      .aux_bufs = std::move(aux_bufs),
+      .params = params,
+      .caller_stream = caller_stream,
+      .op_timeout = op_timeout_,
+      .is_aborted =
+          [this] {
+            return aborted_.load(std::memory_order_acquire) ||
+                   local_abort_.load(std::memory_order_acquire);
+          },
+      .on_error = [this](const std::string& m) { report_and_abort(m); },
+      .on_terminal =
+          [this] {
+            inflight_.fetch_sub(1, std::memory_order_release);
+            std::lock_guard<std::mutex> lk(inflight_mu_);
+            inflight_cv_.notify_all();
+          },
+      .state = state};
+  torch_spyre::distributed::spyre_global_progress_enqueue(std::move(req));
+  seq_.fetch_add(1, std::memory_order_relaxed);
+  return c10::make_intrusive<SpyreCCLWork>(op, state, std::move(hold),
+                                           std::move(result), op_timeout_);
+}
+
 /* **********************************************
  * Interface functions
  *
@@ -568,31 +619,19 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
       output_bufs.push_back(prepare_buffer_desc(outputTensor));
     }
 
-    DEBUGINFO("allgather: calling group_context_->allgather,",
+    DEBUGINFO("allgather: enqueuing async allgather,",
               "output_bufs.size=", output_bufs.size(),
               "rank=", group_context_->getRank(),
               "size=", group_context_->getSize());
 
-    auto ws = group_context_->allgather(output_bufs, input_buf);
-
-    DEBUGINFO("allgather: ws returned, starting");
-
-    // Ensure the producing compute on the caller's stream has landed before the
-    // collective DMAs the input (A5).
-    order_after_caller_stream(inputTensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-
-    DEBUGINFO("allgather: ws started, returning Work");
-
-    seq_.fetch_add(1, std::memory_order_relaxed);
+    auto caller_stream = spyre::getCurrentStream(inputTensors[0].device());
     // Keep the input + all output tensors alive for the async op; complete the
     // Future with the gathered outputs (A6/A7).
     std::vector<at::Tensor> hold = outputTensors[0];
     hold.push_back(inputTensors[0]);
-    return c10::make_intrusive<SpyreCCLWork>(OpType::ALLGATHER, std::move(ws),
-                                             std::move(hold), outputTensors[0],
-                                             op_timeout_);
+    return enqueue_async(OpType::ALLGATHER, input_buf, std::move(output_bufs),
+                         torch_spyre::distributed::CollectiveParams{},
+                         caller_stream, std::move(hold), outputTensors[0]);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("allgather: ") + e.what());
@@ -630,14 +669,11 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
               "buf.device_addr=", buf.device_addr,
               "is_host_only=", buf.is_host_only);
 
-    auto ws =
-        group_context_->allreduce(buf, convert_reduce_op_type(opts.reduceOp));
-    order_after_caller_stream(tensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    seq_.fetch_add(1, std::memory_order_relaxed);
-    return c10::make_intrusive<SpyreCCLWork>(OpType::ALLREDUCE, std::move(ws),
-                                             tensors, tensors, op_timeout_);
+    auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    return enqueue_async(OpType::ALLREDUCE, buf, /*aux_bufs=*/{},
+                         {.reduce_op = convert_reduce_op_type(opts.reduceOp)},
+                         caller_stream,
+                         /*hold=*/tensors, /*result=*/tensors);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("allreduce: ") + e.what());
@@ -990,13 +1026,14 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall_base(
 c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
   abort_guard("barrier");
   try {
-    auto ws = group_context_->barrier();
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    seq_.fetch_add(1, std::memory_order_relaxed);
-    return c10::make_intrusive<SpyreCCLWork>(
-        OpType::BARRIER, std::move(ws), std::vector<at::Tensor>{},
-        std::vector<at::Tensor>{}, op_timeout_);
+    // Barrier has no tensor to key a device off of -- use the default spyre
+    // device's current stream (mirrors the previous synchronous barrier(),
+    // which likewise did not reference any caller tensor/device).
+    auto caller_stream = spyre::getCurrentStream();
+    return enqueue_async(OpType::BARRIER, spyre_comms::BufferDesc{},
+                         /*aux_bufs=*/{},
+                         torch_spyre::distributed::CollectiveParams{},
+                         caller_stream, /*hold=*/{}, /*result=*/{});
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("barrier: ") + e.what());
@@ -1016,15 +1053,11 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
 
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-    auto ws = group_context_->broadcast(buf, opts.rootRank);
-    // On the root the buffer is the source and must be fully written before the
-    // broadcast reads it; on non-roots this is a cheap no-op fence (A5).
-    order_after_caller_stream(tensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    seq_.fetch_add(1, std::memory_order_relaxed);
-    return c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST, std::move(ws),
-                                             tensors, tensors, op_timeout_);
+    auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    return enqueue_async(
+        OpType::BROADCAST, buf, /*aux_bufs=*/{},
+        {.root = static_cast<spyre_comms::process_id_t>(opts.rootRank)},
+        caller_stream, /*hold=*/tensors, /*result=*/tensors);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("broadcast: ") + e.what());
@@ -1076,14 +1109,11 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
       result = {inputTensors[0]};
     }
 
-    auto ws = group_context_->gather(output_bufs, input_buf, opts.rootRank);
-    order_after_caller_stream(inputTensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    seq_.fetch_add(1, std::memory_order_relaxed);
-    return c10::make_intrusive<SpyreCCLWork>(OpType::GATHER, std::move(ws),
-                                             std::move(hold), std::move(result),
-                                             op_timeout_);
+    auto caller_stream = spyre::getCurrentStream(inputTensors[0].device());
+    return enqueue_async(
+        OpType::GATHER, input_buf, std::move(output_bufs),
+        {.root = static_cast<spyre_comms::process_id_t>(opts.rootRank)},
+        caller_stream, std::move(hold), std::move(result));
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("gather: ") + e.what());
@@ -1150,17 +1180,11 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
 
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-    auto ws = group_context_->send(buf, dstRank, tag);
-    // The send buffer must be fully written before the DMA reads it (A5).
-    order_after_caller_stream(tensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    // P2P operations must NOT increment the collective sequence counter.
-    // Only ranks participating in send/recv call this method, so incrementing
-    // would desynchronize the counter across ranks, causing "Detected mismatch
-    // between collectives on ranks" errors on the next collective call.
-    return c10::make_intrusive<SpyreCCLWork>(OpType::SEND, std::move(ws),
-                                             tensors, tensors, op_timeout_);
+    auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    return enqueue_async(
+        OpType::SEND, buf, /*aux_bufs=*/{},
+        {.peer = static_cast<spyre_comms::process_id_t>(dstRank), .tag = tag},
+        caller_stream, /*hold=*/tensors, /*result=*/tensors);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("send: ") + e.what());
@@ -1180,16 +1204,11 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
 
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
-    auto ws = group_context_->recv(buf, srcRank, tag);
-    // Order after any in-flight compute still using the destination buffer
-    // (A5).
-    order_after_caller_stream(tensors[0]);
-    ws->SetStreamAffinity(comm_stream_);
-    ws->start();
-    // P2P operations must NOT increment the collective sequence counter.
-    // See comment in send() above.
-    return c10::make_intrusive<SpyreCCLWork>(OpType::RECV, std::move(ws),
-                                             tensors, tensors, op_timeout_);
+    auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    return enqueue_async(
+        OpType::RECV, buf, /*aux_bufs=*/{},
+        {.peer = static_cast<spyre_comms::process_id_t>(srcRank), .tag = tag},
+        caller_stream, /*hold=*/tensors, /*result=*/tensors);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("recv: ") + e.what());

@@ -254,6 +254,20 @@ class SpyreCCLBackend : public c10d::Backend {
 
   [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
       const at::Tensor& input_tensor);
+
+  // Build a request wired to this backend and enqueue it onto the process-
+  // global async progress worker. Increments inflight_ BEFORE enqueue; the
+  // worker's on_terminal hook decrements (release) and notifies inflight_cv_.
+  // Everything captured into the request (buf, aux_bufs, params,
+  // caller_stream) is a plain value -- no at::Tensor is ever visible to the
+  // worker (C4). hold/result tensors live on the returned SpyreCCLWork and
+  // are only touched by the calling thread.
+  [[nodiscard]] c10::intrusive_ptr<Work> enqueue_async(
+      OpType op, const spyre_comms::BufferDesc& buf,
+      std::vector<spyre_comms::BufferDesc> aux_bufs,
+      torch_spyre::distributed::CollectiveParams params,
+      const spyre::SpyreStream& caller_stream, std::vector<at::Tensor> hold,
+      std::vector<at::Tensor> result);
   void check_single_tensor(const at::Tensor& tensor);
   void check_vector_tensor(const std::vector<at::Tensor>& tensors,
                            int min_allowed = 1, int max_allowed = 1);
