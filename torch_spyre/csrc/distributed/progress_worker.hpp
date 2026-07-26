@@ -81,4 +81,21 @@ struct ProgressRequest {
 // waiters.
 void set_terminal(WorkState& st, ProgressState terminal, std::string reason);
 
+// Start the process-global progress worker on first ref. Idempotent and
+// refcounted: pair every call with spyre_global_progress_unref().
+void spyre_global_progress_ref();
+
+// Release a ref on the process-global progress worker. When is_last is
+// true, stop and join the worker thread regardless of remaining refcount.
+void spyre_global_progress_unref(bool is_last);
+
+// Push req onto the worker's FIFO queue for build+run off the caller thread.
+void spyre_global_progress_enqueue(ProgressRequest req);
+
+// Poll ws until it completes, needs shutdown, or timeout elapses. Does NOT
+// consult any abort flag (M1: a launched wait is never interrupted by local
+// abort).
+WaitOutcome wait_interruptible(spyre_comms::WorkSchedule& ws,
+                               std::chrono::milliseconds timeout);
+
 }  // namespace torch_spyre::distributed
