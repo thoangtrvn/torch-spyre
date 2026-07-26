@@ -85,6 +85,8 @@ void run_one(ProgressRequest& req) {
   {
     std::lock_guard<std::mutex> lk(req.state->m);
     if (req.state->cancelled) {
+      req.state->state = ProgressState::DONE_SUCCESS;
+      req.state->cv.notify_all();
       req.on_terminal();
       return;  // dtor cancelled it; nothing built
     }
@@ -123,6 +125,8 @@ void run_one(ProgressRequest& req) {
     {
       std::lock_guard<std::mutex> lk(req.state->m);
       if (req.state->cancelled) {
+        req.state->state = ProgressState::DONE_SUCCESS;
+        req.state->cv.notify_all();
         req.on_terminal();
         return;
       }
