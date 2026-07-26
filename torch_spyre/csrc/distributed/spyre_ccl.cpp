@@ -573,7 +573,13 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::enqueue_async(
           },
       .state = state};
   torch_spyre::distributed::spyre_global_progress_enqueue(std::move(req));
-  seq_.fetch_add(1, std::memory_order_relaxed);
+  // NOTE: seq_ is NOT bumped here. Collective ops (allreduce, broadcast,
+  // gather, allgather, barrier) bump seq_ at their call sites because every
+  // rank in the group issues them. send/recv are P2P and run on only the 2
+  // participating ranks -- bumping seq_ here would desynchronize
+  // getSequenceNumberForGroup() across the group and trigger spurious
+  // "Detected mismatch between collectives on ranks" errors on the next
+  // collective call.
   return c10::make_intrusive<SpyreCCLWork>(op, state, std::move(hold),
                                            std::move(result), op_timeout_);
 }
@@ -629,6 +635,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     // Future with the gathered outputs (A6/A7).
     std::vector<at::Tensor> hold = outputTensors[0];
     hold.push_back(inputTensors[0]);
+    // Collective op: every rank in the group issues this, so seq_ stays in
+    // sync across ranks.
+    seq_.fetch_add(1, std::memory_order_relaxed);
     return enqueue_async(OpType::ALLGATHER, input_buf, std::move(output_bufs),
                          torch_spyre::distributed::CollectiveParams{},
                          caller_stream, std::move(hold), outputTensors[0]);
@@ -670,6 +679,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
               "is_host_only=", buf.is_host_only);
 
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    // Collective op: every rank in the group issues this, so seq_ stays in
+    // sync across ranks.
+    seq_.fetch_add(1, std::memory_order_relaxed);
     return enqueue_async(OpType::ALLREDUCE, buf, /*aux_bufs=*/{},
                          {.reduce_op = convert_reduce_op_type(opts.reduceOp)},
                          caller_stream,
@@ -1030,6 +1042,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
     // device's current stream (mirrors the previous synchronous barrier(),
     // which likewise did not reference any caller tensor/device).
     auto caller_stream = spyre::getCurrentStream();
+    // Collective op: every rank in the group issues this, so seq_ stays in
+    // sync across ranks.
+    seq_.fetch_add(1, std::memory_order_relaxed);
     return enqueue_async(OpType::BARRIER, spyre_comms::BufferDesc{},
                          /*aux_bufs=*/{},
                          torch_spyre::distributed::CollectiveParams{},
@@ -1054,6 +1069,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    // Collective op: every rank in the group issues this, so seq_ stays in
+    // sync across ranks.
+    seq_.fetch_add(1, std::memory_order_relaxed);
     return enqueue_async(
         OpType::BROADCAST, buf, /*aux_bufs=*/{},
         {.root = static_cast<spyre_comms::process_id_t>(opts.rootRank)},
@@ -1110,6 +1128,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
     }
 
     auto caller_stream = spyre::getCurrentStream(inputTensors[0].device());
+    // Collective op: every rank in the group issues this, so seq_ stays in
+    // sync across ranks.
+    seq_.fetch_add(1, std::memory_order_relaxed);
     return enqueue_async(
         OpType::GATHER, input_buf, std::move(output_bufs),
         {.root = static_cast<spyre_comms::process_id_t>(opts.rootRank)},
@@ -1181,6 +1202,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    // P2P op: only the 2 participating ranks issue this. Do NOT bump seq_
+    // here -- it would desynchronize getSequenceNumberForGroup() across the
+    // group (see enqueue_async's NOTE above).
     return enqueue_async(
         OpType::SEND, buf, /*aux_bufs=*/{},
         {.peer = static_cast<spyre_comms::process_id_t>(dstRank), .tag = tag},
@@ -1205,6 +1229,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
     spyre_comms::BufferDesc buf = prepare_buffer_desc(tensors[0]);
 
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
+    // P2P op: only the 2 participating ranks issue this. Do NOT bump seq_
+    // here -- it would desynchronize getSequenceNumberForGroup() across the
+    // group (see enqueue_async's NOTE above).
     return enqueue_async(
         OpType::RECV, buf, /*aux_bufs=*/{},
         {.peer = static_cast<spyre_comms::process_id_t>(srcRank), .tag = tag},
