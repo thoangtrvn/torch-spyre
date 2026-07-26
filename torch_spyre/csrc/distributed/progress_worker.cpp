@@ -53,11 +53,30 @@ GlobalProgress& gp() {
   return g;
 }
 
-// TASK-4 STUB: only handles ALLREDUCE so this file compiles/links and the
-// Task-3 worker plumbing can be exercised end to end. Task 4 replaces this
-// with the full 7-op dispatch switch over req.op.
+// Per-op build dispatch for the 7 in-scope collectives (Phase 1).
+// Dispatches on req.op to the correct context method, using req.buf,
+// req.aux_bufs, and req.params. All tensor-derived data is pre-extracted by
+// the caller; no at::Tensor access here (C4).
 std::unique_ptr<spyre_comms::WorkSchedule> build_for(ProgressRequest& req) {
-  return req.context->allreduce(req.buf, req.params.reduce_op);
+  auto& ctx = *req.context;
+  switch (req.op) {
+    case c10d::OpType::ALLREDUCE:
+      return ctx.allreduce(req.buf, req.params.reduce_op);
+    case c10d::OpType::BROADCAST:
+      return ctx.broadcast(req.buf, req.params.root);
+    case c10d::OpType::GATHER:
+      return ctx.gather(req.aux_bufs, req.buf, req.params.root);
+    case c10d::OpType::ALLGATHER:
+      return ctx.allgather(req.aux_bufs, req.buf);
+    case c10d::OpType::SEND:
+      return ctx.send(req.buf, req.params.peer, req.params.tag);
+    case c10d::OpType::RECV:
+      return ctx.recv(req.buf, req.params.peer, req.params.tag);
+    case c10d::OpType::BARRIER:
+      return ctx.barrier();
+    default:
+      throw std::runtime_error("async build_for: op not in Phase-1 scope");
+  }
 }
 
 void run_one(ProgressRequest& req) {
@@ -79,6 +98,14 @@ void run_one(ProgressRequest& req) {
   try {
     // BUILD (blocking OOB pre-exchange happens here, on THIS worker thread).
     std::unique_ptr<spyre_comms::WorkSchedule> ws = build_for(req);
+    // Defensive null-check: some builders may return nullptr on degenerate
+    // shapes.
+    if (!ws) {
+      set_terminal(*req.state, ProgressState::DONE_ERROR,
+                   "async build produced null schedule");
+      req.on_terminal();
+      return;
+    }
     // Section 4.6 host-reduce guard: refuse to launch a host-compute
     // schedule.
     if (ws->containsHostReduceOp()) {
