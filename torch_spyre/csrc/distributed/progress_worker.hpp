@@ -85,9 +85,14 @@ void set_terminal(WorkState& st, ProgressState terminal, std::string reason);
 // refcounted: pair every call with spyre_global_progress_unref().
 void spyre_global_progress_ref();
 
-// Release a ref on the process-global progress worker. When is_last is
-// true, stop and join the worker thread regardless of remaining refcount.
-void spyre_global_progress_unref(bool is_last);
+// Release a ref on the process-global progress worker. The worker's own
+// refcount is authoritative and 1:1 with backends; the worker joins the
+// thread whenever this ref drops the count to 0.
+void spyre_global_progress_unref();
+
+// Test/introspection accessor: true iff the worker thread is currently
+// joinable (i.e. running), read under the queue lock.
+bool spyre_global_progress_is_running();
 
 // Push req onto the worker's FIFO queue for build+run off the caller thread.
 void spyre_global_progress_enqueue(ProgressRequest req);

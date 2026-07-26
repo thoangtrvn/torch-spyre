@@ -31,14 +31,6 @@
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
 #include "types_mapping.h"
-// NOTE(task-6): global_info.hpp declares `spyre_comms_global` (used below for
-// is_last / getInits()). It currently lives under spyre-comms/src/, which is
-// NOT on torch-spyre's include path (only SPYRE_COMMS_DIR/include is added by
-// setup.py) -- so this include will fail to resolve until either (a) the
-// header is exposed publicly, or (b) an include dir is added. Flagged for
-// Task 9 (which owns the is_last reconciliation) to resolve; left as
-// specified by the Task-6 brief.
-#include "global_info.hpp"
 
 namespace c10d {
 
@@ -154,11 +146,12 @@ SpyreCCLBackend::~SpyreCCLBackend() {
   if (watchdog_thread_.joinable()) {
     watchdog_thread_.join();
   }
-  // Unref the process-global worker; is_last is true only on the count-0
-  // finalize path. finalize_library() itself is refcounted; the worker join
-  // must precede the count-0 comm-stream teardown.
-  const bool is_last = (spyre_comms_global.getInits() == 1);
-  torch_spyre::distributed::spyre_global_progress_unref(is_last);
+  // Unref the process-global worker. The worker's own refcount is 1:1 with
+  // backends (ref'd once per ctor), so it is authoritative on its own: the
+  // worker joins whenever THIS unref drops its count to 0, with no need to
+  // consult spyre-comms's internal getInits(). This join must precede
+  // finalize_library()'s count-0 comm-stream teardown.
+  torch_spyre::distributed::spyre_global_progress_unref();
   spyre_comms::finalize_library();
 }
 

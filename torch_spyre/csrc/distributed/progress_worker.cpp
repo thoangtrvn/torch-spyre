@@ -203,16 +203,21 @@ void spyre_global_progress_ref() {
   }
 }
 
-void spyre_global_progress_unref(bool is_last) {
+void spyre_global_progress_unref() {
   std::thread to_join;
   {
     std::lock_guard<std::mutex> lk(gp().qm);
-    if (--gp().refcount > 0 && !is_last) return;
+    if (--gp().refcount > 0) return;
     gp().stop = true;
     to_join = std::move(gp().thread);
   }
   gp().qcv.notify_all();
   if (to_join.joinable()) to_join.join();
+}
+
+bool spyre_global_progress_is_running() {
+  std::lock_guard<std::mutex> lk(gp().qm);
+  return gp().thread.joinable();
 }
 
 void spyre_global_progress_enqueue(ProgressRequest req) {
