@@ -30,6 +30,7 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <vector>
 
+#include "distributed/progress_worker.hpp"
 #include "module.h"
 
 namespace c10d {
@@ -280,7 +281,11 @@ class SpyreCCLWork : public Work {
  public:
   /**
    * @param opType         The collective op type (for diagnostics).
-   * @param work_schedule  The async schedule that drives the transfer.
+   * @param state          Shared progress state, published by the async
+   *                       progress worker (Task 2/3). This Work observes it
+   *                       via state->cv; it never owns or drives the
+   *                       underlying WorkSchedule (single-driver rule -- the
+   *                       worker is the sole owner/driver of state->ws).
    * @param hold_tensors   Input/output tensors kept alive by this Work for the
    *                       full duration of the async op. Because the schedule
    *                       captures raw device pointers, releasing these tensors
@@ -296,7 +301,7 @@ class SpyreCCLWork : public Work {
    *                       timeout. kUnsetTimeout means "block indefinitely".
    */
   SpyreCCLWork(OpType opType,
-               std::unique_ptr<spyre_comms::WorkSchedule> work_schedule,
+               std::shared_ptr<torch_spyre::distributed::WorkState> state,
                std::vector<at::Tensor> hold_tensors = {},
                std::vector<at::Tensor> result_tensors = {},
                std::chrono::milliseconds default_timeout = kUnsetTimeout);
@@ -316,7 +321,7 @@ class SpyreCCLWork : public Work {
   void finish_error(const std::string& msg);
 
   c10::intrusive_ptr<c10::ivalue::Future> future_;
-  std::unique_ptr<spyre_comms::WorkSchedule> work_schedule_;
+  std::shared_ptr<torch_spyre::distributed::WorkState> state_;
   std::vector<at::Tensor> hold_tensors_;
   std::vector<at::Tensor> result_tensors_;
   std::atomic<bool> completed_{false};
