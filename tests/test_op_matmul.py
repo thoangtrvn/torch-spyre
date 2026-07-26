@@ -189,6 +189,15 @@ _MATMUL_CASES = [
     ("sp3k_8x384x64",   8,  384, 64, 1, _SP3K, ("identity", "ones")),   # ks=6
     ("sp3k_32x128x64", 32,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=32
     ("sp3k_32x256x64", 32,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=32
+    # #SP3-MGEN (2026-07-26): clean-OUTER general-rows {12,16,20} — the M-gen widen
+    # (LXLU restickify tail generalized from {8,32} to all clean-OUTER rows). Byte-match
+    # verified M12/16/20 x ks2/4; xfail until the torch-path HW probe flips them green.
+    ("sp3k_12x128x64", 12,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=12
+    ("sp3k_12x256x64", 12,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=12
+    ("sp3k_16x128x64", 16,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=16
+    ("sp3k_16x256x64", 16,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=16
+    ("sp3k_20x128x64", 20,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=20
+    ("sp3k_20x256x64", 20,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=20
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -229,7 +238,12 @@ _MULTICORE_HW_VERIFIED_MATMUL: set[str] = {
 # ks<=6; ks=8 (K=512) stays fail-loud (TILE_SIZE overflow #311).
 _SP3K_HW_VERIFIED_MATMUL: set[str] = {
     "sp3k_8x128x64", "sp3k_8x256x64", "sp3k_8x384x64",
-    "sp3k_32x128x64", "sp3k_32x256x64"}
+    "sp3k_32x128x64", "sp3k_32x256x64",
+    # #SP3-MGEN clean-OUTER general-rows — HW-verified 2026-07-26 (max_diff==0 on
+    # silicon, D1 identity + D3 ones; codegen sweep ks2..8, torch path ks2/4).
+    "sp3k_12x128x64", "sp3k_12x256x64",
+    "sp3k_16x128x64", "sp3k_16x256x64",
+    "sp3k_20x128x64", "sp3k_20x256x64"}
 
 
 def _sp5_reason(case_id, M, K, N):
@@ -376,9 +390,15 @@ def test_matmul_verified_membership_locked():
         # ttir classifier fix (K-accumulate no longer misread as bias) + the clean-K
         # dispatcher envelope. ks<=6 (K<=384); ks=8 (K=512) stays fail-loud (#311).
         "sp3k_8x128x64", "sp3k_8x256x64", "sp3k_8x384x64",
-        "sp3k_32x128x64", "sp3k_32x256x64"}, (
-        "SP3 clean-K verified set changed. Only K in {128,192(N/A here),256,384} at "
-        "M in {8,32} (ks<=6, C=1) are torch-path HW-verified. ks>=8 (K>=512) is #311. "
+        "sp3k_32x128x64", "sp3k_32x256x64",
+        # #SP3-MGEN clean-OUTER general-rows {12,16,20} — HW-verified 2026-07-26
+        # (max_diff==0, D1+D3; codegen sweep ks2..8, torch path ks2/4).
+        "sp3k_12x128x64", "sp3k_12x256x64",
+        "sp3k_16x128x64", "sp3k_16x256x64",
+        "sp3k_20x128x64", "sp3k_20x256x64"}, (
+        "SP3 clean-K verified set changed. K in {128,256,384} at M in {8,32} + the "
+        "#SP3-MGEN general-rows {12,16,20} at K in {128,256} (ks<=6, C=1) are torch-path "
+        "HW-verified. ks>=8 (K>=512) is #311. "
         "Confirm max_diff==0 on silicon before widening, then update this lock."
     )
 
