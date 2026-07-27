@@ -1385,30 +1385,67 @@ SpyreCCLWork::SpyreCCLWork(
       result_tensors_(std::move(result_tensors)),
       default_timeout_(default_timeout) {}
 
+SpyreCCLWork::SpyreCCLWork(OpType opType,
+                           std::unique_ptr<spyre_comms::WorkSchedule> ws,
+                           std::vector<at::Tensor> hold_tensors,
+                           std::vector<at::Tensor> result_tensors,
+                           std::chrono::milliseconds default_timeout)
+    : Work(-1, opType),
+      future_(c10::make_intrusive<at::ivalue::Future>(
+          c10::ListType::create(c10::TensorType::get()))),
+      work_schedule_(std::move(ws)),
+      hold_tensors_(std::move(hold_tensors)),
+      result_tensors_(std::move(result_tensors)),
+      default_timeout_(default_timeout) {}
+
 SpyreCCLWork::~SpyreCCLWork() {
-  // Single-driver rule: the async progress worker is the sole owner/driver
-  // of state_->ws once published. This destructor never touches ws -- it
-  // only observes state_->state via the cv and, for pre-launch states,
-  // requests cancellation. Waiting here (rather than detaching) keeps
-  // hold_tensors_ alive until the worker has actually reached a terminal
-  // state, so an in-flight DMA never reads/writes freed tensor storage.
-  std::unique_lock<std::mutex> lk(state_->m);
-  switch (state_->state) {
-    case torch_spyre::distributed::ProgressState::ENQUEUED:
-    case torch_spyre::distributed::ProgressState::BUILDING:
-      // If still pre-launch we can cancel; but BUILDING means the worker may
-      // be mid-build. Safest uniform rule: mark cancelled, then wait for
-      // terminal.
-      state_->cancelled = true;
-      [[fallthrough]];
-    case torch_spyre::distributed::ProgressState::LAUNCHED:
-      state_->cv.wait(lk, [&] {
-        return torch_spyre::distributed::is_terminal(state_->state);
-      });
-      break;
-    case torch_spyre::distributed::ProgressState::DONE_SUCCESS:
-    case torch_spyre::distributed::ProgressState::DONE_ERROR:
-      break;
+  if (state_) {
+    // Single-driver rule: the async progress worker is the sole owner/driver
+    // of state_->ws once published. This destructor never touches ws -- it
+    // only observes state_->state via the cv and, for pre-launch states,
+    // requests cancellation. Waiting here (rather than detaching) keeps
+    // hold_tensors_ alive until the worker has actually reached a terminal
+    // state, so an in-flight DMA never reads/writes freed tensor storage.
+    std::unique_lock<std::mutex> lk(state_->m);
+    switch (state_->state) {
+      case torch_spyre::distributed::ProgressState::ENQUEUED:
+      case torch_spyre::distributed::ProgressState::BUILDING:
+        // If still pre-launch we can cancel; but BUILDING means the worker
+        // may be mid-build. Safest uniform rule: mark cancelled, then wait
+        // for terminal.
+        state_->cancelled = true;
+        [[fallthrough]];
+      case torch_spyre::distributed::ProgressState::LAUNCHED:
+        state_->cv.wait(lk, [&] {
+          return torch_spyre::distributed::is_terminal(state_->state);
+        });
+        break;
+      case torch_spyre::distributed::ProgressState::DONE_SUCCESS:
+      case torch_spyre::distributed::ProgressState::DONE_ERROR:
+        break;
+    }
+  } else {
+    // If the Work is destroyed while the transfer is still reading/writing
+    // the held tensors' device memory, releasing hold_tensors_ would free
+    // storage out from under an in-flight DMA (use-after-free). Drain the
+    // schedule first.
+    //
+    // Key this on the schedule's real state (query()), not completed_: a
+    // wait() that hit its timeout marks completed_ = true while the DMA is
+    // still live, so completed_ alone is not sufficient to prove it is safe
+    // to free.
+    // (Caveat: if the peer is dead this drain can block during teardown --
+    // the lesser evil vs. memory corruption. A comms-level cancel would let
+    // us abort instead of drain.)
+    if (work_schedule_ && !work_schedule_->query()) {
+      try {
+        work_schedule_->synchronize();
+      }
+      catch (...) {
+        // Destructors must not throw; a failed transfer is surfaced via
+        // wait().
+      }
+    }
   }
 }
 
@@ -1427,39 +1464,71 @@ void SpyreCCLWork::finish_error(const std::string& msg) {
 
 bool SpyreCCLWork::isCompleted() {
   if (completed_.load(std::memory_order_acquire)) return true;
-  // Gate on the shared WorkState published by the async progress worker.
-  // Never call ws->query() here -- the worker is the sole driver of ws
-  // (single-driver rule); this Work only observes state_->state/error_reason
-  // under state_->m.
-  torch_spyre::distributed::ProgressState s;
-  std::string reason;
-  {
-    std::lock_guard<std::mutex> lk(state_->m);
-    s = state_->state;
-    reason = state_->error_reason;
-  }
-  if (!torch_spyre::distributed::is_terminal(s)) return false;
-  bool expected = false;
-  if (completed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
-    // Reflect the real terminal state: only complete the Future on genuine
-    // success; on DONE_ERROR propagate the failure (A7). Prefer the
-    // recorded error_reason (e.g. a cross-rank peer failure signaled via the
-    // process group's watchdog) over the generic message when one was set.
-    if (s == torch_spyre::distributed::ProgressState::DONE_ERROR) {
-      finish_error(reason.empty()
-                       ? "[SpyreCCL]: collective completed with DONE_ERROR"
-                       : "[SpyreCCL]: collective aborted: " + reason);
-    } else {
-      finish_success();
+  if (state_) {
+    // Gate on the shared WorkState published by the async progress worker.
+    // Never call ws->query() here -- the worker is the sole driver of ws
+    // (single-driver rule); this Work only observes
+    // state_->state/error_reason under state_->m.
+    torch_spyre::distributed::ProgressState s;
+    std::string reason;
+    {
+      std::lock_guard<std::mutex> lk(state_->m);
+      s = state_->state;
+      reason = state_->error_reason;
     }
+    if (!torch_spyre::distributed::is_terminal(s)) return false;
+    bool expected = false;
+    if (completed_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      // Reflect the real terminal state: only complete the Future on genuine
+      // success; on DONE_ERROR propagate the failure (A7). Prefer the
+      // recorded error_reason (e.g. a cross-rank peer failure signaled via
+      // the process group's watchdog) over the generic message when one was
+      // set.
+      if (s == torch_spyre::distributed::ProgressState::DONE_ERROR) {
+        finish_error(reason.empty()
+                         ? "[SpyreCCL]: collective completed with DONE_ERROR"
+                         : "[SpyreCCL]: collective aborted: " + reason);
+      } else {
+        finish_success();
+      }
+    }
+    return true;
+  } else {
+    if (work_schedule_ && work_schedule_->query()) {
+      bool expected = false;
+      if (completed_.compare_exchange_strong(expected, true,
+                                             std::memory_order_acq_rel)) {
+        // Reflect the real terminal state: only complete the Future on
+        // genuine success; on DONE_ERROR propagate the failure (A7). Prefer
+        // the schedule's shutdown reason (e.g. a cross-rank peer failure
+        // signaled via the process group's watchdog) over the generic
+        // message when one was recorded -- see
+        // report_and_abort()/getShutdownReason().
+        if (work_schedule_->getState() ==
+            spyre_comms::WorkScheduleState::State::DONE_ERROR) {
+          std::string reason = work_schedule_->getShutdownReason();
+          finish_error(reason.empty()
+                           ? "[SpyreCCL]: collective completed with DONE_ERROR"
+                           : "[SpyreCCL]: collective aborted: " + reason);
+        } else {
+          finish_success();
+        }
+      }
+    }
+    return completed_.load(std::memory_order_acquire);
   }
-  return true;
 }
 
 bool SpyreCCLWork::isSuccess() const {
-  std::lock_guard<std::mutex> lk(state_->m);
-  return state_->state != torch_spyre::distributed::ProgressState::DONE_ERROR;
+  if (state_) {
+    std::lock_guard<std::mutex> lk(state_->m);
+    return state_->state !=
+           torch_spyre::distributed::ProgressState::DONE_ERROR;
+  }
+  if (!work_schedule_) return true;
+  return work_schedule_->getState() !=
+         spyre_comms::WorkScheduleState::State::DONE_ERROR;
 }
 
 bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
@@ -1471,49 +1540,134 @@ bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
   const std::chrono::milliseconds effective_timeout =
       (timeout != kUnsetTimeout && timeout.count() > 0) ? timeout
                                                         : default_timeout_;
-  using torch_spyre::distributed::is_terminal;
-  using torch_spyre::distributed::ProgressState;
+  if (state_) {
+    using torch_spyre::distributed::is_terminal;
+    using torch_spyre::distributed::ProgressState;
 
-  std::unique_lock<std::mutex> lk(state_->m);
-  if (!is_terminal(state_->state)) {
+    std::unique_lock<std::mutex> lk(state_->m);
+    if (!is_terminal(state_->state)) {
+      // kUnsetTimeout (or a non-positive value) means "block indefinitely".
+      if (effective_timeout == kUnsetTimeout ||
+          effective_timeout.count() <= 0) {
+        state_->cv.wait(lk, [&] { return is_terminal(state_->state); });
+      } else if (!state_->cv.wait_for(lk, effective_timeout, [&] {
+                   return is_terminal(state_->state);
+                 })) {
+        // Timed out without reaching a terminal state.
+        lk.unlock();
+        bool expected = false;
+        if (completed_.compare_exchange_strong(expected, true,
+                                               std::memory_order_acq_rel)) {
+          finish_error("[SpyreCCL]: collective wait timed out after " +
+                       std::to_string(effective_timeout.count()) + " ms");
+        }
+        throw std::runtime_error(
+            "[SpyreCCL]: collective wait timed out after " +
+            std::to_string(effective_timeout.count()) + " ms");
+      }
+    }
+    const bool err = state_->state == ProgressState::DONE_ERROR;
+    const std::string reason = state_->error_reason;
+    lk.unlock();
+
+    bool expected = false;
+    if (completed_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      if (err) {
+        finish_error(reason.empty()
+                         ? "[SpyreCCL]: collective completed with an error"
+                         : "[SpyreCCL]: collective aborted: " + reason);
+      } else {
+        finish_success();
+      }
+    }
+
+    // c10d contract: wait() surfaces failures by throwing, not by returning
+    // false. A false return is reserved for a timeout that did not complete.
+    if (err) {
+      throw std::runtime_error(
+          reason.empty() ? "[SpyreCCL]: collective completed with an error"
+                         : "[SpyreCCL]: collective aborted: " + reason);
+    }
+    return true;
+  }
+
+  // Sync path: this Work owns and drives work_schedule_ directly.
+  if (!completed_.load(std::memory_order_acquire) && work_schedule_) {
     // kUnsetTimeout (or a non-positive value) means "block indefinitely".
     if (effective_timeout == kUnsetTimeout || effective_timeout.count() <= 0) {
-      state_->cv.wait(lk, [&] { return is_terminal(state_->state); });
-    } else if (!state_->cv.wait_for(lk, effective_timeout, [&] {
-                 return is_terminal(state_->state);
-               })) {
-      // Timed out without reaching a terminal state.
-      lk.unlock();
-      bool expected = false;
-      if (completed_.compare_exchange_strong(expected, true,
-                                             std::memory_order_acq_rel)) {
-        finish_error("[SpyreCCL]: collective wait timed out after " +
-                     std::to_string(effective_timeout.count()) + " ms");
-      }
-      throw std::runtime_error("[SpyreCCL]: collective wait timed out after " +
-                               std::to_string(effective_timeout.count()) +
-                               " ms");
-    }
-  }
-  const bool err = state_->state == ProgressState::DONE_ERROR;
-  const std::string reason = state_->error_reason;
-  lk.unlock();
-
-  bool expected = false;
-  if (completed_.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
-    if (err) {
-      finish_error(reason.empty()
-                       ? "[SpyreCCL]: collective completed with an error"
-                       : "[SpyreCCL]: collective aborted: " + reason);
+      work_schedule_->wait();
     } else {
-      finish_success();
+      // The underlying WorkSchedule::wait() has no deadline, so poll query()
+      // until the timeout elapses. This bounds the wait so a dead peer cannot
+      // hang the caller forever (P1). TODO: replace with a native timed wait
+      // once spyre_comms exposes one.
+      //
+      // This is, in practice, the branch actually taken on essentially every
+      // call: c10d's default process-group timeout (30 minutes) is a
+      // positive value, so effective_timeout is essentially never
+      // kUnsetTimeout even when the caller requests none explicitly.
+      // Confirmed via Phase 1a hang investigation (2026-07-14): the
+      // work_schedule_->wait() branch above was never observed to run.
+      //
+      // needsShutdown() MUST also be checked here, not just the deadline:
+      // report_and_abort() flags comm_stream_ for shutdown (a local error,
+      // or a cross-rank peer failure signaled via the Store watchdog), but
+      // query() only checks in_flight_==0 -- it has no way to observe that
+      // flag. Without this check, a rank blocked in this exact loop (e.g.
+      // waiting on data that will never arrive because the peer failed
+      // before ever sending) would poll query() forever until the full PG
+      // timeout, never noticing the peer's failure at all.
+      const auto deadline =
+          std::chrono::steady_clock::now() + effective_timeout;
+      while (!work_schedule_->query()) {
+        if (work_schedule_->needsShutdown()) {
+          // Fall through via the schedule's own wait(): now fast (returns
+          // promptly once needsShutdown() is observed -- see
+          // RuntimeStream::synchronize()), and it correctly transitions
+          // current_state_ to DONE_ERROR, which the shared completion
+          // handling below (and any later isSuccess()/wait() call) relies
+          // on -- an inline throw here would leave that state stale.
+          work_schedule_->wait();
+          break;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+          bool expected = false;
+          if (completed_.compare_exchange_strong(expected, true,
+                                                 std::memory_order_acq_rel)) {
+            finish_error("[SpyreCCL]: collective timed out after " +
+                         std::to_string(effective_timeout.count()) + " ms");
+          }
+          throw std::runtime_error(
+              "[SpyreCCL]: collective wait timed out after " +
+              std::to_string(effective_timeout.count()) + " ms");
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+
+    bool expected = false;
+    if (completed_.compare_exchange_strong(expected, true,
+                                           std::memory_order_acq_rel)) {
+      if (work_schedule_->getState() ==
+          spyre_comms::WorkScheduleState::State::DONE_ERROR) {
+        std::string reason = work_schedule_->getShutdownReason();
+        finish_error(reason.empty()
+                         ? "[SpyreCCL]: collective completed with DONE_ERROR"
+                         : "[SpyreCCL]: collective aborted: " + reason);
+      } else {
+        finish_success();
+      }
     }
   }
 
   // c10d contract: wait() surfaces failures by throwing, not by returning
   // false. A false return is reserved for a timeout that did not complete.
-  if (err) {
+  // Prefer the schedule's shutdown reason when one was recorded (see
+  // isCompleted() above for why this can be empty).
+  if (!isSuccess()) {
+    std::string reason =
+        work_schedule_ ? work_schedule_->getShutdownReason() : std::string();
     throw std::runtime_error(
         reason.empty() ? "[SpyreCCL]: collective completed with an error"
                        : "[SpyreCCL]: collective aborted: " + reason);

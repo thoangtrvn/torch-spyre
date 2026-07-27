@@ -332,6 +332,33 @@ class SpyreCCLWork : public Work {
                std::vector<at::Tensor> hold_tensors = {},
                std::vector<at::Tensor> result_tensors = {},
                std::chrono::milliseconds default_timeout = kUnsetTimeout);
+
+  /**
+   * @param opType         The collective op type (for diagnostics).
+   * @param work_schedule  Owned WorkSchedule for the synchronous (excluded-op)
+   *                       path. This Work is the sole owner/driver of the
+   *                       schedule -- it queries/waits on it directly (unlike
+   *                       the async ctor above, which only observes a shared
+   *                       WorkState published by the async progress worker).
+   * @param hold_tensors   Input/output tensors kept alive by this Work for the
+   *                       full duration of the op. Because the schedule
+   *                       captures raw device pointers, releasing these tensors
+   *                       before completion would free memory the collective is
+   *                       still using (use-after-free). Holding a reference
+   * here ties their lifetime to the Work.
+   * @param result_tensors The output tensors used to complete the Future so
+   *                       fut.value() / functional-collective consumers observe
+   *                       the collective result. Must be a subset of
+   *                       hold_tensors.
+   * @param default_timeout The process-group timeout to apply in wait() when
+   *                       the caller passes no explicit (positive) per-call
+   *                       timeout. kUnsetTimeout means "block indefinitely".
+   */
+  SpyreCCLWork(OpType opType,
+               std::unique_ptr<spyre_comms::WorkSchedule> work_schedule,
+               std::vector<at::Tensor> hold_tensors = {},
+               std::vector<at::Tensor> result_tensors = {},
+               std::chrono::milliseconds default_timeout = kUnsetTimeout);
   ~SpyreCCLWork() override;
   [[nodiscard]] bool isCompleted() override;
   [[nodiscard]] bool isSuccess() const override;
@@ -348,7 +375,13 @@ class SpyreCCLWork : public Work {
   void finish_error(const std::string& msg);
 
   c10::intrusive_ptr<c10::ivalue::Future> future_;
+  // Set iff constructed via the async ctor (shared state published by the
+  // async progress worker); null on the sync path.
   std::shared_ptr<torch_spyre::distributed::WorkState> state_;
+  // Set iff constructed via the sync ctor (owned/driven directly by this
+  // Work); null on the async path. Exactly one of state_/work_schedule_ is
+  // non-null.
+  std::unique_ptr<spyre_comms::WorkSchedule> work_schedule_;
   std::vector<at::Tensor> hold_tensors_;
   std::vector<at::Tensor> result_tensors_;
   std::atomic<bool> completed_{false};
