@@ -24,7 +24,8 @@
 #include <spyre_comms.hpp>
 #include <spyre_comms_tensor.hpp>
 #include <string>
-#include <torch/csrc/distributed/c10d/Types.hpp>  // OpType
+#include <torch/csrc/distributed/c10d/Types.hpp>  // ReduceOp
+#include <torch/csrc/distributed/c10d/Work.hpp>   // OpType
 #include <vector>
 
 #include "spyre_stream.h"
