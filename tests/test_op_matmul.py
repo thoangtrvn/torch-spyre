@@ -327,7 +327,11 @@ _SP4K_HW_VERIFIED_MATMUL: set[str] = set()
 # TRITON_ALWAYS_COMPILE=1 only bypasses the on-disk cache — a stale binary can make a
 # real fault look fixed, or a working fix look broken.
 # Flip an id in ONLY after max_diff==0 with no BusFence/RbTimeOut on silicon.
-_FLAT_HW_VERIFIED_MATMUL: set[str] = set()
+# HW-VERIFIED 2026-07-28 on tmhoangt-spyre-dev-bob-quick (AIU 1.0 RCUDD1A): rows8/16
+# eager AND compiled, max_diff==0, no BusFence/RbTimeOut. rows=32 (flat_32x256x2048)
+# stays OUT — it is still router-refused (flat_rows_ge32_hwkat_pending; uncollapsed
+# LXLU ladder), so its equivalence is unproven on silicon.
+_FLAT_HW_VERIFIED_MATMUL: set[str] = {"flat_8x256x2048", "flat_16x256x2048"}
 
 
 def _sp4_reason(case_id, M, K, N):
