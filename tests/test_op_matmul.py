@@ -145,6 +145,7 @@ _SP2 = "sp2_multi_core"
 _SP3K = "sp3_clean_k"   # K>64 clean-K (K%64==0) within-core K-accumulation, C=1
 _SP4 = "sp4_n_tiling"   # N>64 clean-N (N%64==0) output-column N-tiling (ns>1), multi-core
 _SP4K = "sp4k_ktiling_ntiling"  # K>64 AND N>64 (ks>1 ∧ ns>1) composition, multi-core (R1)
+_FLAT = "flat_single_pass"  # 127 < ks*ns <= ~192 single-pass large-N, C=1 (no ns time-loop)
 _LLM = "llm_real"
 
 _MATMUL_CASES = [
@@ -226,6 +227,27 @@ _MATMUL_CASES = [
     ("sp4k_64x256x256",  64, 256, 256, 4,  _SP4K, ("identity", "ones")),  # ks4 ns4, HW-verified @C4
     ("sp4k_64x512x512",  64, 512, 512, 4,  _SP4K, ("identity", "ones")),  # ks8 ns8 (ns==ks)
     ("sp4k_128x256x256", 128, 256, 256, 8,  _SP4K, ("identity", "ones")),  # ks4 ns4 rows16
+    # --- FLAT single-pass large-N (127 < ks*ns <= ~192), C=1. The whole N extent is
+    #     RESIDENT and swept in ONE pass — there is NO ns time-loop, so this is a
+    #     structurally different emitter from SP4/SP4K, with its own derived PT drain
+    #     (flat_pt_row_programs) and its own init-packet trailing pad (BODY 4-FLIT
+    #     ALIGNMENT, body = total_flits-1 ≡ 0 mod 4).
+    #     OFFLINE STATUS: rows 8 and 16 are FULL-BINARY RAW-IDENTICAL to the shipped
+    #     deeptools goldens (codegen 7f4c1ca) — the ceiling of what can be proven
+    #     offline. That is NOT correctness: the emulator stubs the compute units
+    #     (sfp/pe/pt/l0 pass-through) and models no DMA/multicast/XLAT, so
+    #     BusFence/deadlock is invisible to us. THIS TIER IS THE ONLY ORACLE.
+    #     rows=32 (flat_32x256x2048) additionally exercises the UNCOLLAPSED LXLU
+    #     activation ladder, which is intentionally NOT raw-byte-match-gated (deeptools'
+    #     LDU-burst collapse is an encoding-only cost artifact we don't replicate);
+    #     silicon max_diff=0 is its ONLY acceptance criterion. It currently fail-louds
+    #     at serialization on flat_rows_ge32_hwkat_pending — run rows 8/16 FIRST, then
+    #     clear that flag and run rows=32.
+    #     K=256 <= 1024 so identity AND ones are both DL16-exact (ones -> out=K=256).
+    #     xfail until the board returns max_diff==0. _FLAT tier. ---
+    ("flat_8x256x2048",   8, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows8  ks4 ns32 RAW-matched
+    ("flat_16x256x2048", 16, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows16 ks4 ns32 RAW-matched
+    ("flat_32x256x2048", 32, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows32 uncollapsed ladder
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -294,6 +316,19 @@ _SP4_HW_VERIFIED_MATMUL: set[str] = {
 # known-answer isn't green yet. Flip an id in once its torch-path HW probe passes.
 _SP4K_HW_VERIFIED_MATMUL: set[str] = set()
 
+# FLAT single-pass large-N (ks*ns>127, C=1, no ns time-loop). Offline is EXHAUSTED:
+# rows 8/16 are FULL-BINARY RAW-IDENTICAL to the shipped deeptools goldens (codegen
+# 7f4c1ca) — both the derived PT drain and the derived init-packet body-alignment pad.
+# EMPTY, and it must stay empty until the board speaks: raw-identity to a golden is
+# strong evidence but NOT correctness, because the emulator stubs the compute units and
+# models no DMA/multicast/XLAT, so a BusFence/deadlock would be invisible offline.
+# CACHE HYGIENE IS LOAD-BEARING before running these: clear ~/.sentient_cache AND
+# RESTART Python. The Triton in-memory cache survives torch._dynamo.reset() and
+# TRITON_ALWAYS_COMPILE=1 only bypasses the on-disk cache — a stale binary can make a
+# real fault look fixed, or a working fix look broken.
+# Flip an id in ONLY after max_diff==0 with no BusFence/RbTimeOut on silicon.
+_FLAT_HW_VERIFIED_MATMUL: set[str] = set()
+
 
 def _sp4_reason(case_id, M, K, N):
     return (
@@ -318,6 +353,31 @@ def _sp4k_reason(case_id, M, K, N):
         "C16->rows4 KLOOP, unbuilt #13; the HW-verified path is C4 at SENCORES<=12). Flip "
         "it in once a torch-path HW probe passes at the routed C (D1 identity + D3 ones, "
         "K,N<=1024 both DL16-exact). Llama-scale ks*ns>127 needs R2/R5."
+    )
+
+
+def _flat_reason(case_id, M, K, N):
+    rows32 = case_id == "flat_32x256x2048"
+    return (
+        f"{case_id} [{M}x{K}x{N} @C1]: FLAT single-pass large-N (ks*ns>127) is BUILT — "
+        "the whole N extent is resident and swept in ONE pass (no ns time-loop), with a "
+        "DERIVED PT drain (flat_pt_row_programs: FILL carries the systolic skew, DRAIN = "
+        "(rows//4)*(ns//2) granules) and a DERIVED init-packet trailing pad (BODY 4-FLIT "
+        "ALIGNMENT: body = total_flits-1 is a multiple of 4). rows 8/16 are FULL-BINARY "
+        "RAW-IDENTICAL to the shipped deeptools goldens (codegen 7f4c1ca) — the CEILING "
+        "of offline evidence, and NOT correctness: the emulator stubs the compute units "
+        "and models no DMA/multicast/XLAT, so BusFence/deadlock is invisible offline. "
+        + ("This rows=32 case additionally exercises the UNCOLLAPSED LXLU activation "
+           "ladder, which is intentionally NOT raw-byte-match-gated (deeptools' "
+           "LDU-burst collapse is an encoding-only cost artifact we do not replicate; "
+           "both forms address the same |A|=rows*ks sticks per trip). Silicon "
+           "max_diff==0 is its ONLY acceptance criterion, and it currently fail-louds "
+           "at serialization on flat_rows_ge32_hwkat_pending — run rows 8/16 first, then "
+           "clear that flag. " if rows32 else "")
+        + "Before running: clear ~/.sentient_cache AND restart Python (the Triton "
+        "in-memory cache survives torch._dynamo.reset()). Flip this id into "
+        "_FLAT_HW_VERIFIED_MATMUL once the board returns max_diff==0 with no "
+        "BusFence/RbTimeOut (D1 identity + D3 ones; K=256<=1024 so both are DL16-exact)."
     )
 
 
@@ -379,6 +439,9 @@ def _xfail(case_id, M, K, N, C, tier):
     elif tier == _SP4K:
         if case_id not in _SP4K_HW_VERIFIED_MATMUL:
             pytest.xfail(_sp4k_reason(case_id, M, K, N))
+    elif tier == _FLAT:
+        if case_id not in _FLAT_HW_VERIFIED_MATMUL:
+            pytest.xfail(_flat_reason(case_id, M, K, N))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
