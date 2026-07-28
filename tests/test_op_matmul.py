@@ -143,6 +143,7 @@ def _known_answer(mode, M, K, N):
 _SP1 = "sp1_single_core"
 _SP2 = "sp2_multi_core"
 _SP3K = "sp3_clean_k"   # K>64 clean-K (K%64==0) within-core K-accumulation, C=1
+_SP4 = "sp4_n_tiling"   # N>64 clean-N (N%64==0) output-column N-tiling (ns>1), multi-core
 _LLM = "llm_real"
 
 _MATMUL_CASES = [
@@ -198,6 +199,19 @@ _MATMUL_CASES = [
     ("sp3k_16x256x64", 16,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=16
     ("sp3k_20x128x64", 20,  128, 64, 1, _SP3K, ("identity", "ones")),   # ks=2 spp=20
     ("sp3k_20x256x64", 20,  256, 64, 1, _SP3K, ("identity", "ones")),   # ks=4 spp=20
+    # --- SP4 N-tiling (N>64, K=64 clean-N), multi-core. Routes via
+    #     resolve_matmul_structure -> SEG_RELATIVE at the choose_cores-routed C
+    #     (effC-clamped). The ns-FOLD PE-peel (pe_outer_imm*trip>=27) is now BUILT
+    #     (d2ba51c) — unblocks the large-N caller class. K=64<=1024 so BOTH identity
+    #     and ones are DL16-exact. C is the ROUTED count (not fixed here); shapes below
+    #     exercise the peel band. xfail until the torch-path HW probe flips them green.
+    #     _SP4 tier. ---
+    ("sp4_128x64x2048", 128, 64, 2048, 8,  _SP4, ("identity", "ones")),  # routed C8  rows16 prod64 PEEL
+    ("sp4_256x64x1024", 256, 64, 1024, 8,  _SP4, ("identity", "ones")),  # routed C8  rows32 prod64 PEEL
+    ("sp4_256x64x2048", 256, 64, 2048, 16, _SP4, ("identity", "ones")),  # routed C16 rows16 prod64 PEEL
+    ("sp4_512x64x1024", 512, 64, 1024, 16, _SP4, ("identity", "ones")),  # routed C16 rows32 prod64 PEEL
+    ("sp4_128x64x512",  128, 64, 512,  16, _SP4, ("identity", "ones")),  # routed C16 rows8 prod8 loop (control)
+    ("sp4_256x64x512",  256, 64, 512,  32, _SP4, ("identity", "ones")),  # routed C32 rows8 prod8 loop (control)
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -244,6 +258,29 @@ _SP3K_HW_VERIFIED_MATMUL: set[str] = {
     "sp3k_12x128x64", "sp3k_12x256x64",
     "sp3k_16x128x64", "sp3k_16x256x64",
     "sp3k_20x128x64", "sp3k_20x256x64"}
+
+# SP4 N-tiling (N>64, K=64). The ns-FOLD PE-peel (pe_outer_imm*trip>=27) is BUILT +
+# CODEGEN-HW-VERIFIED 2026-07-27 (large_n_peel_hw_probe: 8 shapes x D1/D3 = 16/16
+# max_diff==0 at routed C, via emit_sp2_matmul + launch_kernel_from_bytes). BUT the
+# HW-VERIFIED 2026-07-27: codegen large_n_peel_hw_probe 16/16 max_diff==0 at routed C,
+# AND the SP5 frontend gate widened to dispatch N>64 to resolve_matmul_structure ->
+# SEG_RELATIVE (ttir_to_schedule _matmul_resolver _clean_n). Real torch eager +
+# torch.compile known-answer tests now.
+_SP4_HW_VERIFIED_MATMUL: set[str] = {
+    "sp4_128x64x2048", "sp4_256x64x1024", "sp4_256x64x2048",
+    "sp4_512x64x1024", "sp4_128x64x512", "sp4_256x64x512"}
+
+
+def _sp4_reason(case_id, M, K, N):
+    return (
+        f"{case_id} [{M}x{K}x{N}]: SP4 N-tiling (N>64) is BUILT — the ns-FOLD PE-peel "
+        "(pe_outer_imm*trip>=27) landed (codegen d2ba51c) and byte-matches the crossing "
+        "goldens. This id is in the table but NOT yet in _SP4_HW_VERIFIED_MATMUL — its "
+        "torch eager/compile known-answer has not been confirmed max_diff==0 on silicon. "
+        "Flip it in once the torch-path HW probe passes (D1 identity + D3 ones, K=64 so "
+        "both DL16-exact). Real LLM-scale N (ns>=64 at large K) still needs the "
+        "chunked-K x N-tiling composition (LX-capacity-bound)."
+    )
 
 
 def _sp5_reason(case_id, M, K, N):
@@ -298,6 +335,9 @@ def _xfail(case_id, M, K, N, C, tier):
     elif tier == _SP3K:
         if case_id not in _SP3K_HW_VERIFIED_MATMUL:
             pytest.xfail(_sp3k_reason(case_id, M, K, N))
+    elif tier == _SP4:
+        if case_id not in _SP4_HW_VERIFIED_MATMUL:
+            pytest.xfail(_sp4_reason(case_id, M, K, N))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
@@ -404,13 +444,17 @@ def test_matmul_verified_membership_locked():
 
 
 def test_multicore_cases_carry_the_164_blocker():
-    """Every C>1 case must be tagged sp2_multi_core (so it xfails on BOTH SP5 routing
-    AND #164), never mislabeled single-core (which would drop the HW-fault blocker)."""
+    """Every C>1 K=N=64 SP2 case must be tagged sp2_multi_core (so it xfails on BOTH
+    SP5 routing AND #164), never mislabeled single-core (which would drop the HW-fault
+    blocker). SP4 (N>64) is its own multi-core tier: it routes to the same seg-relative
+    multi-core path but is HW-verified past the #164 fault (large_n_peel_hw_probe), so
+    it carries the _SP4 blocker-reason, not _SP2 — exclude it here."""
     for case_id, M, K, N, C, tier, ka_modes in _MATMUL_CASES:
-        if C > 1:
+        if C > 1 and tier != _SP4:
             assert tier == _SP2, (
-                f"{case_id}: C={C}>1 but tier={tier!r}; multi-core must be {_SP2!r} so "
-                "its xfail names #164 (the 0x7b1b silicon fault), not just SP5 routing."
+                f"{case_id}: C={C}>1 but tier={tier!r}; K=N=64 multi-core must be "
+                f"{_SP2!r} so its xfail names #164 (the 0x7b1b silicon fault). "
+                f"(N>64 multi-core is the {_SP4!r} tier, allowed.)"
             )
 
 
