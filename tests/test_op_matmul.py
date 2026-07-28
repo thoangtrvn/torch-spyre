@@ -144,6 +144,7 @@ _SP1 = "sp1_single_core"
 _SP2 = "sp2_multi_core"
 _SP3K = "sp3_clean_k"   # K>64 clean-K (K%64==0) within-core K-accumulation, C=1
 _SP4 = "sp4_n_tiling"   # N>64 clean-N (N%64==0) output-column N-tiling (ns>1), multi-core
+_SP4K = "sp4k_ktiling_ntiling"  # K>64 AND N>64 (ks>1 ∧ ns>1) composition, multi-core (R1)
 _LLM = "llm_real"
 
 _MATMUL_CASES = [
@@ -212,6 +213,19 @@ _MATMUL_CASES = [
     ("sp4_512x64x1024", 512, 64, 1024, 16, _SP4, ("identity", "ones")),  # routed C16 rows32 prod64 PEEL
     ("sp4_128x64x512",  128, 64, 512,  16, _SP4, ("identity", "ones")),  # routed C16 rows8 prod8 loop (control)
     ("sp4_256x64x512",  256, 64, 512,  32, _SP4, ("identity", "ones")),  # routed C32 rows8 prod8 loop (control)
+    # --- SP4K: K>64 AND N>64 composition (ks>1 ∧ ns>1), multi-core (R1). Routes via
+    #     resolve_matmul_structure -> SEG_RELATIVE at the choose_cores-routed C. The
+    #     multi-core K-tiling x N-tiling was CODEGEN-HW-verified 2026-07-27
+    #     (r1_multicore_ktiling_ntiling_hw_probe: 64x256x256 @C4/@C6, D1+D3 = 4/4
+    #     max_diff==0 via emit + launch_kernel_from_bytes). K,N=256<=1024 so identity
+    #     and ones are DL16-exact (ones -> out=K=256). Fit bound ks*ns<=127 (Llama
+    #     K=4096 unreachable single-kernel -> R2/R5). NOTE the routed C: at default
+    #     SENCORES=32, 64x256x256 routes C16->rows4 (KLOOP, unbuilt) -> stays xfail
+    #     until the rows=4 KLOOP rung (#13) OR a per-case SENCORES pin lands; the
+    #     HW-verified path is C4 (SENCORES<=12). _SP4K tier. ---
+    ("sp4k_64x256x256",  64, 256, 256, 4,  _SP4K, ("identity", "ones")),  # ks4 ns4, HW-verified @C4
+    ("sp4k_64x512x512",  64, 512, 512, 4,  _SP4K, ("identity", "ones")),  # ks8 ns8 (ns==ks)
+    ("sp4k_128x256x256", 128, 256, 256, 8,  _SP4K, ("identity", "ones")),  # ks4 ns4 rows16
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -270,6 +284,16 @@ _SP4_HW_VERIFIED_MATMUL: set[str] = {
     "sp4_128x64x2048", "sp4_256x64x1024", "sp4_256x64x2048",
     "sp4_512x64x1024", "sp4_128x64x512", "sp4_256x64x512"}
 
+# SP4K K-tiling x N-tiling composition (ks>1 ∧ ns>1), multi-core (R1). CODEGEN-HW-
+# verified 2026-07-27 (r1_multicore_ktiling_ntiling_hw_probe: 64x256x256 @C4/@C6,
+# max_diff==0 via emit + launch_kernel_from_bytes) AND full-binary RAW byte-match. The
+# torch eager/compile path routes ks>1∧ns>1 (resolve_matmul_structure now PROBES the
+# emitter, no more "unwitnessed triple" raise). EMPTY until a torch-path HW run confirms
+# max_diff==0 at the choose_cores-routed C: at default SENCORES=32 these route to
+# C16->rows4 (KLOOP band, still unbuilt, #13) or unverified C16/C32 -> the torch-path
+# known-answer isn't green yet. Flip an id in once its torch-path HW probe passes.
+_SP4K_HW_VERIFIED_MATMUL: set[str] = set()
+
 
 def _sp4_reason(case_id, M, K, N):
     return (
@@ -280,6 +304,20 @@ def _sp4_reason(case_id, M, K, N):
         "Flip it in once the torch-path HW probe passes (D1 identity + D3 ones, K=64 so "
         "both DL16-exact). Real LLM-scale N (ns>=64 at large K) still needs the "
         "chunked-K x N-tiling composition (LX-capacity-bound)."
+    )
+
+
+def _sp4k_reason(case_id, M, K, N):
+    return (
+        f"{case_id} [{M}x{K}x{N}]: SP4K K-tiling x N-tiling (ks>1 AND ns>1) composition "
+        "is BUILT and CODEGEN-HW-verified (r1_multicore_ktiling_ntiling_hw_probe: "
+        "64x256x256 @C4/@C6 max_diff==0) + full-binary RAW byte-match. The torch path "
+        "routes it (resolve_matmul_structure PROBES emit_sp2_matmul), but this id is NOT "
+        "yet in _SP4K_HW_VERIFIED_MATMUL — at default SENCORES=32 it routes to a C whose "
+        "torch-path known-answer is not confirmed max_diff==0 on silicon (64x256x256 -> "
+        "C16->rows4 KLOOP, unbuilt #13; the HW-verified path is C4 at SENCORES<=12). Flip "
+        "it in once a torch-path HW probe passes at the routed C (D1 identity + D3 ones, "
+        "K,N<=1024 both DL16-exact). Llama-scale ks*ns>127 needs R2/R5."
     )
 
 
@@ -338,6 +376,9 @@ def _xfail(case_id, M, K, N, C, tier):
     elif tier == _SP4:
         if case_id not in _SP4_HW_VERIFIED_MATMUL:
             pytest.xfail(_sp4_reason(case_id, M, K, N))
+    elif tier == _SP4K:
+        if case_id not in _SP4K_HW_VERIFIED_MATMUL:
+            pytest.xfail(_sp4k_reason(case_id, M, K, N))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
@@ -450,11 +491,12 @@ def test_multicore_cases_carry_the_164_blocker():
     multi-core path but is HW-verified past the #164 fault (large_n_peel_hw_probe), so
     it carries the _SP4 blocker-reason, not _SP2 — exclude it here."""
     for case_id, M, K, N, C, tier, ka_modes in _MATMUL_CASES:
-        if C > 1 and tier != _SP4:
+        if C > 1 and tier not in (_SP4, _SP4K):
             assert tier == _SP2, (
                 f"{case_id}: C={C}>1 but tier={tier!r}; K=N=64 multi-core must be "
                 f"{_SP2!r} so its xfail names #164 (the 0x7b1b silicon fault). "
-                f"(N>64 multi-core is the {_SP4!r} tier, allowed.)"
+                f"(N>64 multi-core is {_SP4!r}; K>64∧N>64 multi-core is {_SP4K!r} — "
+                f"both HW-verified past #164, allowed.)"
             )
 
 
