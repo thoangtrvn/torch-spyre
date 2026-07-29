@@ -268,8 +268,25 @@ class LoopSpec:
     body: list[Any]
 
 
+# Global cache for constant tensors to avoid redundant tensor creation
+# Key: (const_val, device, dtype)
+_constant_tensor_cache: dict[tuple[float, str, torch.dtype], torch.Tensor] = {}
+
+
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    return torch.tensor(const_val, dtype=dtype).to(device)
+    cache_key = (float(const_val), str(device), dtype)
+
+    # Check cache first
+    if cache_key in _constant_tensor_cache:
+        return _constant_tensor_cache[cache_key]
+    import torch_spyre
+
+    t = torch.empty((), dtype=dtype, device=device)
+    torch_spyre._C.fill_tensor(t, float(const_val))
+
+    # Cache for future use
+    _constant_tensor_cache[cache_key] = t
+    return t
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:
