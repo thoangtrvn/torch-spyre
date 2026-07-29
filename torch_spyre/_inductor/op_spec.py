@@ -21,6 +21,7 @@ from typing import Any, Literal, Sequence
 from sympy import Symbol, Expr, Function
 from torch_spyre._C import DataFormats, ElementArrangement
 import torch
+from torch_spyre import _C
 
 
 class IndirectAccess(Function):
@@ -268,24 +269,47 @@ class LoopSpec:
     body: list[Any]
 
 
-# Global cache for constant tensors to avoid redundant tensor creation
-# Key: (const_val, device, dtype)
-_constant_tensor_cache: dict[tuple[float, str, torch.dtype], torch.Tensor] = {}
-
-
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    cache_key = (float(const_val), str(device), dtype)
+    """Create or retrieve a cached constant tensor on the device.
+
+    Args:
+        const_val: The scalar constant value
+        device: Target device (e.g., "spyre", torch.device("spyre"))
+        dtype: Tensor dtype (default: torch.float16)
+
+    Returns:
+        A 0-d tensor on the device containing the constant value.
+        THIS TENSOR MUST NOT BE MUTATED.
+
+    Note:
+
+        float(const_val) makes NaN values always miss the cache because
+        float('nan') != float('nan'). This is intentional - it falls back to
+        creating a fresh tensor for each NaN request rather than attempting
+        cache matching.
+    """
+    from torch._inductor.virtualized import V
+
+    # Get or create per-graph cache (lives for the lifetime of the compilation)
+    cache = V.graph.__dict__.setdefault("_spyre_constant_tensors", {})
+
+    # Use robust device key (handle both string and torch.device)
+    device_key = (
+        (device.type, device.index) if hasattr(device, "type") else (str(device), None)
+    )
+
+    cache_key = (float(const_val), device_key, dtype)
 
     # Check cache first
-    if cache_key in _constant_tensor_cache:
-        return _constant_tensor_cache[cache_key]
-    import torch_spyre
+    if cache_key in cache:
+        return cache[cache_key]
 
+    # Create new tensor with device-side fill
     t = torch.empty((), dtype=dtype, device=device)
-    torch_spyre._C.fill_tensor(t, float(const_val))
+    _C.fill_tensor(t, float(const_val))
 
-    # Cache for future use
-    _constant_tensor_cache[cache_key] = t
+    # Cache for future use within this graph
+    cache[cache_key] = t
     return t
 
 
