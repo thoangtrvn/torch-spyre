@@ -683,16 +683,25 @@ def test_matmul_verified_membership_locked():
 def test_multicore_cases_carry_the_164_blocker():
     """Every C>1 K=N=64 SP2 case must be tagged sp2_multi_core (so it xfails on BOTH
     SP5 routing AND #164), never mislabeled single-core (which would drop the HW-fault
-    blocker). SP4 (N>64) is its own multi-core tier: it routes to the same seg-relative
-    multi-core path but is HW-verified past the #164 fault (large_n_peel_hw_probe), so
-    it carries the _SP4 blocker-reason, not _SP2 — exclude it here."""
+    blocker).
+
+    KEYED ON THE STRUCTURAL CONDITION (K == 64 and N == 64), not on a tier allow-list.
+    It previously read `tier not in (_SP4, _SP4K)`, which is the same drift class as the
+    ~15 other `if operation in (...)` lists in this stack: every new multi-core tier has
+    to remember to add itself, and the failure mode is a spurious assertion against a
+    band the rule was never about. #164 is a K=N=64 SP2 fault, and that is exactly what
+    the docstring always said — so the shape IS the signal.
+
+    Verified behaviour-preserving when it was rewritten: across all 38 pre-existing cases
+    no _SP4/_SP4K case is K==64,N==64 (so the old allow-list was fully redundant), and no
+    C>1 K==64,N==64 case has a non-_SP2 tier (so nothing stops being checked). The only
+    case the structural form newly exempts is the streaming c=2 vehicle at K=4096,N=2752,
+    which is not a K=N=64 shape."""
     for case_id, M, K, N, C, tier, ka_modes in _MATMUL_CASES:
-        if C > 1 and tier not in (_SP4, _SP4K):
+        if C > 1 and K == 64 and N == 64:
             assert tier == _SP2, (
-                f"{case_id}: C={C}>1 but tier={tier!r}; K=N=64 multi-core must be "
-                f"{_SP2!r} so its xfail names #164 (the 0x7b1b silicon fault). "
-                f"(N>64 multi-core is {_SP4!r}; K>64∧N>64 multi-core is {_SP4K!r} — "
-                f"both HW-verified past #164, allowed.)"
+                f"{case_id}: C={C}>1 at K=N=64 but tier={tier!r}; it must be "
+                f"{_SP2!r} so its xfail names #164 (the 0x7b1b silicon fault)."
             )
 
 
