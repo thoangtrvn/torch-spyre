@@ -288,6 +288,13 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
         creating a fresh tensor for each NaN request rather than attempting
         cache matching.
     """
+    # Normalize device to string
+    device_type = device.type if hasattr(device, "type") else str(device)
+
+    # For non-Spyre devices (e.g., CPU), use standard torch.tensor path
+    if device_type != "spyre":
+        return torch.tensor(const_val, dtype=dtype).to(device)
+
     from torch._inductor.virtualized import V
 
     # Get or create per-graph cache (lives for the lifetime of the compilation)
@@ -304,7 +311,7 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
     if cache_key in cache:
         return cache[cache_key]
 
-    # Create new tensor with device-side fill
+    # Create new tensor with device-side fill (Spyre only)
     t = torch.empty((), dtype=dtype, device=device)
     _C.fill_tensor(t, float(const_val))
 
