@@ -269,6 +269,7 @@ _SP3K = "sp3_clean_k"   # K>64 clean-K (K%64==0) within-core K-accumulation, C=1
 _SP4 = "sp4_n_tiling"   # N>64 clean-N (N%64==0) output-column N-tiling (ns>1), multi-core
 _SP4K = "sp4k_ktiling_ntiling"  # K>64 AND N>64 (ks>1 ∧ ns>1) composition, multi-core (R1)
 _FLAT = "flat_single_pass"  # 127 < ks*ns <= ~192 single-pass large-N, C=1 (no ns time-loop)
+_STREAM = "streaming_c2"  # ks*ns >> 127 STREAMING N-slab loop, chunked-K through LX (c=2)
 _LLM = "llm_real"
 
 _MATMUL_CASES = [
@@ -371,6 +372,15 @@ _MATMUL_CASES = [
     ("flat_8x256x2048",   8, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows8  ks4 ns32 RAW-matched
     ("flat_16x256x2048", 16, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows16 ks4 ns32 RAW-matched
     ("flat_32x256x2048", 32, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows32 uncollapsed ladder
+    # --- STREAMING N-loop, c=2. The rung past FLAT: ks*ns = 64*43 = 2752 >> 127, so the
+    #     N extent CANNOT be resident and is swept as ns=43 slabs in one CB, with K
+    #     accumulated in n_chunk=32 chunks of c=2 K-tiles THROUGH LX. This is the
+    #     real-LLM large-N path. xfail until the board returns max_diff==0.
+    #     "ones" is NOT listed: it is DL16-exact only for K <= 1024 and K=4096 here.
+    #     kdense_lane/ktile/row are appended mechanically by _kdense_modes (N=2752 <= K,
+    #     and P3 `row` is exact at 1+(M-1)+128*7 = 1024), which matters because P3 is
+    #     THE detector for the `M - rows` activation law this band's L3LU must carry. ---
+    ("stream_c2_128x4096x2752", 128, 4096, 2752, 2, _STREAM, ("identity",)),
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -455,6 +465,10 @@ _SP4K_HW_VERIFIED_MATMUL: set[str] = set()
 # stays OUT — it is still router-refused (flat_rows_ge32_hwkat_pending; uncollapsed
 # LXLU ladder), so its equivalence is unproven on silicon.
 _FLAT_HW_VERIFIED_MATMUL: set[str] = {"flat_8x256x2048", "flat_16x256x2048"}
+# STREAMING c=2: nothing verified. The emitter reaches c=2 (codegen 9677895) but still
+# emits c=8-era forms for the ladder, the psum re-feed and the LXSU drain, so no build
+# has been offered to silicon yet. See _stream_reason.
+_STREAM_HW_VERIFIED_MATMUL: set[str] = set()
 
 
 def _sp4_reason(case_id, M, K, N):
@@ -480,6 +494,35 @@ def _sp4k_reason(case_id, M, K, N):
         "C16->rows4 KLOOP, unbuilt #13; the HW-verified path is C4 at SENCORES<=12). Flip "
         "it in once a torch-path HW probe passes at the routed C (D1 identity + D3 ones, "
         "K,N<=1024 both DL16-exact). Llama-scale ks*ns>127 needs R2/R5."
+    )
+
+
+def _stream_reason(case_id, M, K, N):
+    rows, ks, ns, c = M // 2, K // 64, N // 64, 2
+    return (
+        f"{case_id} [{M}x{K}x{N} @C2]: STREAMING N-loop matmul, c={c} "
+        f"(rows={rows} ks={ks} ns={ns} n_chunk={ks // c}) is UNDER REBUILD and NOT "
+        "offered to silicon yet. ks*ns = "
+        f"{ks * ns} >> 127, so N cannot be resident: the kernel sweeps ns N-slabs in one "
+        "CB while accumulating K in n_chunk chunks of c K-tiles THROUGH LX (the psum is "
+        "snapshotted to LX by LXSU and re-read on the direct LX->PE port between "
+        "chunks). c=2 is the LARGEST EXPRESSIBLE chunk at these rows: the LXLU "
+        "immediate ladder needs (c-1)*rows + 3 <= 127, and c=4/c=8 need pointer hops "
+        "that are NOT derived (matmul-streaming-nloop.md §5.4). "
+        "The per-unit laws are decoded 3/3 from the shipped c=2 goldens and "
+        "independently reviewed (§5.10), and codegen's test_matmul_streaming_c2.py holds "
+        "the acceptance suite; at the time of writing 62 of its assertions are RED "
+        "against the current emitter, which is the rebuild's to-do list. "
+        "OFFLINE EVIDENCE CANNOT CLOSE THIS BAND: the failure mode is cadence, not "
+        "arithmetic -- a producer that feeds at the wrong rate HANGS the array rather "
+        "than returning wrong numbers, and the emulator stubs every compute unit and "
+        "models no DMA/multicast, so BusFence/RbTimeOut is invisible offline. "
+        "Before running: clear ~/.sentient_cache AND restart Python (the Triton "
+        "in-memory cache survives torch._dynamo.reset()). Flip this id into "
+        "_STREAM_HW_VERIFIED_MATMUL once the board returns max_diff==0 on identity AND "
+        "all three kdense modes with no BusFence/RbTimeOut -- kdense_row is the one that "
+        "can see an `M - rows` activation-addressing regression, so a pass without it "
+        "proves less than it appears to (§5.9)."
     )
 
 
@@ -569,6 +612,9 @@ def _xfail(case_id, M, K, N, C, tier):
     elif tier == _FLAT:
         if case_id not in _FLAT_HW_VERIFIED_MATMUL:
             pytest.xfail(_flat_reason(case_id, M, K, N))
+    elif tier == _STREAM:
+        if case_id not in _STREAM_HW_VERIFIED_MATMUL:
+            pytest.xfail(_stream_reason(case_id, M, K, N))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
