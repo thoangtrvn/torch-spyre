@@ -100,6 +100,99 @@ def _small_pos_2d(M, K):
     return ((torch.arange(n, dtype=torch.int64) % 8 + 1).to(torch.float16).reshape(M, K))
 
 
+_ELEMS_PER_STICK = 64          # 128-byte stick / 16-bit DL16 element
+_DL16_MAX_EXACT_INT = 1024     # 10 significand bits => ints exact to 2^10; 1025 is not
+
+
+def _kat_kdense(mode, M, K, N):
+    """DL16-exact known-answer with a DENSE activation (nonzero at every k).
+
+    WHY: the "identity" operand has a large BLIND SUBSPACE. Because a[m,k] = 0 for
+    every k > 0, ANY permutation of activation elements confined to k > 0 leaves
+    every output BIT-IDENTICAL -- all K-1 non-zero-column k-columns are mutually
+    interchangeable with zero observable effect. It can DETECT that something is
+    wrong but cannot DISCRIMINATE between candidate activation-addressing fixes.
+    Here a is dense, so a mis-addressed activation changes a value.
+
+    WHY IT IS STILL EXACT AT LARGE K: b is ONE-HOT per column (b[j,j] = 1), so the
+    product multiset for each output is one exact value plus K-1 exact zeros, hence
+    every PARTIAL sum is either 0 or that value and no accumulation step rounds --
+    in any order. This matters because on AIU 1.0 the PT FP accumulator IS DL16
+    (no wider accumulator; 1p5 gets FP24), so a K-reduction rounds to 10 significand
+    bits at EVERY step. That is also why "ones" needs K <= 1024 and this does not.
+
+    The values are positional codes, so a residual names the element actually read:
+      kdense_ktile (P1)  a[m,k] = 1 + (m % 16) + 16 * (k // 64)   k-tile in the HIGH
+                         digit, so a one-tile error shows |delta| >= 16. Degenerate
+                         at ks == 1 (single k-tile), hence gated to K > 64.
+      kdense_lane  (P2)  a[m,k] = 1 + (m % 16) + 16 * (k % 64)    resolves the element
+                         WITHIN a stick; max is 1024 for any shape.
+    Both attain exactly 1024, i.e. ZERO margin -- hence the asserts below.
+
+    Canonical implementation and the full proof:
+    spyre-knowledgebase codegen/scripts/matmul_kat_operands.py (kept in step with
+    this by test_kdense_matches_the_canonical_kat_module).
+    """
+    # A one-hot selector needs a distinct k per output column.
+    assert N <= K, (
+        f"kdense requires N <= K (one-hot selector needs a distinct k per column); "
+        f"got K={K}, N={N}. Large-N bands (N>K) cannot use this operand."
+    )
+    m = torch.arange(M, dtype=torch.int64).unsqueeze(1)
+    k = torch.arange(K, dtype=torch.int64).unsqueeze(0)
+    if mode == "kdense_ktile":
+        assert K > _ELEMS_PER_STICK, (
+            f"kdense_ktile is degenerate at ks == 1 (K={K}): k//64 is always 0, so "
+            f"the pattern carries no k information. Use kdense_lane."
+        )
+        values = 1 + (m % 16) + 16 * (k // _ELEMS_PER_STICK)
+    elif mode == "kdense_lane":
+        values = 1 + (m % 16) + 16 * (k % _ELEMS_PER_STICK)
+    else:
+        raise ValueError(f"unknown kdense mode: {mode!r}")
+
+    # ZERO-MARGIN GUARDS. Refuse rather than emit a spurious diff: a value above
+    # 1024 is not DL16-exact, so the resulting max_diff would look like a codegen
+    # bug rather than an out-of-envelope operand.
+    vmax = int(values.max().item())
+    assert vmax <= _DL16_MAX_EXACT_INT, (
+        f"{mode} at M={M}, K={K} reaches {vmax} > {_DL16_MAX_EXACT_INT}: not "
+        f"DL16-exact (1025 is the first inexact integer), so every partial sum is "
+        f"no longer provably exact."
+    )
+    assert int(values.min().item()) >= 1, "activation must be nonzero at every (m,k)"
+
+    a = values.to(torch.float16)
+    assert torch.equal(a, torch.round(a)), "activation must stay integer-valued"
+    b = torch.zeros(K, N, dtype=torch.float16)
+    cols = torch.arange(N, dtype=torch.int64)
+    b[cols, cols] = 1.0
+    # One-hot-per-column is THE precondition of the exactness argument, so check the
+    # built tensor rather than trusting the indexing.
+    assert torch.equal(b.sum(dim=0), torch.ones(N, dtype=torch.float16)), \
+        "selector b must be one-hot per column"
+    # Analytic reference: a pure gather of a, no arithmetic -> zero reference error.
+    expected = a[:, :N].clone()
+    return a, b, expected
+
+
+def _kdense_modes(M, K, N):
+    """Which kdense modes are valid for this shape.
+
+    DERIVED rather than listed per case in _MATMUL_CASES, because unlike "identity"
+    (exact for M <= 1024) and "ones" (exact for K <= 1024) the eligibility here is
+    mechanical -- N <= K for the one-hot selector, K > 64 for a non-degenerate
+    k-tile digit -- so deriving it keeps new cases covered automatically instead of
+    relying on someone remembering to add the mode.
+    """
+    if N > K:
+        return ()
+    modes = ["kdense_lane"]
+    if K > _ELEMS_PER_STICK:
+        modes.append("kdense_ktile")
+    return tuple(modes)
+
+
 def _known_answer(mode, M, K, N):
     """Return (a, b, expected) for a DL16-exact matmul known-answer.
 
@@ -114,7 +207,14 @@ def _known_answer(mode, M, K, N):
                              value i+1 <= M), and it is the SAME D1 the HW probe uses.
     mode == "ones"     (D3): a = ones[M,K], b = ones[K,N]; expected[m,n] = K.
                              Exact only while K <= 1024 (DL16 integer ceiling).
+    mode == "kdense_ktile" / "kdense_lane" (P1/P2): a is DENSE -- nonzero at EVERY
+                             (m,k) -- so activation MIS-ADDRESSING is observable,
+                             which "identity" structurally cannot see (see
+                             _kat_kdense). b stays one-hot, which is what keeps it
+                             DL16-exact at large K.
     """
+    if mode.startswith("kdense_"):
+        return _kat_kdense(mode, M, K, N)
     if mode == "identity":
         # ramp in column 0 only (generalizes the old K==N eye() form to any K,N).
         a = torch.zeros(M, K, dtype=torch.float16)
@@ -456,7 +556,13 @@ def _xfail(case_id, M, K, N, C, tier):
 def _check_known_answers(case_id, entry, M, K, N, ka_modes, run):
     """Run each DL16-exact known-answer for this shape via `run(a, b)` and assert
     max_diff == 0. Executed ONLY once the case is HW-verified (past the _xfail gate) —
-    documents the intended assertion until then."""
+    documents the intended assertion until then.
+
+    The kdense modes are appended mechanically (see _kdense_modes): they are the only
+    known-answers whose activation is dense in k, so they are the only ones that can
+    observe an activation-addressing regression. On an already-passing shape they must
+    give max_diff == 0 — that is the no-false-positive check for the instrument."""
+    ka_modes = tuple(ka_modes) + _kdense_modes(M, K, N)
     for mode in ka_modes:
         a, b, expected = _known_answer(mode, M, K, N)
         out_dev = run(a.to("spyre"), b.to("spyre")).cpu()
@@ -599,3 +705,90 @@ def test_matmul_routed_cores_contract():
     for M, expected_c in _ROUTED_CORES.items():
         assert choose_cores(M, 64, 64, 32) == expected_c, (
             f"M={M}: choose_cores routed C={choose_cores(M,64,64,32)}, expected {expected_c}")
+
+
+# --- kdense known-answer: offline properties (no device needed) ----------------------
+
+@pytest.mark.parametrize("mode", ("kdense_lane", "kdense_ktile"))
+@pytest.mark.parametrize("M,K,N", [(128, 4096, 2752), (64, 256, 256), (8, 128, 64)])
+def test_kdense_operand_is_dense_and_dl16_exact(mode, M, K, N):
+    """The two properties the operand exists for: DENSE in k, and DL16-exact.
+
+    Exactness is checked the only way that proves it -- the analytic gather must equal
+    a float64 matmul, so the reference is validated independently of the algebra.
+    """
+    a, b, expected = _known_answer(mode, M, K, N)
+    assert a.shape == (M, K) and b.shape == (K, N) and expected.shape == (M, N)
+    # DENSE: every (m,k) nonzero. This is exactly what "identity" lacks.
+    assert int((a == 0).sum()) == 0, f"{mode}: activation must be nonzero at every (m,k)"
+    # DL16-exact: integer-valued and inside the 10-significand-bit ceiling.
+    assert torch.equal(a, torch.round(a))
+    assert int(a.max().item()) <= _DL16_MAX_EXACT_INT
+    # b one-hot per column -> every partial sum is 0 or a single exact value.
+    assert torch.equal(b.sum(dim=0), torch.ones(N, dtype=torch.float16))
+    # The reference is a gather; prove it equals a real matmul computed exactly.
+    ref = (a.to(torch.float64) @ b.to(torch.float64)).to(torch.float16)
+    assert torch.equal(ref, expected), f"{mode}: analytic gather != float64 matmul"
+
+
+def test_kdense_sees_what_identity_is_blind_to():
+    """The reason this mode exists, as an executable claim.
+
+    Under "identity" a[m,k] = 0 for every k > 0, so exchanging two k-tiles with
+    k >= 1 is the IDENTITY MAP ON THE DATA and the output is bit-identical -- the
+    blind subspace. Under kdense_ktile the same exchange moves the k-tile digit, so
+    the residual is exactly the digit weight, 16.
+    """
+    M, K, N = 128, 4096, 2752
+    es = _ELEMS_PER_STICK
+
+    def swap_k_tiles(t, t1, t2):
+        s, lo1, lo2 = t.clone(), t1 * es, t2 * es
+        s[:, lo1:lo1 + es] = t[:, lo2:lo2 + es]
+        s[:, lo2:lo2 + es] = t[:, lo1:lo1 + es]
+        return s
+
+    a_id, _, exp_id = _known_answer("identity", M, K, N)
+    a_kd, _, exp_kd = _known_answer("kdense_ktile", M, K, N)
+    # Both source blocks are identically zero under identity, so the swap is a no-op.
+    assert int((a_id[:, es:3 * es] != 0).sum()) == 0
+    blind = (swap_k_tiles(a_id, 1, 2)[:, :N].float() - exp_id.float()).abs().max().item()
+    seen = (swap_k_tiles(a_kd, 1, 2)[:, :N].float() - exp_kd.float()).abs().max().item()
+    assert blind == 0.0, "identity must be BLIND to a k>0 k-tile permutation"
+    assert seen == 16.0, f"kdense_ktile must see it as exactly the digit weight 16, got {seen}"
+    # A swap TOUCHING k-tile 0 is NOT in the blind subspace -- so "both tiles >= 1"
+    # above is load-bearing, not incidental.
+    touches_zero = (swap_k_tiles(a_id, 0, 1)[:, :N].float()
+                    - exp_id.float()).abs().max().item()
+    assert touches_zero > 0.0
+
+
+def test_kdense_matches_the_canonical_kat_module():
+    """Keep this in step with the canonical builder instead of letting them drift.
+
+    The canonical implementation and the full DL16 proof live in spyre-knowledgebase
+    (codegen/scripts/matmul_kat_operands.py). It is a script, not an installed package,
+    so import it by path and skip when the sibling checkout is absent.
+    """
+    import importlib.util
+    from pathlib import Path
+    here = Path(__file__).resolve()
+    # Two layouts in use: the dev checkout (.../spyre-knowledgebase/codegen/...) and the
+    # box, which rsyncs codegen/ straight into AIU/ (.../AIU/codegen/...).
+    rel = ("codegen", "scripts", "matmul_kat_operands.py")
+    cand = [p.joinpath("spyre-knowledgebase", *rel) for p in here.parents]
+    cand += [p.joinpath(*rel) for p in here.parents]
+    src = next((c for c in cand if c.is_file()), None)
+    if src is None:
+        pytest.skip("matmul_kat_operands.py not found in any known checkout layout")
+    spec = importlib.util.spec_from_file_location("matmul_kat_operands", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    M, K, N = 128, 4096, 2752
+    for mine, theirs in (("kdense_ktile", "k_tile"), ("kdense_lane", "lane")):
+        a1, b1, e1 = _known_answer(mine, M, K, N)
+        a2, b2, e2 = mod.kat_operands(M, K, N, theirs)
+        assert torch.equal(a1, a2), f"{mine}: activation diverged from canonical {theirs}"
+        assert torch.equal(b1, b2), f"{mine}: selector diverged from canonical {theirs}"
+        assert torch.equal(e1, e2), f"{mine}: reference diverged from canonical {theirs}"
