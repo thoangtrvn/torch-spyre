@@ -127,7 +127,22 @@ def _kat_kdense(mode, M, K, N):
                          at ks == 1 (single k-tile), hence gated to K > 64.
       kdense_lane  (P2)  a[m,k] = 1 + (m % 16) + 16 * (k % 64)    resolves the element
                          WITHIN a stick; max is 1024 for any shape.
-    Both attain exactly 1024, i.e. ZERO margin -- hence the asserts below.
+      kdense_row   (P3)  a[m,k] = 1 + m + 128 * (k_t % 8)         resolves m EXACTLY,
+                         so it sees ROW/CORE displacement that P1/P2 cannot.
+    P1/P2 attain exactly 1024 (ZERO margin); P3's max depends on M and ks -- hence the
+    asserts below rather than a fixed envelope.
+
+    WHICH PATTERN SEES WHAT -- they are NOT interchangeable, and picking the wrong one
+    silently proves nothing (verified offline on the R1/SP4K band, C=4 ks=4 rows=16):
+                                      D1    P1    P2    P3
+      contiguous-read (no ADDEARIMM)  64    48     0   336
+      k-tiles 1<->3 exchanged          0    32     0   256
+    P2 is BLIND to both because it is k-tile-invariant by construction. P1's row digit
+    is (m % 16), which ALIASES with rows=16, so P1 sees these only via its k_t digit.
+    P3 resolves m exactly and is the most sensitive to the `M - rows` inter-tile skip,
+    which is a ROW-dimension law. Rule of thumb: THE PATTERN MUST RESOLVE THE DIMENSION
+    THE DEFECT PERTURBS -- k-tile errors need P1, row/core errors need P3, intra-stick
+    errors need P2.
 
     Canonical implementation and the full proof:
     spyre-knowledgebase codegen/scripts/matmul_kat_operands.py (kept in step with
@@ -148,6 +163,9 @@ def _kat_kdense(mode, M, K, N):
         values = 1 + (m % 16) + 16 * (k // _ELEMS_PER_STICK)
     elif mode == "kdense_lane":
         values = 1 + (m % 16) + 16 * (k % _ELEMS_PER_STICK)
+    elif mode == "kdense_row":
+        # m resolved EXACTLY (not m % 16), so row/core displacement is visible.
+        values = 1 + m + 128 * ((k // _ELEMS_PER_STICK) % 8)
     else:
         raise ValueError(f"unknown kdense mode: {mode!r}")
 
@@ -190,6 +208,11 @@ def _kdense_modes(M, K, N):
     modes = ["kdense_lane"]
     if K > _ELEMS_PER_STICK:
         modes.append("kdense_ktile")
+        # P3 resolves m exactly, so its ceiling depends on BOTH M and ks and it does
+        # not fit every shape. Only offer it where it is provably DL16-exact.
+        ks = K // _ELEMS_PER_STICK
+        if 1 + (M - 1) + 128 * min(7, ks - 1) <= _DL16_MAX_EXACT_INT:
+            modes.append("kdense_row")
     return tuple(modes)
 
 
@@ -709,7 +732,7 @@ def test_matmul_routed_cores_contract():
 
 # --- kdense known-answer: offline properties (no device needed) ----------------------
 
-@pytest.mark.parametrize("mode", ("kdense_lane", "kdense_ktile"))
+@pytest.mark.parametrize("mode", ("kdense_lane", "kdense_ktile", "kdense_row"))
 @pytest.mark.parametrize("M,K,N", [(128, 4096, 2752), (64, 256, 256), (8, 128, 64)])
 def test_kdense_operand_is_dense_and_dl16_exact(mode, M, K, N):
     """The two properties the operand exists for: DENSE in k, and DL16-exact.
@@ -786,7 +809,8 @@ def test_kdense_matches_the_canonical_kat_module():
     spec.loader.exec_module(mod)
 
     M, K, N = 128, 4096, 2752
-    for mine, theirs in (("kdense_ktile", "k_tile"), ("kdense_lane", "lane")):
+    for mine, theirs in (("kdense_ktile", "k_tile"), ("kdense_lane", "lane"),
+                         ("kdense_row", "row")):
         a1, b1, e1 = _known_answer(mine, M, K, N)
         a2, b2, e2 = mod.kat_operands(M, K, N, theirs)
         assert torch.equal(a1, a2), f"{mine}: activation diverged from canonical {theirs}"
