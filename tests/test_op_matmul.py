@@ -202,15 +202,28 @@ def _kdense_modes(M, K, N):
     mechanical -- N <= K for the one-hot selector, K > 64 for a non-degenerate
     k-tile digit -- so deriving it keeps new cases covered automatically instead of
     relying on someone remembering to add the mode.
+
+    EACH mode carries its OWN DL16-exactness ceiling (the value must stay <= 1024, or
+    _kat_kdense's guard raises while BUILDING the operand -- a spurious test failure that
+    is not a codegen fault). kdense_ktile's value is `1 + (m%16) + 16*(k//64)`, so its
+    k-tile digit `k//64` runs 0..ks-1 and the max is `1 + 15 + 16*(ks-1)`, exact only for
+    ks <= 64 (ks=65 -> 1040). This was previously gated on `K > 64` ALONE, with no ks
+    ceiling, so a large-ks shape (e.g. stream_c2_128x8192x2752, ks=128) was offered a
+    non-exact kdense_ktile and failed at operand-build though its KERNEL is correct
+    (max_diff=0 on the codegen-path sweep). kdense_lane's `k%64` is bounded by 64 so it is
+    ks-INDEPENDENT and always exact. kdense_row's ceiling depends on M and ks (guarded
+    below).
     """
     if N > K:
         return ()
-    modes = ["kdense_lane"]
+    modes = ["kdense_lane"]  # ks-independent (k%64 bounded), always DL16-exact
     if K > _ELEMS_PER_STICK:
-        modes.append("kdense_ktile")
+        ks = K // _ELEMS_PER_STICK
+        # kdense_ktile digit is k//64 in 0..ks-1: max 1 + 15 + 16*(ks-1) <= 1024 iff ks <= 64.
+        if 1 + 15 + 16 * (ks - 1) <= _DL16_MAX_EXACT_INT:
+            modes.append("kdense_ktile")
         # P3 resolves m exactly, so its ceiling depends on BOTH M and ks and it does
         # not fit every shape. Only offer it where it is provably DL16-exact.
-        ks = K // _ELEMS_PER_STICK
         if 1 + (M - 1) + 128 * min(7, ks - 1) <= _DL16_MAX_EXACT_INT:
             modes.append("kdense_row")
     return tuple(modes)
@@ -372,15 +385,45 @@ _MATMUL_CASES = [
     ("flat_8x256x2048",   8, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows8  ks4 ns32 RAW-matched
     ("flat_16x256x2048", 16, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows16 ks4 ns32 RAW-matched
     ("flat_32x256x2048", 32, 256, 2048, 1, _FLAT, ("identity", "ones")),  # rows32 uncollapsed ladder
-    # --- STREAMING N-loop, c=2. The rung past FLAT: ks*ns = 64*43 = 2752 >> 127, so the
-    #     N extent CANNOT be resident and is swept as ns=43 slabs in one CB, with K
-    #     accumulated in n_chunk=32 chunks of c=2 K-tiles THROUGH LX. This is the
-    #     real-LLM large-N path. xfail until the board returns max_diff==0.
-    #     "ones" is NOT listed: it is DL16-exact only for K <= 1024 and K=4096 here.
-    #     kdense_lane/ktile/row are appended mechanically by _kdense_modes (N=2752 <= K,
-    #     and P3 `row` is exact at 1+(M-1)+128*7 = 1024), which matters because P3 is
-    #     THE detector for the `M - rows` activation law this band's L3LU must carry. ---
-    ("stream_c2_128x4096x2752", 128, 4096, 2752, 2, _STREAM, ("identity",)),
+    # --- STREAMING N-loop, c=2. The rung past FLAT: ks*ns >> 127, so the N extent
+    #     CANNOT be resident and is swept as ns slabs in one CB, with K accumulated in
+    #     n_chunk = ks/c chunks of c=2 K-tiles THROUGH LX (the psum is snapshotted to LX
+    #     by LXSU and re-read on the direct LX->PE port between chunks). This is the
+    #     real-LLM large-N path.
+    #
+    #     These are THE SEVEN FITTING c=2 WITNESSES, all CODEGEN-HW-VERIFIED max_diff==0
+    #     on silicon via scripts/streaming_c2_hw_sweep.py (codegen path: emit_sp2_matmul
+    #     + launch_kernel_from_bytes). The `C` column is the core split the FRONTEND
+    #     resolver now picks for the shape (choose_streaming_cores = fewest admitting
+    #     cores), which is IDENTICAL to the C each sweep case was verified at -- that
+    #     equality is what makes the codegen-path evidence transfer to the torch path,
+    #     and it is asserted in codegen/tests, not assumed here.
+    #     Envelope covered: rows = M//C in {32, 48}; ks in {32,48,64,128} (n_chunk
+    #     16/24/32/64); C in {1,2,4,32} (single-core .. all-32-core); M 32..1024.
+    #
+    #     "ones" is NOT listed on any of them: it is DL16-exact only for K <= 1024 and
+    #     every K here is >= 2048. kdense_lane/ktile/row are appended mechanically by
+    #     _kdense_modes -- W1/W3/S4/S5/S6/S8 get them (N=2752 <= K), W2 gets NONE
+    #     (N=2752 > K=2048, so the one-hot selector does not fit). kdense_row matters
+    #     most: it is THE detector for the `M - rows` activation law this band's L3LU
+    #     must carry (§5.9), so W2's pass proves strictly less than the others'.
+    #
+    #     DELIBERATELY ABSENT: 128x4096x2752 @C2 (rows=64), the old c=8 "vehicle". At
+    #     rows=64 the c=2 LX image is over capacity (16768 > 16384 sticks) so the band
+    #     REFUSES it, and its only buildable form is the pre-contract c=8 family that
+    #     HANGS on silicon (EXIT=124, D2H barrier never releases;
+    #     [[streaming-vehicle-hangs-on-silicon-r1]]). Its (M,K,N) is NOT unroutable
+    #     though -- the resolver lands it at C=4/rows=32 in the c=2 family, i.e. NOT the
+    #     hanging configuration -- but no golden or silicon run exists at (rows=32,
+    #     ks=64, ns=43, C=4), so it is not listed as a case yet.
+    #     xfail until the board returns max_diff==0 THROUGH THE TORCH PATH. ---
+    ("stream_c2_64x4096x2752",    64, 4096, 2752,  2, _STREAM, ("identity",)),  # W1 rows32 ks64
+    ("stream_c2_128x2048x2752",  128, 2048, 2752,  4, _STREAM, ("identity",)),  # W2 rows32 ks32 N>K
+    ("stream_c2_96x4096x2752",    96, 4096, 2752,  2, _STREAM, ("identity",)),  # W3 rows48 ks64
+    ("stream_c2_128x3072x2752",  128, 3072, 2752,  4, _STREAM, ("identity",)),  # S4 rows32 ks48
+    ("stream_c2_128x8192x2752",  128, 8192, 2752,  4, _STREAM, ("identity",)),  # S5 rows32 ks128
+    ("stream_c2_1024x4096x2752", 1024, 4096, 2752, 32, _STREAM, ("identity",)),  # S6 rows32 C32
+    ("stream_c2_32x4096x2752",    32, 4096, 2752,  1, _STREAM, ("identity",)),  # S8 rows32 C1
     # --- Real LLM projection (Granite/Llama-class hidden 4096). K>64 clean-K IS now
     #     built (SP3 clean-K), but K=4096 = ks=64 (>=8) fail-loud on the TILE_SIZE
     #     overflow (#311), AND N=4096 needs SP4 (unbuilt). ones overflows DL16
@@ -465,10 +508,37 @@ _SP4K_HW_VERIFIED_MATMUL: set[str] = set()
 # stays OUT — it is still router-refused (flat_rows_ge32_hwkat_pending; uncollapsed
 # LXLU ladder), so its equivalence is unproven on silicon.
 _FLAT_HW_VERIFIED_MATMUL: set[str] = {"flat_8x256x2048", "flat_16x256x2048"}
-# STREAMING c=2: nothing verified. The emitter reaches c=2 (codegen 9677895) but still
-# emits c=8-era forms for the ladder, the psum re-feed and the LXSU drain, so no build
-# has been offered to silicon yet. See _stream_reason.
-_STREAM_HW_VERIFIED_MATMUL: set[str] = set()
+# STREAMING c=2: EMPTY, and the reason is a DISTINCTION, not an omission. All seven c=2
+# cases are CODEGEN-path HW-verified (scripts/streaming_c2_hw_sweep.py, max_diff==0 on
+# silicon at exactly the C listed in _MATMUL_CASES), and the frontend resolver now routes
+# them (choose_streaming_cores + the streaming fallback in resolve_matmul_structure). But
+# the codegen path calls emit_sp2_matmul DIRECTLY, so it proves the BINARY, not the
+# ROUTE: it does not traverse torch.compile -> Inductor -> the autotuner -> the resolver,
+# where a wrong routed C, a tensor-order/stride mismatch or a stale cache would produce a
+# different (or no) binary. The standing acceptance for this tier is the TORCH path.
+# CACHE HYGIENE IS LOAD-BEARING before running these: clear ~/.sentient_cache AND RESTART
+# Python (the Triton in-memory cache survives torch._dynamo.reset(), and
+# TRITON_ALWAYS_COMPILE=1 only bypasses the on-disk cache).
+# Flip each id in ONLY after eager AND compiled return max_diff==0 with no BusFence/
+# RbTimeOut. See _stream_reason.
+# HW-VERIFIED THROUGH THE TORCH PATH 2026-08-01 on tmhoangt-spyre-dev-bob-quick (AIU 1.0
+# RCUDD1A): all seven c=2 witnesses, EAGER AND COMPILED, max_diff==0, no BusFence/RbTimeOut,
+# on freshly-built kernels (SPYRE_DUMP_BINARY_DIR fresh-dump asserted, all cache layers
+# cleared + fresh Python per case). This is the FIRST real-LLM-shaped streaming matmul
+# (chunked-K accumulation through LX, real Granite-FFN N=2752) running correct on silicon
+# through the production `a @ b` -> resolver -> streaming-emitter route, not just the
+# codegen-direct path. Operands: identity + the auto-derived kdense modes (kdense_row = the
+# `M - rows` L3LU activation-addressing detector, exercised on 6/7; S5 ks=128 uses
+# kdense_lane+row after the _kdense_modes ks<=64 fix for kdense_ktile).
+_STREAM_HW_VERIFIED_MATMUL: set[str] = {
+    "stream_c2_64x4096x2752",    # W1  rows=32 ks=64  C=2
+    "stream_c2_128x2048x2752",   # W2  rows=32 ks=32  C=4
+    "stream_c2_96x4096x2752",    # W3  rows=48 ks=64  C=2
+    "stream_c2_128x3072x2752",   # S4  rows=32 ks=48  C=4
+    "stream_c2_128x8192x2752",   # S5  rows=32 ks=128 C=4
+    "stream_c2_1024x4096x2752",  # S6  rows=32 ks=64  C=32 (full 32-core)
+    "stream_c2_32x4096x2752",    # S8  rows=32 ks=64  C=1
+}
 
 
 def _sp4_reason(case_id, M, K, N):
@@ -497,32 +567,40 @@ def _sp4k_reason(case_id, M, K, N):
     )
 
 
-def _stream_reason(case_id, M, K, N):
-    rows, ks, ns, c = M // 2, K // 64, N // 64, 2
+def _stream_reason(case_id, M, K, N, C):
+    rows, ks, ns, c = M // C, K // 64, N // 64, 2
     return (
-        f"{case_id} [{M}x{K}x{N} @C2]: STREAMING N-loop matmul, c={c} "
-        f"(rows={rows} ks={ks} ns={ns} n_chunk={ks // c}) is UNDER REBUILD and NOT "
-        "offered to silicon yet. ks*ns = "
-        f"{ks * ns} >> 127, so N cannot be resident: the kernel sweeps ns N-slabs in one "
-        "CB while accumulating K in n_chunk chunks of c K-tiles THROUGH LX (the psum is "
-        "snapshotted to LX by LXSU and re-read on the direct LX->PE port between "
-        "chunks). c=2 is the LARGEST EXPRESSIBLE chunk at these rows: the LXLU "
-        "immediate ladder needs (c-1)*rows + 3 <= 127, and c=4/c=8 need pointer hops "
-        "that are NOT derived (matmul-streaming-nloop.md §5.4). "
-        "The per-unit laws are decoded 3/3 from the shipped c=2 goldens and "
-        "independently reviewed (§5.10), and codegen's test_matmul_streaming_c2.py holds "
-        "the acceptance suite; at the time of writing 62 of its assertions are RED "
-        "against the current emitter, which is the rebuild's to-do list. "
-        "OFFLINE EVIDENCE CANNOT CLOSE THIS BAND: the failure mode is cadence, not "
+        f"{case_id} [{M}x{K}x{N} @C{C}]: STREAMING N-loop matmul, c={c} "
+        f"(rows={rows} ks={ks} ns={ns} n_chunk={ks // c}) is BUILT, ROUTED, and "
+        "CODEGEN-PATH HW-VERIFIED -- but its TORCH-path known-answer is not confirmed "
+        "yet, which is this tier's acceptance bar. "
+        f"ks*ns = {ks * ns} >> 127, so N cannot be resident: the kernel sweeps ns "
+        "N-slabs in one CB while accumulating K in n_chunk chunks of c K-tiles THROUGH "
+        "LX (the psum is snapshotted to LX by LXSU and re-read on the direct LX->PE "
+        "port between chunks). c=2 is the LARGEST EXPRESSIBLE chunk at these rows: the "
+        "LXLU immediate ladder needs (c-1)*rows + 3 <= 127, and c=4/c=8 need pointer "
+        "hops that are NOT derived (matmul-streaming-nloop.md §5.4) -- and the c=8 form "
+        "that does exist HANGS on silicon. "
+        "EVIDENCE SO FAR: scripts/streaming_c2_hw_sweep.py ran all seven fitting c=2 "
+        f"witnesses on the board and returned max_diff==0, this shape included at C={C} "
+        "-- the same C the resolver routes it to. That proves the BINARY. It does NOT "
+        "prove the ROUTE: the sweep calls emit_sp2_matmul directly and never traverses "
+        "torch.compile -> Inductor -> the autotuner -> resolve_matmul_structure, so a "
+        "wrong routed C, a tensor-order/stride mismatch, or a stale cache would still "
+        "be unseen. That gap is exactly the class that bit the FLAT band on 8x256x2048 "
+        "(a shape whose binary was raw-matched but which died in the autotuner). "
+        "OFFLINE EVIDENCE CANNOT SUBSTITUTE HERE: the failure mode is cadence, not "
         "arithmetic -- a producer that feeds at the wrong rate HANGS the array rather "
         "than returning wrong numbers, and the emulator stubs every compute unit and "
         "models no DMA/multicast, so BusFence/RbTimeOut is invisible offline. "
         "Before running: clear ~/.sentient_cache AND restart Python (the Triton "
         "in-memory cache survives torch._dynamo.reset()). Flip this id into "
-        "_STREAM_HW_VERIFIED_MATMUL once the board returns max_diff==0 on identity AND "
-        "all three kdense modes with no BusFence/RbTimeOut -- kdense_row is the one that "
-        "can see an `M - rows` activation-addressing regression, so a pass without it "
-        "proves less than it appears to (§5.9)."
+        "_STREAM_HW_VERIFIED_MATMUL once the board returns max_diff==0 EAGER AND "
+        "COMPILED on identity AND every kdense mode _kdense_modes offers for this shape, "
+        "with no BusFence/RbTimeOut -- kdense_row is the one that can see an `M - rows` "
+        "activation-addressing regression, so a pass without it proves less than it "
+        "appears to (§5.9). NOTE: at N > K this shape gets NO kdense mode at all "
+        "(the one-hot selector needs N <= K), so its pass is the weakest of the seven."
     )
 
 
@@ -614,7 +692,7 @@ def _xfail(case_id, M, K, N, C, tier):
             pytest.xfail(_flat_reason(case_id, M, K, N))
     elif tier == _STREAM:
         if case_id not in _STREAM_HW_VERIFIED_MATMUL:
-            pytest.xfail(_stream_reason(case_id, M, K, N))
+            pytest.xfail(_stream_reason(case_id, M, K, N, C))
     elif tier == _LLM:
         if case_id not in _HW_VERIFIED_MATMUL:
             pytest.xfail(_llm_reason(case_id, M, K, N))
