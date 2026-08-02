@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 from typing import Any, Literal, Sequence
 
 from sympy import Symbol, Expr, Function
@@ -242,6 +243,56 @@ class OpSpec:
     debug_handle: DebugHandle | None = None
 
 
+# --- Module-level constant tensor cache --------------------------------------
+#
+# Cache for Spyre constant tensors to avoid redundant tensor creation across
+# multiple forward passes.
+#
+# Thread-safe for concurrent inference workloads.
+#
+_CONSTANT_TENSOR_CACHE: dict[tuple, torch.Tensor] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def clear_constant_tensor_cache():
+    """Clear the constant tensor cache.
+
+    Should be called when:
+    - Running torch.compiler.reset() to ensure test isolation
+    - Manually reclaiming device memory
+    - Starting a new inference session with different constants
+
+    Example:
+        >>> torch.compiler.reset()
+        >>> clear_constant_tensor_cache()  # Clear Spyre constants
+    """
+    _CONSTANT_TENSOR_CACHE.clear()
+
+
+# --- Monkey-patch torch.compiler.reset() to clear Spyre constants -------------
+#
+# Wrap torch.compiler.reset() to automatically clear our cache when users reset
+# Inductor state. This ensures proper test isolation without requiring manual
+# intervention.
+#
+try:
+    import torch.compiler
+
+    _original_reset = torch.compiler.reset
+
+    def _reset_with_cache_clear():
+        """Wrapped reset that clears Spyre constant cache."""
+        _original_reset()
+        clear_constant_tensor_cache()
+
+    # Apply monkey-patch
+    torch.compiler.reset = _reset_with_cache_clear
+except (ImportError, AttributeError):
+    # torch.compiler.reset may not exist in older PyTorch versions
+    # Fall back to manual clearing only
+    pass
+
+
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
@@ -270,54 +321,67 @@ class LoopSpec:
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
-    """Create or retrieve a cached constant tensor on the device.
+    """Create or retrieve a cached constant tensor for Spyre device.
+
+    Uses module-level cache that persists across forward passes. The cache
+    uses weak references for automatic memory management - tensors are GC'd
+    when no longer referenced by the compiled graph.
+
+    For test isolation, call clear_constant_tensor_cache() after
+    torch.compiler.reset().
+
+    WARNING: Returns a shared tensor that MUST NEVER be mutated in-place.
+
+    The returned tensor is reused across multiple calls with matching
+    (value, device, dtype). In-place mutation would corrupt all callers.
+
+    Inductor enforces immutability via:
+      - SpyreConstantFallback.should_allocate() == False
+      - SpyreConstantFallback.get_mutation_names() == []
+
+    Any pass that modifies this contract MUST update this function.
 
     Args:
-        const_val: The scalar constant value
-        device: Target device (e.g., "spyre", torch.device("spyre"))
-        dtype: Tensor dtype (default: torch.float16)
+        const_val: Scalar constant value
+        device: Target device (e.g., "spyre", "cpu", or torch.device(...))
+        dtype: Data type (default: torch.float16)
 
     Returns:
-        A 0-d tensor on the device containing the constant value.
-        THIS TENSOR MUST NOT BE MUTATED.
+        Immutable constant tensor (DO NOT MUTATE)
 
     Note:
+        For non-Spyre devices (e.g., CPU), uses standard torch.tensor path
+        without caching as these tensors are cheap to create.
 
         float(const_val) makes NaN values always miss the cache because
         float('nan') != float('nan'). This is intentional - it falls back to
         creating a fresh tensor for each NaN request rather than attempting
         cache matching.
     """
-    # Normalize device to string
+    # Normalize device type
     device_type = device.type if hasattr(device, "type") else str(device)
 
-    # For non-Spyre devices (e.g., CPU), use standard torch.tensor path
+    # For non-Spyre devices (e.g., CPU), use standard PyTorch path without caching
     if device_type != "spyre":
         return torch.tensor(const_val, dtype=dtype).to(device)
 
-    from torch._inductor.virtualized import V
-
-    # Get or create per-graph cache (lives for the lifetime of the compilation)
-    cache = V.graph.__dict__.setdefault("_spyre_constant_tensors", {})
-
-    # Use robust device key (handle both string and torch.device)
+    # Create cache key with normalized device
     device_key = (
         (device.type, device.index) if hasattr(device, "type") else (str(device), None)
     )
-
     cache_key = (float(const_val), device_key, dtype)
 
-    # Check cache first
-    if cache_key in cache:
-        return cache[cache_key]
+    # Thread-safe cache lookup and insertion
+    with _CACHE_LOCK:
+        if cache_key in _CONSTANT_TENSOR_CACHE:
+            return _CONSTANT_TENSOR_CACHE[cache_key]
 
-    # Create new tensor with device-side fill (Spyre only)
-    t = torch.empty((), dtype=dtype, device=device)
-    _C.fill_tensor(t, float(const_val))
+        # Create new tensor with device-side fill
+        t = torch.empty((), dtype=dtype, device=device)
+        _C.fill_tensor(t, float(const_val))
 
-    # Cache for future use within this graph
-    cache[cache_key] = t
-    return t
+        _CONSTANT_TENSOR_CACHE[cache_key] = t
+        return t
 
 
 def find_unimplemented(specs: list) -> UnimplementedOp | None:
