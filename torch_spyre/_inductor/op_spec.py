@@ -272,30 +272,6 @@ def clear_constant_tensor_cache():
     _CONSTANT_TENSOR_CACHE.clear()
 
 
-# --- Monkey-patch torch.compiler.reset() to clear Spyre constants -------------
-#
-# Wrap torch.compiler.reset() to automatically clear our cache when users reset
-# Inductor state. This ensures proper test isolation without requiring manual
-# intervention.
-#
-try:
-    import torch.compiler
-
-    _original_reset = torch.compiler.reset
-
-    def _reset_with_cache_clear():
-        """Wrapped reset that clears Spyre constant cache."""
-        _original_reset()
-        clear_constant_tensor_cache()
-
-    # Apply monkey-patch
-    torch.compiler.reset = _reset_with_cache_clear
-except (ImportError, AttributeError):
-    # torch.compiler.reset may not exist in older PyTorch versions
-    # Fall back to manual clearing only
-    pass
-
-
 @dataclasses.dataclass
 class UnimplementedOp:
     op: str
