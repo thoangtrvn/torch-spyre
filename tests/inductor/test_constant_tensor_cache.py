@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for spyre_constant_tensor module-level caching.
+"""Tests for spyre_constant_tensor module-level LRU caching.
 
 Tests verify:
 1. Cache hit: Same (value, device, dtype) returns same tensor object
 2. Cache miss: Different values/devices/dtypes create new tensors
-3. Cache clearing: torch.compiler.reset() clears the cache via monkey-patch
-4. CPU device: Not cached (uses standard torch.tensor path)
-5. Thread safety: Concurrent access works correctly
+3. LRU eviction: Oldest entries evicted when cache exceeds max size
+4. Cache clearing: Manual clear_constant_tensor_cache() for test isolation
+5. CPU device: Not cached (uses standard torch.tensor path)
+6. Thread safety: Concurrent access works correctly
 """
 
 import threading
@@ -38,12 +39,14 @@ class TestConstantTensorCache(unittest.TestCase):
     """Test module-level caching for spyre_constant_tensor."""
 
     def setUp(self):
-        """Reset compiler state before each test."""
+        """Clear cache and reset state before each test."""
+        clear_constant_tensor_cache()
         torch.compiler.reset()
         torch.manual_seed(0xBEEF)
 
     def tearDown(self):
-        """Clean up after each test."""
+        """Clean up cache and reset state after each test."""
+        clear_constant_tensor_cache()
         torch.compiler.reset()
 
     def test_cache_hit_returns_same_object(self):
@@ -117,36 +120,22 @@ class TestConstantTensorCache(unittest.TestCase):
                     msg=f"DMA fill for {val} incorrect: got {t.item()}, expected {val}",
                 )
 
-    def test_cache_cleared_on_reset(self):
-        """torch.compiler.reset() clears the cache via monkey-patch."""
-        # Create and cache a tensor
-        _ = spyre_constant_tensor(1.0, torch.device("spyre"), torch.float16)
-        self.assertEqual(len(_CONSTANT_TENSOR_CACHE), 1)
-
-        # Reset should clear cache
-        torch.compiler.reset()
-        self.assertEqual(
-            len(_CONSTANT_TENSOR_CACHE), 0, "Cache should be empty after reset"
-        )
-
     def test_manual_cache_clear(self):
         """Manual clear_constant_tensor_cache() works."""
-        # Create cached tensors and HOLD references (weak refs need strong refs)
+        # Create cached tensors and HOLD references
         t1 = spyre_constant_tensor(1.0, torch.device("spyre"), torch.float16)
         t2 = spyre_constant_tensor(2.0, torch.device("spyre"), torch.float16)
 
         # Use values to ensure they're not optimized away
         _ = t1.item() + t2.item()
 
-        # Cache should have entries (tensors still referenced)
-        self.assertGreater(
-            len(_CONSTANT_TENSOR_CACHE), 0, "Cache should have entries with active refs"
-        )
+        # Cache should have entries
+        self.assertGreater(len(_CONSTANT_TENSOR_CACHE), 0, "Cache should have entries")
 
         # Manual clear
         clear_constant_tensor_cache()
         self.assertEqual(
-            len(_CONSTANT_TENSOR_CACHE), 0, "Manual clear should empty cache"
+            len(_CONSTANT_TENSOR_CACHE), 0, "Cache should be empty after manual clear"
         )
 
     def test_thread_safety(self):
