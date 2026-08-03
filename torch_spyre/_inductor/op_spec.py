@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import dataclasses
 import threading
 from typing import Any, Literal, Sequence
@@ -245,12 +246,14 @@ class OpSpec:
 
 # --- Module-level constant tensor cache --------------------------------------
 #
-# Cache for Spyre constant tensors to avoid redundant tensor creation across
-# multiple forward passes.
+# LRU cache for Spyre constant tensors to avoid redundant tensor creation across
+# multiple forward passes. Uses OrderedDict for least-recently-used eviction
+# with a maximum size limit to bound memory usage.
 #
 # Thread-safe for concurrent inference workloads.
 #
-_CONSTANT_TENSOR_CACHE: dict[tuple, torch.Tensor] = {}
+_CACHE_MAX_SIZE = 1000  # Maximum number of cached constants (~128KB)
+_CONSTANT_TENSOR_CACHE: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 _CACHE_LOCK = threading.Lock()
 
 
@@ -323,9 +326,9 @@ class LoopSpec:
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
     """Create or retrieve a cached constant tensor for Spyre device.
 
-    Uses module-level cache that persists across forward passes. The cache
-    uses weak references for automatic memory management - tensors are GC'd
-    when no longer referenced by the compiled graph.
+    Uses module-level LRU cache that persists across forward passes with a
+    maximum size limit (default: 1000 entries, ~128KB). Least-recently-used
+    entries are automatically evicted when the cache exceeds the limit.
 
     For test isolation, call clear_constant_tensor_cache() after
     torch.compiler.reset().
@@ -358,29 +361,35 @@ def spyre_constant_tensor(const_val, device, dtype=torch.float16):
         creating a fresh tensor for each NaN request rather than attempting
         cache matching.
     """
-    # Normalize device type
-    device_type = device.type if hasattr(device, "type") else str(device)
+    # Normalize device to torch.device object if string is passed
+    if isinstance(device, str):
+        device = torch.device(device)
 
     # For non-Spyre devices (e.g., CPU), use standard PyTorch path without caching
-    if device_type != "spyre":
+    if device.type != "spyre":
         return torch.tensor(const_val, dtype=dtype).to(device)
 
-    # Create cache key with normalized device
-    device_key = (
-        (device.type, device.index) if hasattr(device, "type") else (str(device), None)
-    )
+    # Create cache key with normalized device (device.type, device.index)
+    device_key = (device.type, device.index)
     cache_key = (float(const_val), device_key, dtype)
 
-    # Thread-safe cache lookup and insertion
+    # Thread-safe cache lookup and insertion with LRU eviction
     with _CACHE_LOCK:
         if cache_key in _CONSTANT_TENSOR_CACHE:
+            # Cache hit: move to end (most recently used)
+            _CONSTANT_TENSOR_CACHE.move_to_end(cache_key)
             return _CONSTANT_TENSOR_CACHE[cache_key]
 
-        # Create new tensor with device-side fill
+        # Cache miss: create new tensor with device-side fill
         t = torch.empty((), dtype=dtype, device=device)
         _C.fill_tensor(t, float(const_val))
 
         _CONSTANT_TENSOR_CACHE[cache_key] = t
+
+        # Evict least-recently-used entries if over limit
+        while len(_CONSTANT_TENSOR_CACHE) > _CACHE_MAX_SIZE:
+            _CONSTANT_TENSOR_CACHE.popitem(last=False)  # Remove oldest (LRU)
+
         return t
 
 
