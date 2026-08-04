@@ -69,24 +69,33 @@ __all__ = ["softmax", "SoftmaxHostError"]
 #: bfloat16 (that is 1p5/BF16).  Extend per generation, not per convenience.
 _DTYPE_BITS = {torch.float16: 16}
 
-#: Rows per core in the witnessed envelope: the plan's `M == 32*C` law means every core
-#: owns exactly 32 rows.  Used to DERIVE the core count from M rather than hardcoding
-#: 32 — the shape pin in codegen refuses anything this does not resolve correctly.
-_ROWS_PER_CORE = 32
-
-
 class SoftmaxHostError(RuntimeError):
     """Raised when sentient_codegen is unreachable, so no binary can be built."""
 
 
 def _resolve_num_cores(m: int) -> int:
-    """Core count from the envelope law ``M == 32*C`` (so ``C = M/32``).
+    """Core count for ``softmax`` over ``[m, N]`` — DELEGATED to codegen, deliberately.
 
-    Clamped to >= 1 only so a tiny M produces a clean envelope refusal downstream
-    rather than a confusing division-by-zero inside the plan.  This is NOT a widening:
-    the witnessed-shape pin in ``softmax_dispatch`` still has the final say.
+    This used to compute ``m // 32`` here and call the result "cores", citing the
+    envelope law ``M == 32*C``. That solved the law for the WRONG VARIABLE: all four
+    tracked goldens are ``_32cores`` and the quantity that varies between them is
+    rows_per_core, so C is the constant (32) and rows is derived. The two readings are
+    observationally identical at the witnessed shape (rows == 32 AND C == 32), which is
+    why the error survived a byte-match, a silicon HW-KAT and review.
+
+    It now delegates to ``resolve_softmax_cores``, which lives in codegen and is TESTED.
+    That relocation is the point: this module is not importable off-box, so arithmetic
+    kept here is arithmetic no test can reach — which is how the wrong law got in.
+    Do not re-inline it.
     """
-    return max(1, m // _ROWS_PER_CORE)
+    try:
+        from sentient_codegen.encoder.softmax_dispatch import resolve_softmax_cores
+    except ImportError as e:
+        raise SoftmaxHostError(
+            "sentient_codegen not importable — source env.sh so codegen is on "
+            "PYTHONPATH (required to resolve the softmax core count)."
+        ) from e
+    return resolve_softmax_cores(m)
 
 
 def _build_launch_plan(m: int, n: int, num_cores: int, dtype_bits: int):

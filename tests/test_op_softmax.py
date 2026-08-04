@@ -102,49 +102,54 @@ _OK, _REFUSE = "ok", "refuse"
 
 # (case_id, M, N, routed_C, expect, reason_substr)
 #
-# THE `routed_C` COLUMN IS DERIVED, NOT DECLARED — and getting that wrong is what made
-# the first version of this table describe mechanisms that never fire. The routed op
-# computes `C = M/32` from the envelope law `M == 32*C`; it is NOT a user knob. So a
-# case cannot pick its own C, and the guard that fires is whichever one that derived C
-# reaches. Consequences, measured rather than assumed:
-#   * `r = M/C` is therefore ALWAYS 32, so the CONFOUNDED-second-operand guard
-#     (`e*128 == 2*r*ns_row*128` identically) and the `u=4 must divide r` guard are
-#     both STRUCTURALLY UNREACHABLE from the torch path. They are real guards, reachable
-#     only from the codegen API where C is passed explicitly — and they are tested there
-#     (`codegen/tests/test_softmax_dispatch.py`). Naming a torch case after them
-#     asserted a mechanism that could not fire.
-#   * M=2048 derives C=64, which trips the C>32 core ceiling FIRST.
-# `reason_substr` pins WHICH guard fires, so a rename can never again silently claim the
-# wrong mechanism: the assertion checks the message, not just that something raised.
+# `routed_C` IS 32 FOR EVERY SHAPE THAT HAS ONE, and that is the corrected law: all four
+# tracked dim=-1 goldens are `_32cores`, and the quantity that varies between them is
+# rows_per_core (1024->32, 2048->64, 736->23, 1x2048->1). C is the CONSTANT; rows is
+# derived as M/C. The first version of this table had it inverted (C = M/32), which is
+# observationally identical at M=1024 (rows == 32 AND C == 32) and therefore survived a
+# byte-match, a silicon HW-KAT and review — the 32x32 small-constant aliasing.
+#
+# Correcting it COLLAPSED the structural envelope to a single point: the confound
+# constraint is `rows*ns_row == 32`, so at ns_row=1 and C=32 only M=1024 is admissible.
+# Consequence worth stating, because it is the safety win: there is no longer ANY
+# "structurally buildable but unwitnessed" case. Every refusal below is a REAL structural
+# limit, so the witnessed-shape pin is now defence in depth rather than the sole barrier.
+#
+# Every reason below was verified against the real dispatch at the corrected C — not
+# predicted. `reason_substr` pins WHICH guard fires so a rename cannot silently re-point
+# a case at a different mechanism (the defect the box run caught).
 _SOFTMAX_CASES = [
     # THE witnessed shape: byte-match golden + silicon, eager and compiled.
     ("witnessed_1024x64_c32", 1024, 64, 32, _OK, None),
 
-    # M=2048 -> C=64 > 32 physical cores. Found on hardware: this used to be named
-    # "confounded" and expected NotImplementedError; it actually refuses on the core
-    # ceiling, and did so with a raw ValueError until the dispatch was fixed to give
-    # every refusal one type.
-    ("refuse_2048x64_exceeds_32_cores", 2048, 64, 64, _REFUSE, "exceeds the 32 cores"),
+    # rows=64 -> 2*64*1*128 = 16384 != e*128 = 8192. The second-operand byte distance is
+    # CONFOUNDED in the only admitted golden; emitting either candidate would ship a
+    # curve fit. Un-confounding it needs the rows=64 golden DECODED (its own rung).
+    ("refuse_2048x64_confounded", 2048, 64, 32, _REFUSE, "confounded"),
+
+    # rows=16 -> 4096 != 8192. Same guard as 2048, different side of it: this is why
+    # M-widening is blocked on the confound and not on a core-count bug.
+    ("refuse_512x64_confounded", 512, 64, 32, _REFUSE, "confounded"),
+
+    # rows=23: u=4 does not divide 23 (the mvloopcnt trip is rows/u) and no remainder-row
+    # tail is built. A REAL capability limit -- and note a golden for this shape EXISTS,
+    # so it becomes byte-match-gatable the moment the tail is built.
+    ("refuse_736x64_no_row_tail", 736, 64, 32, _REFUSE, "must divide"),
+
+    # rows=2 -> row_unroll u=2, a value no golden witnesses. Refused rather than
+    # extrapolated: u is derived from rows, and 2 is outside the witnessed set.
+    ("refuse_64x64_unwitnessed_unroll", 64, 64, 32, _REFUSE, "unwitnessed"),
 
     # N != 64: the cross-lane reduce is ONE STICK PER ROW; N=2048 is 32 sticks/row.
     # THIS IS THE DECODE SHAPE -- refusing it is exactly why softmax is not yet servable
-    # for attention, so it stays in the table as a documented refusal.
+    # for attention, and no amount of M-widening changes that (N is the binding axis).
     ("refuse_1x2048_decode", 1, 2048, 1, _REFUSE, "one stick per row"),
-
-    # --- structurally BUILDABLE but UNWITNESSED — the dangerous class ---------------
-    # Every SoftmaxPlan constraint passes and the dispatch WOULD build a binary; there is
-    # no golden and no silicon run. If any of these returns a tensor, the witnessed-shape
-    # pin has been removed and unverified binaries are shipping.
-    # (736 belongs HERE, not with the structural refusals: C=23 gives r=32, so the
-    # row-tail guard it was originally named for never fires.)
-    ("refuse_736x64_unwitnessed", 736, 64, 23, _REFUSE, "structurally buildable"),
-    ("refuse_512x64_unwitnessed", 512, 64, 16, _REFUSE, "structurally buildable"),
-    ("refuse_64x64_unwitnessed", 64, 64, 2, _REFUSE, "structurally buildable"),
 ]
 
-#: The routed core-count derivation, mirrored from torch_spyre/ops/softmax.py. Asserted
-#: against every row below so the table's `routed_C` cannot drift from what runs.
-_ROWS_PER_CORE = 32
+#: The corrected law: C is CONSTANT at 32 (clamped for M<32), rows is derived. Mirrored
+#: from sentient_codegen.encoder.softmax_dispatch.resolve_softmax_cores, which is where
+#: the derivation now lives BECAUSE the wrong version was unreachable by any test here.
+_SOFTMAX_CORES = 32
 
 #: Ids HW-verified on silicon through the TORCH path (eager AND torch.compile).
 #: Populated 2026-08-04: 3.28 ULP_DL16, 0 outliers, 3630 subnormal outputs clean,
@@ -315,18 +320,22 @@ def test_codegen_witnessed_set_agrees_with_this_contract():
 def test_table_routed_C_matches_the_ops_derivation():
     """The `routed_C` column must be what the op actually derives, not a wish.
 
-    This guard exists because the first version of this table DECLARED C=32 for every
-    row, as documentation. That was wrong for four of six rows — M=2048 runs at C=64,
-    M=736 at C=23 — and the wrong C is precisely what made two cases claim guards that
-    cannot fire (`r = M/C` is always 32, so the confounded-operand and `u|r` guards are
-    unreachable from the torch path). A column that silently disagrees with the code is
-    worse than no column: it reads as verified fact.
+    This column has now been wrong TWICE, in opposite directions, which is why it is
+    asserted rather than documented. First it declared C=32 everywhere while the code
+    derived C=M/32 (so 2048 really ran at C=64). Then the code itself was found to have
+    solved `M == 32*C` for the wrong variable — C is the CONSTANT (32, per all four
+    `_32cores` goldens) and rows is derived. A column that silently disagrees with the
+    code is worse than no column: it reads as verified fact.
+
+    Cross-checked against the single source of truth, `resolve_softmax_cores` in codegen,
+    by `test_codegen_and_contract_agree_on_the_core_law` below.
     """
     for case_id, M, N, C, _expect, _reason in _SOFTMAX_CASES:
-        derived = max(1, M // _ROWS_PER_CORE)
+        derived = min(_SOFTMAX_CORES, M)
         assert C == derived, (
-            f"{case_id}: table says routed C={C} but the op derives C={derived} from "
-            f"M={M} (C = M/{_ROWS_PER_CORE}). Fix the table, not the op.")
+            f"{case_id}: table says routed C={C} but the corrected law derives "
+            f"C={derived} from M={M} (C = min(32, M) — C is CONSTANT, rows is what "
+            f"varies). Fix the table, not the law.")
 
 
 def test_refusal_reasons_are_discriminating():
@@ -339,11 +348,38 @@ def test_refusal_reasons_are_discriminating():
     match a DIFFERENT class's message.
     """
     specific = {r for _, _, _, _, e, r in _SOFTMAX_CASES if e == _REFUSE and r}
-    assert "exceeds the 32 cores" in specific and "one stick per row" in specific
-    # The class marker must not appear inside a structural reason, or an unwitnessed case
-    # would pass while a core-ceiling or N-shape guard was the one actually firing.
-    for structural in ("exceeds the 32 cores", "one stick per row"):
-        assert "structurally buildable" not in structural
+    # At the corrected law every refusal is a REAL structural limit — the
+    # "structurally buildable but unwitnessed" class is now EMPTY, so no case may claim it.
+    assert "structurally buildable" not in specific, (
+        "a case claims the unwitnessed-but-buildable reason, but at C=32 that class is "
+        "empty (the confound pins rows==32 => M==1024). Re-verify which guard fires.")
+    assert {"confounded", "must divide", "unwitnessed", "one stick per row"} <= specific
+    # No reason may be a substring of another, or a case could pass on the wrong guard.
+    for a in specific:
+        for b in specific:
+            if a != b:
+                assert a not in b, f"reason {a!r} is a substring of {b!r} — not discriminating"
+
+
+def test_codegen_and_contract_agree_on_the_core_law():
+    """The core law has ONE home (codegen); this asserts the mirror here matches it.
+
+    `_SOFTMAX_CORES` and the table's routed_C column are a copy. The original defect was
+    a law living where no test could reach it, so the cure is not just moving it but
+    checking the copy against it.
+    """
+    try:
+        from sentient_codegen.encoder.softmax_dispatch import (
+            SOFTMAX_CORES,
+            resolve_softmax_cores,
+        )
+    except ImportError:
+        pytest.skip("sentient_codegen not importable (source env.sh)")
+    assert _SOFTMAX_CORES == SOFTMAX_CORES
+    for case_id, M, _N, C, _e, _r in _SOFTMAX_CASES:
+        assert C == resolve_softmax_cores(M), (
+            f"{case_id}: table C={C} disagrees with codegen's "
+            f"resolve_softmax_cores({M})={resolve_softmax_cores(M)}")
 
 
 def test_softmax_is_not_claimed_beyond_one_shape():
