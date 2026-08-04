@@ -580,6 +580,46 @@ def spyre_embedding(
     return torch.ops.spyre.embedding(weight, indices)
 
 
+@register_spyre_decomposition([torch.ops.aten._softmax.default])
+def spyre_softmax(
+    self: torch.Tensor,
+    dim: int,
+    half_to_float: bool = False,
+) -> torch.Tensor:
+    """Keep ``aten._softmax`` OPAQUE under torch.compile — route it to the custom
+    ``spyre::softmax`` op instead of letting Inductor lower it to a Triton kernel.
+
+    WHY THE GENERIC LOWERING CANNOT WORK HERE, and it is not about fusion: the device
+    softmax binary addresses THREE HBM segments (scratch=0, x=1, out=2), but the Triton
+    launcher binds ``xlat[i] = tensor_args[i]`` positionally from the kernel's own
+    arguments and has no workspace concept, so a two-arg softmax kernel trips the #86
+    guard (``declared_segment_count 3 > 2 launched``) — correctly, because the third
+    segment would store to unmapped memory. The custom op allocates its own scratch and
+    launches all three tensors. The general workspace facility is #113.
+
+    Note this is where Inductor would otherwise DECOMPOSE softmax into
+    amax/sub/exp/sum/div and fuse them; ``ttir_analyzer._match_softmax`` exists to
+    pattern-match that back, but recovering the op only to be unable to bind its
+    scratch does not help. Staying opaque is the shorter path.
+
+    CONSEQUENCE: softmax becomes a fusion barrier (correct for bring-up; a flash-style
+    attention kernel needs an ONLINE single-pass softmax, which is #114 — a separate
+    op, not a relaxation of this one).
+
+    Intentionally NOT in ``_TRITON_INCOMPATIBLE_DECOMPOSITIONS``: like embedding, this
+    must SURVIVE on the triton path so the opaque op replaces the generic lowering.
+    Ops in that set do the opposite (they fall back to standard aten).
+
+    ENVELOPE: only M=1024 N=64 C=32 DL16 is routed; the op raises for anything else and
+    the error PROPAGATES (no CPU fallback, #70).
+    """
+    if half_to_float:
+        raise NotImplementedError(
+            "spyre softmax: half_to_float=True (fp32 output from a half input) is "
+            "unsupported — the device kernel produces DL16.")
+    return torch.ops.spyre.softmax(self, dim)
+
+
 @register_spyre_decomposition([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,

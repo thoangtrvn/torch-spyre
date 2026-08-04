@@ -18,6 +18,7 @@ from torch._inductor.fx_passes.reinplace import inplaceable_ops, InplaceableOp
 from torch_spyre.ops.fallbacks import warn_fallback
 from torch_spyre.ops.eager import compile_once
 from torch_spyre.ops import embedding  # noqa: F401
+from torch_spyre.ops import softmax  # noqa: F401  # registers spyre::softmax (#112)
 
 from .errors import Unsupported
 

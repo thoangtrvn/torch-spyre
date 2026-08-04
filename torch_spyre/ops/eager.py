@@ -99,7 +99,11 @@ register_torch_compile_kernel(
         aten.relu,
         aten.rsqrt,
         aten.sigmoid,
-        aten._softmax,
+        # aten._softmax is REGISTERED ELSEWHERE (#112): torch_spyre/ops/softmax.py
+        # binds it to the spyre::softmax custom op, which allocates its own scratch
+        # segment and launches [scratch, x, out]. Leaving it here too would register a
+        # SECOND kernel for the same (aten::_softmax, spyre) key. Do not re-add it
+        # without removing that binding first.
         aten.stack,
         aten.sum,
         aten.sqrt,
