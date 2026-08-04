@@ -671,6 +671,23 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
               "buf.device_addr=", buf.device_addr,
               "is_host_only=", buf.is_host_only);
 
+    // Splittability guard: allreduce reduce-scatters the buffer across
+    // ranks, so each rank needs at least one 128-byte stick. A tensor
+    // smaller than world_size sticks makes LIBCOLL's split geometry round
+    // the per-rank base size to 0 and abort (envelope.cpp:
+    // DT_CHECK(base_size > 0)) -- an uncatchable abort on the async worker
+    // thread, and a silent no-op that would corrupt in release (NDEBUG)
+    // builds. Reject it here on the caller thread as a catchable error
+    // instead. 128 = one fp16 stick (64 fp16 elems).
+    const int world_sz = static_cast<int>(group_context_->getSize());
+    constexpr size_t kStickBytes = 128;
+    TORCH_CHECK(
+        buf.byte_count >= static_cast<size_t>(world_sz) * kStickBytes,
+        "[", getBackendName(), "]: allreduce tensor too small to split across ",
+        world_sz, " ranks: have ", buf.byte_count, " bytes, need >= ",
+        static_cast<size_t>(world_sz) * kStickBytes,
+        " (>= 1 stick of 128 bytes per rank).");
+
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
     // Collective op: every rank in the group issues this, so seq_ stays in
     // sync across ranks.

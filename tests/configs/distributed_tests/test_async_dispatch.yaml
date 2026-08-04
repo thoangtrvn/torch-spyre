@@ -1,0 +1,30 @@
+# Configuration file for torch-spyre distributed tests
+# These tests require multi-process execution via torchrun
+#
+# Usage:
+#   cd torch-spyre/tests
+#   ./run_test.sh configs/test_distributed_config.yaml
+#
+# The run_test.sh script automatically detects tests in the distributed/
+# directory and launches them with: torchrun --nproc-per-node $AIU_WORLD_SIZE
+
+test_suite_config:
+  files:
+    # Async c10d progress-thread dispatch tests
+    - path: ${TORCH_DEVICE_ROOT}/tests/distributed/test_async_dispatch.py
+      unlisted_test_mode: mandatory_success
+      tests:
+        - names:
+            - TestAsyncDispatch::test_allreduce_async_returns_before_completion
+            - TestAsyncDispatch::test_back_to_back_collectives_preserve_order
+            - TestAsyncDispatch::test_destroy_work_handle_variants
+            - TestAsyncDispatch::test_reduce_excluded_op_stays_synchronous
+            - TestAsyncDispatch::test_zz_world_and_tp_subgroup_coexist_and_teardown
+          mode: mandatory_success
+
+  global:
+    # Global configuration for distributed tests
+    # These tests use the spyreccl backend for distributed operations
+    supported_dtypes:
+      - name: float16
+      - name: float32

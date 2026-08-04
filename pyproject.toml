@@ -95,6 +95,30 @@ filterwarnings = [
     "ignore::DeprecationWarning:torch.jit._script",
 ]
 norecursedirs = ['tests/models']
+# spyre-testing-plugin (from the sibling spyre-inference checkout) is installed
+# in the same shared venv and pytest auto-loads it regardless of which repo's
+# tests are running, so it injects these marks on upstream vLLM test items even
+# during a plain torch-spyre run. Mirrors the marker list declared in
+# spyre-inference/pyproject.toml plus the tags in its upstream_tests.yaml.
+markers = [
+    "upstream",
+    "uses_subprocess",
+    "distributed",
+    "attention",
+    "model",
+    "granite",
+    "generation",
+    "embedding",
+    "basic_correctness",
+    # These three come from vLLM's own upstream test suite (the cached
+    # worktree under ~/.cache/vllm-upstream-tests), not from
+    # spyre-testing-plugin's injected tags above -- vLLM's own pytest.ini
+    # registers them, but that config isn't active when running from
+    # torch-spyre's own pytest invocation.
+    "core_model",
+    "cpu_model",
+    "slow_test",
+]
 
 [tool.uv]
 required-version = ">=0.9.0"
