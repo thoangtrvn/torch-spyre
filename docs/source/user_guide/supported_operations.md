@@ -17,7 +17,7 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.bmm` | Y | Y | Spyre | |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
 | **Activation Functions** | | | | |
-| `torch.nn.functional.softmax` | Y | Y | Spyre | |
+| `torch.nn.functional.softmax` | Y | Y | Spyre | **`dim=-1` only, and ONE shape: `[1024, 64]` float16 (DL16).** Routed via the `spyre::softmax` custom op; HW-verified eager + compiled at 3.28 ULP_DL16. Every other shape/dtype/axis raises `NotImplementedError` (no host fallback). Attention shapes (`[seq, seq]` prefill, `[1, seq]` decode) are NOT yet supported. See `codegen/docs/op-milestones/softmax.md`. |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.rms_norm` | Y | Y | Spyre | Custom decomposition |
 | `torch.nn.functional.gelu` | | Y | Spyre | Custom op + lowering |
