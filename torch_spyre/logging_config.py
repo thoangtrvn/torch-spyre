@@ -72,14 +72,41 @@ def _get_lock():
     return _lock
 
 
+def _normalize_component(component: str) -> str:
+    """Normalize a TORCH_LOGS component name onto the internal namespace.
+
+    torch validates every TORCH_LOGS target with importlib.util.find_spec(),
+    which runs during ``import torch``. Only ``torch_spyre.*`` is a real
+    on-disk package that passes that check; a bare ``spyre.*`` target makes
+    torch raise ``Invalid log settings`` before any Spyre code runs. So the
+    ``torch_spyre.*`` spelling is the one users must type on the command line.
+
+    Internally, however, all Spyre loggers are named ``spyre.*`` (both the
+    Python ``spyre.inductor.*`` loggers and the C++ ``spyre.runtime`` etc.).
+    This maps the ``torch_spyre`` prefix onto ``spyre`` so the configured
+    level lands on the logger that actually emits records:
+
+        "torch_spyre"                 -> "spyre"
+        "torch_spyre.inductor.passes" -> "spyre.inductor.passes"
+
+    The legacy bare ``spyre.*`` spelling is returned unchanged for
+    backward compatibility.
+    """
+    if component == "torch_spyre" or component.startswith("torch_spyre."):
+        return "spyre" + component[len("torch_spyre") :]
+    return component
+
+
 def _parse_torch_logs() -> Dict[str, LogLevel]:
     """Parse TORCH_LOGS environment variable for spyre namespaces.
 
-    Supported formats:
-    - TORCH_LOGS="spyre.inductor:DEBUG"
-    - TORCH_LOGS="+spyre.inductor"  (enables at INFO)
-    - TORCH_LOGS="-spyre.inductor"  (disables)
-    - TORCH_LOGS="spyre:INFO,spyre.inductor:DEBUG"
+    Supported formats (the ``torch_spyre.*`` spelling is preferred because it
+    is the only one torch's own validator accepts; it is normalized onto the
+    internal ``spyre.*`` namespace):
+    - TORCH_LOGS="torch_spyre.inductor:DEBUG"
+    - TORCH_LOGS="+torch_spyre.inductor"  (enables at INFO)
+    - TORCH_LOGS="-torch_spyre.inductor"  (disables)
+    - TORCH_LOGS="torch_spyre:INFO,torch_spyre.inductor:DEBUG"
 
     Returns:
         Dictionary mapping component names to log levels
@@ -96,18 +123,18 @@ def _parse_torch_logs() -> Dict[str, LogLevel]:
             continue
 
         if entry.startswith("+"):
-            component = entry[1:]
+            component = _normalize_component(entry[1:])
             if component.startswith("spyre"):
                 config[component] = LogLevel.INFO
                 _config_source[component] = "TORCH_LOGS"
         elif entry.startswith("-"):
-            component = entry[1:]
+            component = _normalize_component(entry[1:])
             if component.startswith("spyre"):
                 config[component] = LogLevel.DISABLED
                 _config_source[component] = "TORCH_LOGS"
         elif ":" in entry:
             component, level_str = entry.split(":", 1)
-            component = component.strip()
+            component = _normalize_component(component.strip())
             level_str = level_str.strip()
             if component.startswith("spyre"):
                 try:
