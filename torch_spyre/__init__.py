@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import atexit
 import threading
 import types
 import importlib
@@ -66,6 +67,20 @@ class _SpyreImpl:
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
+
+            # Register an atexit handler to gracefully shut down the Spyre
+            # runtime.  The libflex.so RuntimeContext destructor has a bug:
+            # it resets the device *before* destroying the scheduler (and its
+            # ResponseWorker), so the ResponseWorker's Shutdown() method
+            # submits a cancel CB to an already-reset device, corrupting the
+            # heap (malloc_consolidate: unaligned fastbin chunk detected).
+            #
+            # Since we cannot fix libflex.so, we synchronize the device and
+            # then use os._exit(0) to bypass C++ static destructors entirely.
+            # This is safe because at this point all user code has finished
+            # and we only risk leaking device resources — which the OS reclaims
+            # when the process exits anyway.
+            atexit.register(self._shutdown)
 
             ## Run patch on import
             from ._monkey_patch import _patch_tensor_for_spyre
@@ -133,6 +148,23 @@ class _SpyreImpl:
     def _mark_after_fork(self):
         self._initialized = True
         self._in_bad_fork = True
+
+    def _shutdown(self):
+        """Last-resort shutdown via Python atexit.
+
+        The primary mechanism is the C-level std::atexit handler registered
+        in PYBIND11_MODULE (module.cpp), which synchronizes the device,
+        cleans up the runtime, and calls _exit(0) before C++ static
+        destructors run.  In normal exit, that handler fires first (LIFO)
+        and this Python handler never runs.
+
+        This exists as a fallback if the C handler somehow doesn't fire —
+        e.g., the process is exiting via a path that bypasses C atexit but
+        still runs Python atexit.  In that case we just os._exit(0) to
+        prevent the buggy libflex.so static destructors from corrupting
+        the heap.
+        """
+        os._exit(0)
 
 
 def make_spyre_module() -> types.ModuleType:
