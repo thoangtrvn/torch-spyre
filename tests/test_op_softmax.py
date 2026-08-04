@@ -100,26 +100,51 @@ def _softmax(x):
 # envelope law M == 32*C); a user writes torch.softmax and never picks C.
 _OK, _REFUSE = "ok", "refuse"
 
+# (case_id, M, N, routed_C, expect, reason_substr)
+#
+# THE `routed_C` COLUMN IS DERIVED, NOT DECLARED — and getting that wrong is what made
+# the first version of this table describe mechanisms that never fire. The routed op
+# computes `C = M/32` from the envelope law `M == 32*C`; it is NOT a user knob. So a
+# case cannot pick its own C, and the guard that fires is whichever one that derived C
+# reaches. Consequences, measured rather than assumed:
+#   * `r = M/C` is therefore ALWAYS 32, so the CONFOUNDED-second-operand guard
+#     (`e*128 == 2*r*ns_row*128` identically) and the `u=4 must divide r` guard are
+#     both STRUCTURALLY UNREACHABLE from the torch path. They are real guards, reachable
+#     only from the codegen API where C is passed explicitly — and they are tested there
+#     (`codegen/tests/test_softmax_dispatch.py`). Naming a torch case after them
+#     asserted a mechanism that could not fire.
+#   * M=2048 derives C=64, which trips the C>32 core ceiling FIRST.
+# `reason_substr` pins WHICH guard fires, so a rename can never again silently claim the
+# wrong mechanism: the assertion checks the message, not just that something raised.
 _SOFTMAX_CASES = [
     # THE witnessed shape: byte-match golden + silicon, eager and compiled.
-    ("witnessed_1024x64_c32", 1024, 64, 32, _OK),
+    ("witnessed_1024x64_c32", 1024, 64, 32, _OK, None),
 
-    # --- refused: structurally UNBUILDABLE, each for a DIFFERENT honest reason -----
-    # second-operand byte distance is CONFOUNDED in the only golden (admits M == 32*C)
-    ("refuse_2048x64_confounded", 2048, 64, 32, _REFUSE),
-    # row unroll u=4 must divide rows_per_core=23; no remainder-row tail is built
-    ("refuse_736x64_no_row_tail", 736, 64, 32, _REFUSE),
-    # the cross-lane reduce is ONE STICK PER ROW (N==64); N=2048 is 32 sticks/row.
-    # This is the decode shape -- refusing it is why softmax is not servable yet.
-    ("refuse_1x2048_decode", 1, 2048, 32, _REFUSE),
+    # M=2048 -> C=64 > 32 physical cores. Found on hardware: this used to be named
+    # "confounded" and expected NotImplementedError; it actually refuses on the core
+    # ceiling, and did so with a raw ValueError until the dispatch was fixed to give
+    # every refusal one type.
+    ("refuse_2048x64_exceeds_32_cores", 2048, 64, 64, _REFUSE, "exceeds the 32 cores"),
 
-    # --- refused: structurally BUILDABLE but UNWITNESSED (the dangerous class) -----
-    # Every SoftmaxPlan constraint passes and the dispatch WOULD build a binary; there
-    # is no golden and no silicon run. If these ever return a tensor, the
-    # witnessed-shape pin has been removed and unverified binaries are shipping.
-    ("refuse_512x64_unwitnessed", 512, 64, 16, _REFUSE),
-    ("refuse_64x64_unwitnessed", 64, 64, 2, _REFUSE),
+    # N != 64: the cross-lane reduce is ONE STICK PER ROW; N=2048 is 32 sticks/row.
+    # THIS IS THE DECODE SHAPE -- refusing it is exactly why softmax is not yet servable
+    # for attention, so it stays in the table as a documented refusal.
+    ("refuse_1x2048_decode", 1, 2048, 1, _REFUSE, "one stick per row"),
+
+    # --- structurally BUILDABLE but UNWITNESSED — the dangerous class ---------------
+    # Every SoftmaxPlan constraint passes and the dispatch WOULD build a binary; there is
+    # no golden and no silicon run. If any of these returns a tensor, the witnessed-shape
+    # pin has been removed and unverified binaries are shipping.
+    # (736 belongs HERE, not with the structural refusals: C=23 gives r=32, so the
+    # row-tail guard it was originally named for never fires.)
+    ("refuse_736x64_unwitnessed", 736, 64, 23, _REFUSE, "structurally buildable"),
+    ("refuse_512x64_unwitnessed", 512, 64, 16, _REFUSE, "structurally buildable"),
+    ("refuse_64x64_unwitnessed", 64, 64, 2, _REFUSE, "structurally buildable"),
 ]
+
+#: The routed core-count derivation, mirrored from torch_spyre/ops/softmax.py. Asserted
+#: against every row below so the table's `routed_C` cannot drift from what runs.
+_ROWS_PER_CORE = 32
 
 #: Ids HW-verified on silicon through the TORCH path (eager AND torch.compile).
 #: Populated 2026-08-04: 3.28 ULP_DL16, 0 outliers, 3630 subnormal outputs clean,
@@ -177,17 +202,34 @@ def _check_softmax(case_id, entry, M, N, run):
         f"{case_id}/{entry}: row-sum error {row_err:.2f} ULP_DL16 — a per-row scale bug")
 
 
-def _check_refused(case_id, entry, M, N, run):
-    """An out-of-envelope shape must FAIL LOUD, never silently compute.
+def _check_refused(case_id, entry, M, N, run, reason_substr):
+    """An out-of-envelope shape must FAIL LOUD, for the REASON this case claims.
 
-    NotImplementedError (which SoftmaxEnvelopeError subclasses) is the contract: it
-    PROPAGATES rather than falling back to host compute (#70). Asserting the type
-    rather than 'any exception' matters — Inductor treats its own `Unsupported` as
-    'fall back', which for softmax would mean a silent CPU result.
+    Two assertions, and the second is the one that earns its keep:
+
+    (1) TYPE. NotImplementedError (which SoftmaxEnvelopeError subclasses) is the
+        contract: it PROPAGATES rather than falling back to host compute (#70).
+        Asserting the type rather than "any exception" matters — Inductor treats its own
+        `Unsupported` as "fall back", which for softmax would mean a silent CPU result.
+        It also matters because it CAUGHT A REAL DEFECT: M=2048 refused with a raw
+        ValueError from the C>32 core guard, which no NotImplementedError handler would
+        have caught. The dispatch now gives every refusal one type.
+
+    (2) REASON. Without this, a case passes as long as SOMETHING refuses — and the first
+        version of this table proved that is not enough: two cases were named after
+        guards that cannot fire on the routed path, and passed anyway. Pinning the
+        message means a rename cannot silently re-point a case at a different mechanism.
     """
     x = _make_input(M, N)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(NotImplementedError) as exc:
         run(x.to("spyre")).cpu()
+    msg = str(exc.value).lower()
+    assert "softmax" in msg, (
+        f"{case_id}/{entry}: refusal does not name the op the user called: {exc.value}")
+    assert reason_substr.lower() in msg, (
+        f"{case_id}/{entry}: refused, but NOT for the {reason_substr!r} reason this case "
+        f"claims. Either the case name/mechanism is wrong or a different guard now fires "
+        f"first. Message: {exc.value}")
 
 
 # ---------------------------------------------------------------------------
@@ -195,11 +237,11 @@ def _check_refused(case_id, entry, M, N, run):
 # ---------------------------------------------------------------------------
 @requires_hw
 @pytest.mark.parametrize(
-    "case_id,M,N,C,expect", _SOFTMAX_CASES, ids=[c[0] for c in _SOFTMAX_CASES]
+    "case_id,M,N,C,expect,reason", _SOFTMAX_CASES, ids=[c[0] for c in _SOFTMAX_CASES]
 )
-def test_softmax_eager(case_id, M, N, C, expect):
+def test_softmax_eager(case_id, M, N, C, expect, reason):
     if expect == _REFUSE:
-        _check_refused(case_id, "eager", M, N, _softmax)
+        _check_refused(case_id, "eager", M, N, _softmax, reason)
         return
     if case_id not in _HW_VERIFIED_SOFTMAX:
         pytest.xfail(
@@ -215,12 +257,12 @@ def test_softmax_eager(case_id, M, N, C, expect):
 # ---------------------------------------------------------------------------
 @requires_hw
 @pytest.mark.parametrize(
-    "case_id,M,N,C,expect", _SOFTMAX_CASES, ids=[c[0] for c in _SOFTMAX_CASES]
+    "case_id,M,N,C,expect,reason", _SOFTMAX_CASES, ids=[c[0] for c in _SOFTMAX_CASES]
 )
-def test_softmax_compiled(case_id, M, N, C, expect):
+def test_softmax_compiled(case_id, M, N, C, expect, reason):
     compiled = torch.compile(_softmax, dynamic=False)
     if expect == _REFUSE:
-        _check_refused(case_id, "compiled", M, N, compiled)
+        _check_refused(case_id, "compiled", M, N, compiled, reason)
         return
     if case_id not in _HW_VERIFIED_SOFTMAX:
         pytest.xfail(f"{case_id}: not HW-verified through the compiled torch path.")
@@ -258,7 +300,7 @@ def test_codegen_witnessed_set_agrees_with_this_contract():
     except ImportError:
         pytest.skip("sentient_codegen not importable (source env.sh)")
 
-    for case_id, M, N, C, expect in _SOFTMAX_CASES:
+    for case_id, M, N, C, expect, _reason in _SOFTMAX_CASES:
         key = (M, N, C, 16)
         if expect == _OK:
             assert key in SOFTMAX_WITNESSED_SHAPES, (
@@ -268,6 +310,40 @@ def test_codegen_witnessed_set_agrees_with_this_contract():
             assert key not in SOFTMAX_WITNESSED_SHAPES, (
                 f"{case_id} is a _REFUSE case here but codegen ADMITS it — one of the "
                 f"two has been widened without the other")
+
+
+def test_table_routed_C_matches_the_ops_derivation():
+    """The `routed_C` column must be what the op actually derives, not a wish.
+
+    This guard exists because the first version of this table DECLARED C=32 for every
+    row, as documentation. That was wrong for four of six rows — M=2048 runs at C=64,
+    M=736 at C=23 — and the wrong C is precisely what made two cases claim guards that
+    cannot fire (`r = M/C` is always 32, so the confounded-operand and `u|r` guards are
+    unreachable from the torch path). A column that silently disagrees with the code is
+    worse than no column: it reads as verified fact.
+    """
+    for case_id, M, N, C, _expect, _reason in _SOFTMAX_CASES:
+        derived = max(1, M // _ROWS_PER_CORE)
+        assert C == derived, (
+            f"{case_id}: table says routed C={C} but the op derives C={derived} from "
+            f"M={M} (C = M/{_ROWS_PER_CORE}). Fix the table, not the op.")
+
+
+def test_refusal_reasons_are_discriminating():
+    """No two refusal reasons may be substrings of each other's messages.
+
+    A reason that matches every message proves nothing — the same confound that made
+    `"row"` useless in the codegen test (it appears in all three structural reasons).
+    Here the risk is subtler: several cases share `"structurally buildable"` legitimately
+    (they are the same class), but a reason must never be so generic that it would also
+    match a DIFFERENT class's message.
+    """
+    specific = {r for _, _, _, _, e, r in _SOFTMAX_CASES if e == _REFUSE and r}
+    assert "exceeds the 32 cores" in specific and "one stick per row" in specific
+    # The class marker must not appear inside a structural reason, or an unwitnessed case
+    # would pass while a core-ceiling or N-shape guard was the one actually firing.
+    for structural in ("exceeds the 32 cores", "one stick per row"):
+        assert "structurally buildable" not in structural
 
 
 def test_softmax_is_not_claimed_beyond_one_shape():
