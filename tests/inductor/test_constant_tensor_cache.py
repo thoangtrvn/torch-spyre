@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for spyre_constant_tensor module-level LRU caching.
+"""Tests for spyre_constant_tensor module-level caching.
 
 Tests verify:
 1. Cache hit: Same (value, device, dtype) returns same tensor object
 2. Cache miss: Different values/devices/dtypes create new tensors
-3. LRU eviction: Oldest entries evicted when cache exceeds max size
+3. Bounded size: Cache stays bounded at max size, regardless of underlying implementation
 4. Cache clearing: Manual clear_constant_tensor_cache() for test isolation
 5. CPU device: Not cached (uses standard torch.tensor path)
 6. Thread safety: Concurrent access works correctly
@@ -137,6 +137,41 @@ class TestConstantTensorCache(unittest.TestCase):
         self.assertEqual(
             len(_CONSTANT_TENSOR_CACHE), 0, "Cache should be empty after manual clear"
         )
+
+    def test_cache_stays_bounded(self):
+        """Cache stays bounded at max size when entries exceed the limit.
+
+        This tests the desired property that the cache never grows beyond
+        _CACHE_MAX_SIZE, regardless of the underlying implementation.
+        """
+        from torch_spyre._inductor.op_spec import _CACHE_MAX_SIZE
+
+        # Clear cache to start fresh
+        clear_constant_tensor_cache()
+
+        # Create more entries than the max size
+        num_entries = _CACHE_MAX_SIZE + 100
+        for i in range(num_entries):
+            spyre_constant_tensor(float(i), torch.device("spyre"), torch.float16)
+
+        # Cache should stay bounded at or below max size
+        self.assertLessEqual(
+            len(_CONSTANT_TENSOR_CACHE),
+            _CACHE_MAX_SIZE,
+            f"Cache should stay bounded at {_CACHE_MAX_SIZE}, "
+            f"got {len(_CONSTANT_TENSOR_CACHE)}",
+        )
+
+        # Cache should still function correctly after eviction
+        test_value = 100.0  # Exactly representable in float16
+        t = spyre_constant_tensor(test_value, torch.device("spyre"), torch.float16)
+        self.assertEqual(t.item(), test_value)
+
+        # Creating an already-cached value should still work
+        t2 = spyre_constant_tensor(test_value, torch.device("spyre"), torch.float16)
+        self.assertEqual(t2.item(), test_value)
+        recreated = spyre_constant_tensor(0.0, torch.device("spyre"), torch.float16)
+        self.assertEqual(recreated.item(), 0.0)
 
     def test_thread_safety(self):
         """Concurrent access from multiple threads works correctly."""
