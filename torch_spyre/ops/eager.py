@@ -197,7 +197,18 @@ def spyre__copy_from(self, dst, non_blocking=False):
     ):
         torch_spyre._C.copy_tensor(self, dst, non_blocking)
         return dst
-    elif self.device.type == "spyre" and self.device == dst.device:
+    elif self.device.type == "spyre" and dst.device.type == "spyre":
+        # Type-only comparison, not self.device == dst.device: this process
+        # owns exactly one physical spyre device (one process per accelerator
+        # under torchrun), so any two "spyre"-typed tensors here are
+        # necessarily on that same physical device regardless of what their
+        # .index happens to report. Exact device-object equality was
+        # rejecting some same-device tensors (e.g. from a .to(DEVICE)-sourced
+        # tensor copied into a device=DEVICE-constructed one) and falling
+        # through to the generic aten fallback below, which re-dispatches the
+        # identical op and recurses into this same kernel forever -- see
+        # bug_analysis_copy_from_recursion.md.
+        #
         # Pass storage_offsets explicitly: a graph input's storage_offset is
         # dropped by Inductor, so the lowering must re-introduce it in-graph
         # (see copy_from_d2d in customops.py and lower_spyre_from_d2d).

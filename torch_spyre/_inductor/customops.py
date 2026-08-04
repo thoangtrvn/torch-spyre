@@ -226,7 +226,43 @@ def _(input: torch.Tensor):
 @torch.library.custom_op(
     "spyre::copy_from_d2d", mutates_args=("dst",), device_types="spyre"
 )
-@compile_once("spyre.copy_from_d2d")
+# dynamic=False: separately from the specialize_int fix below (which pins the
+# int OFFSET args), this pins the TENSOR shape/stride args static too. Without
+# it, dynamo's *default* auto-dynamic promotes a tensor dimension to a SymInt
+# the moment this op is called with a second distinct shape -- which is
+# essentially guaranteed the first time this runs for real: this op backs the
+# KV-cache write in the attention path, and prefill (many tokens) vs. decode
+# (one token per step) are always two different shapes. That symbolic
+# dimension then propagates into a buffer's tiled-layout STRIDE (Spyre's
+# stickified layout reorders dims, so the symbolic dim is often interior, not
+# outermost) and crashes torch-spyre's own core-division pass:
+# `_inductor/pass_utils.py`'s `_per_core_view_on_buf` does a bare
+# `int(dep.index.coeff(sym))` with no symbolic-safe fallback (unlike every
+# other stride/size read in that file, which routes through
+# `concretize_expr`/`size_hint`) -- see
+# torch-inductor-symbolic-shapes-explained.md (workspace root) §5 for the
+# full trace. dynamic=False avoids ever creating that symbol in the first
+# place, at the cost of one extra fresh trace + fresh SDSC binary per
+# distinct tensor shape seen (same "one binary per shape" cost the
+# specialize_int fix below already accepts for the offsets).
+#
+# To safely remove this pin in the future, BOTH of the following need to be
+# true, not just one:
+#   1. (narrow, proximate) `_per_core_view_on_buf` (pass_utils.py:833) must
+#      concretize `dep.index.coeff(sym)` the same way the rest of that file
+#      already does, with an explicit, safe fallback (e.g. treat the buffer as
+#      ineligible for LX/scratchpad placement rather than crash) when the
+#      coefficient is genuinely symbolic -- otherwise removing dynamic=False
+#      just re-exposes the crash this comment describes.
+#   2. (broader) deeptools/SDSC needs actual support for symbolic shape
+#      parameters in the binary format itself (a symbolic size baked in as a
+#      runtime argument rather than a compile-time constant) for one compiled
+#      binary to genuinely serve many shapes without per-shape recompilation
+#      -- tracked as issues #220 / #1371-3. Without this, (1) alone only
+#      prevents the crash; it does not remove the recompilation cost dynamic=
+#      False also avoids paying differently (many static binaries) vs. what
+#      true dynamic-shape support would give (one polymorphic binary).
+@compile_once("spyre.copy_from_d2d", dynamic=False)
 def copy_from_d2d(
     src: torch.Tensor,
     dst: torch.Tensor,
@@ -272,7 +308,13 @@ def _(
 @torch.library.custom_op(
     "spyre::overwrite", mutates_args=("output",), device_types="spyre"
 )
-@compile_once("spyre.overwrite")
+# dynamic=False: same latent gap as spyre.copy_from_d2d above (see that op's
+# comment for the full trace and the two conditions needed to safely remove
+# this pin) -- this op's own specialize_int fix below only pins the int
+# dims/offsets args static; without this, dynamo's auto-dynamic can still
+# promote a TENSOR shape/stride to a SymInt on a second distinct shape, which
+# crashes the same core-division pass (`_inductor/pass_utils.py:833`).
+@compile_once("spyre.overwrite", dynamic=False)
 def overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
