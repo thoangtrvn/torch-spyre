@@ -122,14 +122,16 @@ _SOFTMAX_CASES = [
     # THE witnessed shape: byte-match golden + silicon, eager and compiled.
     ("witnessed_1024x64_c32", 1024, 64, 32, _OK, None),
 
-    # rows=64 -> 2*64*1*128 = 16384 != e*128 = 8192. The second-operand byte distance is
-    # CONFOUNDED in the only admitted golden; emitting either candidate would ship a
-    # curve fit. Un-confounding it needs the rows=64 golden DECODED (its own rung).
-    ("refuse_2048x64_confounded", 2048, 64, 32, _REFUSE, "confounded"),
+    # rows=64: WITNESSED (Band A). The second-operand distance confound was RESOLVED --
+    # decoded rows-independent (e*128=8192, identical in the rows=32 AND rows=64 goldens),
+    # byte-matched (28416 B) AND silicon HW-KAT PASS (3.74 ULP, 0 bad, 3x clean, 2026-08-05).
+    ("witnessed_2048x64_c32", 2048, 64, 32, _OK, None),
 
-    # rows=16 -> 4096 != 8192. Same guard as 2048, different side of it: this is why
-    # M-widening is blocked on the confound and not on a core-count bug.
-    ("refuse_512x64_confounded", 512, 64, 32, _REFUSE, "confounded"),
+    # rows=16 (< 32): UNWITNESSED, refused by the witnessed-shape PIN (not a chained
+    # structural reason — it constructs fine). The message says "admits only witnessed
+    # shapes"; "admits only" is the discriminating substring (unique to the pin, and NOT
+    # a substring of any structural reason — avoids the "witnessed" ⊂ "unwitnessed" clash).
+    ("refuse_512x64_unwitnessed_pin", 512, 64, 32, _REFUSE, "admits only"),
 
     # rows=23: u=4 does not divide 23 (the mvloopcnt trip is rows/u) and no remainder-row
     # tail is built. A REAL capability limit -- and note a golden for this shape EXISTS,
@@ -151,10 +153,13 @@ _SOFTMAX_CASES = [
 #: the derivation now lives BECAUSE the wrong version was unreachable by any test here.
 _SOFTMAX_CORES = 32
 
-#: Ids HW-verified on silicon through the TORCH path (eager AND torch.compile).
-#: Populated 2026-08-04: 3.28 ULP_DL16, 0 outliers, 3630 subnormal outputs clean,
-#: both entry points matching the bytes-launch KAT at the same range.
-_HW_VERIFIED_SOFTMAX = {"witnessed_1024x64_c32"}
+#: Ids HW-verified on silicon (bytes-launch KAT; torch-path eager+compiled where run).
+#: M=1024 populated 2026-08-04 (3.28 ULP_DL16, 0 outliers, 3630 subnormal outputs clean).
+#: M=2048 (Band A, rows=64) populated 2026-08-05 (3.74 ULP_DL16, 0 bad, 3x clean unpadded
+#: bytes-launch KAT). NOTE: M=2048 silicon was proven via the bytes-launch KAT
+#: (scripts/softmax_dim_neg1_hw_kat.py KAT_M=2048); the torch-path eager/compiled twin at
+#: M=2048 should be box-run to confirm routing before treating the torch entry as verified.
+_HW_VERIFIED_SOFTMAX = {"witnessed_1024x64_c32", "witnessed_2048x64_c32"}
 
 
 def _make_input(M, N):
@@ -278,16 +283,17 @@ def test_softmax_compiled(case_id, M, N, C, expect, reason):
 # HW-independent guards (run everywhere, incl. CI without a board).
 # ---------------------------------------------------------------------------
 def test_softmax_verified_membership_locked():
-    """Contract lock: EXACTLY one shape is HW-verified through the torch path.
+    """Contract lock: EXACTLY the shapes that have passed on silicon are HW-verified.
 
     Pins the verified set so a future edit cannot silently widen it past what has
     actually passed on silicon. Widening requires a golden or an HW-KAT for the new
     shape, an entry in SOFTMAX_WITNESSED_SHAPES, and an edit here — same change.
     """
-    assert _HW_VERIFIED_SOFTMAX == {"witnessed_1024x64_c32"}, (
-        "Softmax verified set changed. Only M=1024 N=64 C=32 DL16 has passed on "
-        "silicon (2026-08-04, 3.28 ULP_DL16, eager + torch.compile). Confirm on "
-        "hardware before widening, then update this lock."
+    assert _HW_VERIFIED_SOFTMAX == {"witnessed_1024x64_c32", "witnessed_2048x64_c32"}, (
+        "Softmax verified set changed. Silicon-passed shapes: M=1024 N=64 C=32 "
+        "(2026-08-04, 3.28 ULP) and M=2048 N=64 C=32 (2026-08-05, 3.74 ULP, 0 bad, "
+        "3x clean, bytes-launch HW-KAT). Confirm on hardware before widening, then "
+        "update this lock."
     )
 
 
@@ -348,13 +354,17 @@ def test_refusal_reasons_are_discriminating():
     match a DIFFERENT class's message.
     """
     specific = {r for _, _, _, _, e, r in _SOFTMAX_CASES if e == _REFUSE and r}
-    # At the corrected law every refusal is a REAL structural limit — the
-    # "structurally buildable but unwitnessed" class is now EMPTY, so no case may claim it.
-    assert "structurally buildable" not in specific, (
-        "a case claims the unwitnessed-but-buildable reason, but at C=32 that class is "
-        "empty (the confound pins rows==32 => M==1024). Re-verify which guard fires.")
-    assert {"confounded", "must divide", "unwitnessed", "one stick per row"} <= specific
+    # After Band A: M=2048/rows=64 is WITNESSED (no longer a "confounded" refusal), so the
+    # confound reason is gone. The remaining refusals are: a witnessed-shape PIN (rows=16,
+    # "admits only") and three REAL structural limits (u∤rows "must divide"; u=2
+    # "unwitnessed"; N>64 "one stick per row").
+    assert "confounded" not in specific, (
+        "a case still claims the 'confounded' reason, but the second-operand distance "
+        "confound was RESOLVED (rows-independent) and M=2048 is now witnessed.")
+    assert {"admits only", "must divide", "unwitnessed", "one stick per row"} <= specific
     # No reason may be a substring of another, or a case could pass on the wrong guard.
+    # (This CAUGHT the "witnessed" ⊂ "unwitnessed" clash when 512's reason was first set to
+    # "witnessed"; "admits only" is disjoint from all three structural reasons.)
     for a in specific:
         for b in specific:
             if a != b:

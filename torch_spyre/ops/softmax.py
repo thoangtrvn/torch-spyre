@@ -48,14 +48,17 @@ the full-binary byte-match locks, and exactly what the silicon KAT
 outliers.  Reusing it unchanged is what makes that evidence transfer to this path
 instead of becoming a new unknown.
 
-ENVELOPE: ONE SHAPE, FAIL-LOUD
-------------------------------
-Only ``M=1024, N=64, C=32`` DL16 is admitted, enforced in codegen by
+ENVELOPE: WITNESSED SHAPES ONLY, FAIL-LOUD
+------------------------------------------
+Admitted: ``M=1024`` (rows=32) and ``M=2048`` (rows=64), both ``N=64, C=32`` DL16 —
+each byte-matched AND silicon-verified, enforced in codegen by
 ``SOFTMAX_WITNESSED_SHAPES``.  Everything else raises ``SoftmaxEnvelopeError`` (a
 ``NotImplementedError``, so it PROPAGATES and fails the compile).  There is
 deliberately no CPU fallback (#70): a silent host softmax is worse than a hard error.
-This is NOT servable attention yet — ``[1, seq]`` decode and ``[seq, seq]`` prefill are
-both refused.  Widening needs a golden or an HW-KAT, never a relaxed guard.
+This is STILL NOT servable attention — it is "more M at N=64".  ``N != 64``
+(``[1, seq]`` decode, ``[seq, seq]`` prefill = multi-stick rows) and ``dim=0`` remain
+refused (separate unbuilt datapaths).  Widening needs a golden or an HW-KAT, never a
+relaxed guard.
 """
 from __future__ import annotations
 
