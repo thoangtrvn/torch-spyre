@@ -241,6 +241,16 @@ class SpyreCCLBackend : public c10d::Backend {
   std::thread watchdog_thread_;
   std::atomic<bool> watchdog_stop_{false};
 
+  // Per-group failure-signal Store key. The base key is a single global
+  // constant shared by every backend; suffixing it with a hash of this group's
+  // sorted global ranks scopes peer-validation-failure propagation to this
+  // group's members, so one subgroup's detected failure no longer aborts
+  // coexisting sibling groups through the Store. (The shared comm_stream_
+  // hardware-shutdown path remains process-fatal across all groups by design —
+  // see report_and_abort().) Immutable after construction (set before the
+  // watchdog thread starts), so no synchronization is needed to read it.
+  std::string error_store_key_;
+
   // Backend-local teardown interrupt: gates ONLY pre-launch request drops (M1).
   // wait_interruptible never consults it — a launched DMA on the shared stream
   // is never abandoned. Set in the destructor / abort().
@@ -268,6 +278,20 @@ class SpyreCCLBackend : public c10d::Backend {
       torch_spyre::distributed::CollectiveParams params,
       const spyre::SpyreStream& caller_stream, std::vector<at::Tensor> hold,
       std::vector<at::Tensor> result);
+
+  // Perform one asymmetric pairwise exchange for the variable-size collectives:
+  // send all of send_base's bytes to peer and receive all of recv_base's bytes
+  // from peer, decomposed into a balanced sendrecv (min(S,R) bytes, any size)
+  // plus credit-bounded one-directional send/recv sub-legs for the |S-R|
+  // remainder. Each sub-leg is its own WorkSchedule (SetStreamAffinity + start
+  // + wait), so every one-directional run stays within send_credit and the HDMA
+  // credit guard never fires (broadcast/reduce are avoided entirely). round_tag
+  // must be distinct per round and identical on both peers (both derive the
+  // same decomposition from the shared sizes). Returns the last sub-leg's
+  // schedule (nullptr if S==R==0).
+  [[nodiscard]] std::unique_ptr<spyre_comms::WorkSchedule> exchange_uneven(
+      const spyre_comms::BufferDesc& send_base,
+      const spyre_comms::BufferDesc& recv_base, int peer, int round_tag);
   void check_single_tensor(const at::Tensor& tensor);
   void check_vector_tensor(const std::vector<at::Tensor>& tensors,
                            int min_allowed = 1, int max_allowed = 1);

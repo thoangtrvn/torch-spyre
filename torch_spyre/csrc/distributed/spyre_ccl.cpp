@@ -15,7 +15,9 @@
  */
 #include "spyre_ccl.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -43,6 +45,43 @@ namespace {
 // message.
 constexpr const char* kSpyreCCLErrorStoreKey = "spyre_ccl/error_signal";
 constexpr auto kWatchdogPollInterval = std::chrono::milliseconds(200);
+
+// FNV-1a hash of the sorted global group ranks, as a decimal string. Used as a
+// stable per-group suffix for the failure-signal Store key: identical on every
+// member (same membership -> same string), distinct across groups with
+// different membership. Uniqueness (not cryptographic strength) is all that is
+// required.
+std::string group_key_suffix(std::vector<spyre_comms::process_id_t> ranks) {
+  std::sort(ranks.begin(), ranks.end());
+  uint64_t h = 1469598103934665603ULL;
+  for (auto r : ranks) {
+    for (int b = 0; b < 8; ++b) {
+      h ^= static_cast<uint64_t>((r >> (b * 8)) & 0xffULL);
+      h *= 1099511628211ULL;
+    }
+  }
+  return std::to_string(h);
+}
+
+// Store-based allgather of every member's global rank, returned in group-local
+// index order (result[i] == global rank of group-local rank i). Each member
+// publishes its own global rank at its group-local index, then reads all size
+// entries (get_to_str blocks until each peer has published). Runs in the
+// group's own PrefixStore, so the fixed key prefix cannot collide across
+// groups.
+std::vector<spyre_comms::process_id_t> allgather_group_global_ranks(
+    const c10::intrusive_ptr<::c10d::Store>& store, int rank, int size,
+    int64_t my_global_rank) {
+  const std::string prefix = "spyre_ccl/subgroup_grank/";
+  store->set(prefix + std::to_string(rank), std::to_string(my_global_rank));
+  std::vector<spyre_comms::process_id_t> group_ranks(static_cast<size_t>(size));
+  for (int i = 0; i < size; ++i) {
+    std::string v = store->get_to_str(prefix + std::to_string(i));
+    group_ranks[static_cast<size_t>(i)] =
+        static_cast<spyre_comms::process_id_t>(std::stoll(v));
+  }
+  return group_ranks;
+}
 }  // namespace
 
 /***********************************************
@@ -79,36 +118,58 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
   }
 
   /*
-   * A3: WORLD-ONLY support.
+   * Subgroup support.
    *
-   * The comms library exposes only a single world context (no sub-group
-   * constructor). For the default (world) ProcessGroup, the c10d rank/size
-   * passed here match the world context's rank/size. A ProcessGroup created
-   * via new_group() with a strict subset of ranks would otherwise silently
-   * reduce across the ENTIRE world (wrong participant set → wrong results and
-   * hangs). Detect that case from the store/rank/size args and fail cleanly
-   * instead of silently doing the wrong thing.
+   * For the default (world) ProcessGroup the c10d rank/size match the world
+   * context's, and we reuse it directly. For a new_group() with a strict subset
+   * of ranks, we build the group's global-rank vector via a Store allgather and
+   * hand it to spyre_comms::create_context(), which returns a logical
+   * communicator over the world's already-established transport (no re-init).
+   * The rank/size the constructor receives are group-local; create_context maps
+   * them to global internally via the group_ranks vector.
    */
   const bool is_world_group = (static_cast<spyre_comms::process_id_t>(size) ==
                                world_context->getSize()) &&
                               (static_cast<spyre_comms::process_id_t>(rank) ==
                                world_context->getRank());
-  if (!is_world_group) {
-    // EXTENSION POINT: when the comms library gains a sub-group context
-    // factory, replace this throw with something like
-    //   group_context_ = spyre_comms::create_context(group_ranks, store);
-    // (deriving group_ranks from `store`), and drop the throw. Everything
-    // below already works against an arbitrary Context.
-    //
-    // Balance the init refcount taken above before throwing (see the null
-    // check above for why the destructor will not run).
-    spyre_comms::finalize_library();
-    throw SpyreCCLNotSupportedException(
-        getBackendName(),
-        "subgroup process groups (only the world group is supported; "
-        "new_group() with a subset of ranks is not yet implemented)");
+
+  std::vector<spyre_comms::process_id_t> group_ranks;
+  try {
+    if (is_world_group) {
+      // World group: global ranks are 0..size-1, in order.
+      group_ranks.resize(static_cast<size_t>(size));
+      for (int i = 0; i < size; ++i) {
+        group_ranks[static_cast<size_t>(i)] =
+            static_cast<spyre_comms::process_id_t>(i);
+      }
+      group_context_ = world_context;
+    } else {
+      // Subgroup: allgather every member's global rank (in group-local index
+      // order) through the group's own PrefixStore, then build the sub-context.
+      group_ranks = allgather_group_global_ranks(
+          store, rank, size, static_cast<int64_t>(world_context->getRank()));
+      group_context_ = spyre_comms::create_context(world_context, group_ranks);
+    }
   }
-  group_context_ = std::move(world_context);
+  catch (...) {
+    // Balance the init refcount taken above before propagating: because this
+    // constructor throws, the destructor (which calls finalize_library()) will
+    // NOT run.
+    spyre_comms::finalize_library();
+    throw;
+  }
+  if (nullptr == group_context_) {
+    spyre_comms::finalize_library();
+    throw std::runtime_error("[" + getBackendName() +
+                             "]: Failed to create the group context");
+  }
+
+  // Per-group failure-signal key (see error_store_key_ in the header): scope
+  // the shared Store error key to this group's members so one subgroup's
+  // detected failure no longer aborts coexisting sibling groups. Set BEFORE the
+  // watchdog thread starts (which reads it), so no synchronization is needed.
+  error_store_key_ =
+      std::string(kSpyreCCLErrorStoreKey) + "/" + group_key_suffix(group_ranks);
 
   // Use the dedicated comm stream so collectives run independently
   // of the compute stream, enabling compute/communication overlap.
@@ -407,16 +468,27 @@ spyre_comms::BufferDesc SpyreCCLBackend::prepare_buffer_desc(
   auto* raw_data_ptr = input_tensor.storage().data_ptr().get();
   auto* raw_ctx = input_tensor.storage().data_ptr().get_context();
   auto* ctx = static_cast<spyre::SharedOwnerCtx*>(raw_ctx);
-  if (ctx == nullptr) {
-    TORCH_CHECK(false,
-                "prepare_buffer_desc: get_context() returned NULL — tensor has "
-                "no device address");
-  }
 
   // Compute dtype directly from PyTorch scalar type
   auto str_type = spyre::torchScalarToString[input_tensor.scalar_type()];
   const auto [sen_dtype_cpu, _sen_dtype_dev] =
       convert_string_to_datatype_pair(str_type);
+
+  // A 0-numel tensor (e.g. one rank's empty contribution to a variable-size
+  // all_gatherv/reduce_scatterv) never gets a real Spyre allocation, so its
+  // context is legitimately NULL -- not an error. Every exchange_uneven/
+  // Context call already treats a 0-byte BufferDesc as a no-op without
+  // dereferencing device_addr, so a nullptr address here is never touched.
+  if (input_tensor.numel() == 0) {
+    return spyre_comms::BufferDesc{raw_data_ptr, nullptr, 0, sen_dtype_cpu,
+                                   false};
+  }
+
+  if (ctx == nullptr) {
+    TORCH_CHECK(false,
+                "prepare_buffer_desc: get_context() returned NULL — tensor has "
+                "no device address");
+  }
 
   // Compute byte count matching TensorInfo::DataSize():
   // (volume * bits_per_element + 7) / 8, with rounding for sub-byte types.
@@ -430,6 +502,72 @@ spyre_comms::BufferDesc SpyreCCLBackend::prepare_buffer_desc(
       raw_data_ptr, &ctx->composite_addr, byte_count, sen_dtype_cpu,
       false  // is_host_only
   };
+}
+
+std::unique_ptr<spyre_comms::WorkSchedule> SpyreCCLBackend::exchange_uneven(
+    const spyre_comms::BufferDesc& send_base,
+    const spyre_comms::BufferDesc& recv_base, int peer, int round_tag) {
+  const size_t S = send_base.byte_count;
+  const size_t R = recv_base.byte_count;
+  const size_t balanced = std::min(S, R);
+  const size_t limit = spyre_comms::max_one_directional_transfer_bytes();
+  constexpr size_t kMinTransfer = 128;
+
+  std::unique_ptr<spyre_comms::WorkSchedule> last;
+  auto run = [&](std::unique_ptr<spyre_comms::WorkSchedule> ws) {
+    ws->SetStreamAffinity(comm_stream_);
+    ws->start();
+    ws->wait();
+    last = std::move(ws);
+  };
+
+  // Distinct tag namespace per round (both peers derive the identical
+  // decomposition from the shared sizes, so they assign matching sub-leg tags).
+  constexpr int kTagStride = 1024;
+  int tag = round_tag * kTagStride;
+
+  // Balanced portion: one bidirectional sendrecv of `balanced` bytes each way.
+  // Bidirectional runs are exempt from the one-directional credit guard at any
+  // size, so this is a single sub-leg regardless of how large `balanced` is.
+  if (balanced > 0) {
+    spyre_comms::SubRangeBuffer s =
+        spyre_comms::make_byte_subrange(send_base, 0, balanced);
+    spyre_comms::SubRangeBuffer r =
+        spyre_comms::make_byte_subrange(recv_base, 0, balanced);
+    // s and r stay alive across this call; sendrecv copies their addresses into
+    // its own schedule (computeChunkExchangeInfos), so they may drop
+    // afterwards.
+    run(group_context_->sendrecv(s.desc, r.desc, peer, tag));
+  }
+  ++tag;
+
+  // Remainder: |S - R| bytes in a single direction, chunked so each sub-leg is
+  // <= send_credit chunks (<= limit bytes) and therefore passes the guard.
+  auto push_one_directional = [&](const spyre_comms::BufferDesc& base,
+                                  size_t total, bool is_send) {
+    size_t off = balanced;
+    while (off < total) {
+      size_t len = std::min(total - off, limit);
+      // Keep a trailing sub-leg at >= the 128-byte minimum transfer.
+      if ((total - off) - len != 0 && (total - off) - len < kMinTransfer) {
+        len = (total - off) - kMinTransfer;
+      }
+      spyre_comms::SubRangeBuffer sub =
+          spyre_comms::make_byte_subrange(base, off, len);
+      run(is_send ? group_context_->send(sub.desc, peer, tag)
+                  : group_context_->recv(sub.desc, peer, tag));
+      off += len;
+      ++tag;
+    }
+  };
+
+  if (S > R) {
+    push_one_directional(send_base, S, /*is_send=*/true);
+  } else if (R > S) {
+    push_one_directional(recv_base, R, /*is_send=*/false);
+  }
+
+  return last;
 }
 
 /**
@@ -591,6 +729,9 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
             "inputTensors.size=", inputTensors.size());
   abort_guard("allgather");
   try {
+    const int world = static_cast<int>(group_context_->getSize());
+    const int me = static_cast<int>(group_context_->getRank());
+
     if (static_cast<int>(outputTensors.size()) != 1) {
       std::string _err_msg =
           "[" + getBackendName() +
@@ -598,42 +739,121 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
           " Actual: " + std::to_string(outputTensors.size());
       TORCH_CHECK(false, _err_msg);
     }
-    if (static_cast<int>(outputTensors[0].size()) !=
-        static_cast<int>(group_context_->getSize())) {
+    if (static_cast<int>(outputTensors[0].size()) != world) {
       std::string _err_msg =
           "[" + getBackendName() +
           "]: Incorrect output list size. The list size should be exactly " +
-          std::to_string(group_context_->getSize()) +
+          std::to_string(world) +
           " Actual: " + std::to_string(outputTensors[0].size());
       TORCH_CHECK(false, _err_msg);
     }
     check_vector_tensor(inputTensors, 1, 1);
-    check_vector_tensor(outputTensors[0], 1,
-                        static_cast<int>(group_context_->getSize()));
+    check_vector_tensor(outputTensors[0], 1, world);
 
-    spyre_comms::BufferDesc input_buf = prepare_buffer_desc(inputTensors[0]);
+    std::vector<at::Tensor>& outs = outputTensors[0];
+    at::Tensor& input = inputTensors[0];
 
+    spyre_comms::BufferDesc input_buf = prepare_buffer_desc(input);
+
+    // Precompute output descriptors and detect the uniform case (every output
+    // slot has the same byte size as this rank's input). Uniform all-gather
+    // keeps the existing host-staged Context::allgather fast path. A variable
+    // (per-rank differently-sized) all-gather — the vLLM MoE all_gatherv case —
+    // takes the N-broadcast decomposition below, which matches the NCCL
+    // reference (pynccl.all_gatherv) and reuses the verified broadcast
+    // primitive. world == 1 is trivially uniform (one output slot == input).
     std::vector<spyre_comms::BufferDesc> output_bufs;
-    for (auto& outputTensor : outputTensors[0]) {
+    output_bufs.reserve(outs.size());
+    bool uniform = true;
+    for (auto& outputTensor : outs) {
       output_bufs.push_back(prepare_buffer_desc(outputTensor));
+      if (output_bufs.back().byte_count != input_buf.byte_count) {
+        uniform = false;
+      }
     }
 
-    DEBUGINFO("allgather: enqueuing async allgather,",
-              "output_bufs.size=", output_bufs.size(),
-              "rank=", group_context_->getRank(),
-              "size=", group_context_->getSize());
+    if (uniform) {
+      DEBUGINFO("allgather (uniform): enqueuing async allgather,",
+                "output_bufs.size=", output_bufs.size(), "rank=", me,
+                "size=", world);
 
-    auto caller_stream = spyre::getCurrentStream(inputTensors[0].device());
-    // Keep the input + all output tensors alive for the async op; complete the
-    // Future with the gathered outputs (A6/A7).
-    std::vector<at::Tensor> hold = outputTensors[0];
-    hold.push_back(inputTensors[0]);
-    // Collective op: every rank in the group issues this, so seq_ stays in
-    // sync across ranks.
+      auto caller_stream = spyre::getCurrentStream(input.device());
+      std::vector<at::Tensor> hold = outs;
+      hold.push_back(input);
+      // Collective op: every rank in the group issues this, so seq_ stays
+      // in sync across ranks.
+      seq_.fetch_add(1, std::memory_order_relaxed);
+      return enqueue_async(OpType::ALLGATHER, input_buf, std::move(output_bufs),
+                           torch_spyre::distributed::CollectiveParams{},
+                           caller_stream, std::move(hold), outs);
+    }
+
+    // ── Variable-size all-gather: pairwise sendrecv rounds ──
+    // broadcast is unsafe here: Broadcast_Unicast's multi-peer one-directional
+    // fan-out trips the HDMA credit guard at MoE sizes
+    // ((world-1)*ceil(size/2MB) > send_credit). Instead, round r pairs this
+    // rank with peer p = ((r - me) % world + world) % world (the symmetric
+    // matching alltoall_base uses). Each round this rank SENDS its whole
+    // contribution (input, sizes[me] bytes) and RECEIVES peer p's whole
+    // contribution into outs[p] (sizes[p] bytes) — an asymmetric exchange that
+    // exchange_uneven decomposes into a balanced sendrecv + credit-bounded
+    // one-directional remainder, every sub-leg either bidirectional
+    // (guard-exempt) or under send_credit. outs[p] is a whole, caller-owned
+    // tensor, so there is no dim-0 offset slicing of a tiled tensor and no
+    // per-round scratch (no UAF class). All ranks iterate r = 0..world-1 in the
+    // same order (deterministic cross-rank launch order); sequential rounds are
+    // deadlock-free. See docs/design/allgatherv-reducescatterv-design.md.
+    //
+    // NOTE: this rank cannot validate that outs[p] on OTHER ranks matches rank
+    // p's contribution size — like alltoall's split lists, the caller must
+    // supply cross-rank-consistent sizes (vLLM passes an explicit sizes
+    // vector).
+    TORCH_CHECK(input_buf.byte_count == output_bufs[me].byte_count, "[",
+                getBackendName(), "]: allgather output slot for this rank (",
+                output_bufs[me].byte_count,
+                " bytes) must match this rank's input (", input_buf.byte_count,
+                " bytes)");
+
+    // The input is SENT every round — it must be fully written before the DMA
+    // reads it (A5).
+    order_after_caller_stream(input);
+
+    // Self-leg: this rank's own slot is a whole-tensor copy of input
+    // (layout-safe, same shape). Fence so it lands before the caller reads
+    // outs.
+    if (input_buf.byte_count > 0) {
+      outs[me].copy_(input);
+      order_after_caller_stream(outs[me]);
+    }
+
+    std::unique_ptr<spyre_comms::WorkSchedule> last_ws;
+    for (int r = 0; r < world; ++r) {
+      const int p = ((r - me) % world + world) % world;
+      if (p == me) {
+        continue;  // own slot handled by the self-leg copy above
+      }
+      auto ws = exchange_uneven(input_buf, output_bufs[p], p, r);
+      if (ws) {
+        last_ws = std::move(ws);
+      }
+    }
+
     seq_.fetch_add(1, std::memory_order_relaxed);
-    return enqueue_async(OpType::ALLGATHER, input_buf, std::move(output_bufs),
-                         torch_spyre::distributed::CollectiveParams{},
-                         caller_stream, std::move(hold), outputTensors[0]);
+    std::vector<at::Tensor> hold = outs;
+    hold.push_back(input);
+    if (!last_ws) {
+      // Degenerate: no cross-rank bytes moved (every rank contributes 0). The
+      // self copy already produced the result; synthesize a completed Work so
+      // the Future/wait path is well-formed (mirrors alltoall_base).
+      spyre_comms::BufferDesc self_b = prepare_buffer_desc(outs[me]);
+      last_ws = group_context_->device_copy(self_b, self_b);
+      last_ws->SetStreamAffinity(comm_stream_);
+      last_ws->start();
+      last_ws->wait();
+    }
+    return c10::make_intrusive<SpyreCCLWork>(
+        OpType::ALLGATHER, std::move(last_ws), std::move(hold), outs,
+        op_timeout_);
   }
   catch (const std::exception& e) {
     report_and_abort(std::string("allgather: ") + e.what());
@@ -1189,11 +1409,144 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
   }
 }
 
+// Reduce-scatter as a pairwise sendrecv shuffle with on-device accumulation
+// (docs/design/allgatherv-reducescatterv-design.md). Context::reduce is avoided
+// entirely: it is host-staged (D2H all -> CPU sum -> H2D, the async-free path
+// behind the earlier allreduce UAF) and each non-root SEND is exposed to the
+// same one-directional credit throw as broadcast. Instead, round r pairs this
+// rank with peer p = ((r - me) % world + world) % world; this rank SENDS its
+// chunk destined for p (input_list[p], sizes[p] bytes) and RECEIVES p's chunk
+// destined for this rank (sizes[me] bytes) into a scratch, then accumulates it
+// on-device into an output seeded from this rank's own chunk (input_list[me]).
+// Every transfer is a balanced-or-under-credit sub-leg (exchange_uneven), so
+// the credit guard never fires; the single reused scratch is allocated once (no
+// per-round alloc/free, no UAF class). All ranks iterate r = 0..world-1 in the
+// same order (deterministic cross-rank launch order); sequential rounds are
+// deadlock-free by construction. This is not yet a ring/recursive-halving
+// reduce-scatter (that is follow-up for NCCL-competitive performance) but it is
+// correct, credit-safe, and never touches the host-reduce path.
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce_scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const ReduceScatterOptions& opts) {
-  throw SpyreCCLNotSupportedException(getBackendName(), __func__);
+  abort_guard("reduce_scatter");
+  try {
+    const int world = static_cast<int>(group_context_->getSize());
+    const int me = static_cast<int>(group_context_->getRank());
+
+    TORCH_CHECK(static_cast<int>(outputTensors.size()) == 1, "[",
+                getBackendName(),
+                "]: reduce_scatter expects exactly 1 output tensor; got ",
+                outputTensors.size());
+    TORCH_CHECK(static_cast<int>(inputTensors.size()) == 1, "[",
+                getBackendName(),
+                "]: reduce_scatter expects exactly 1 input list; got ",
+                inputTensors.size());
+
+    at::Tensor& output = outputTensors[0];
+    std::vector<at::Tensor>& ins = inputTensors[0];
+    TORCH_CHECK(static_cast<int>(ins.size()) == world, "[", getBackendName(),
+                "]: reduce_scatter input list must have length world_size (",
+                world, "); got ", ins.size());
+
+    if (opts.reduceOp != ReduceOp::SUM) {
+      std::string _err_msg = "[" + getBackendName() +
+                             "]: reduce_scatter only supports SUM operation." +
+                             " Actual: " + std::to_string(opts.reduceOp);
+      TORCH_CHECK(false, _err_msg);
+    }
+
+    check_single_tensor(output);
+    for (auto& t : ins) {
+      check_single_tensor(t);
+    }
+
+    spyre_comms::BufferDesc output_buf = prepare_buffer_desc(output);
+
+    // Precompute every chunk descriptor up front.
+    std::vector<spyre_comms::BufferDesc> in_bufs;
+    in_bufs.reserve(world);
+    for (int i = 0; i < world; ++i) {
+      in_bufs.push_back(prepare_buffer_desc(ins[i]));
+    }
+    TORCH_CHECK(output_buf.byte_count == in_bufs[me].byte_count, "[",
+                getBackendName(), "]: reduce_scatter output (",
+                output_buf.byte_count,
+                " bytes) must match this rank's input chunk input_list[", me,
+                "] (", in_bufs[me].byte_count, " bytes)");
+
+    // world == 1: the single rank's own chunk is the result (no reduction).
+    if (world == 1) {
+      order_after_caller_stream(ins[me]);
+      auto ws = group_context_->device_copy(output_buf, in_bufs[me]);
+      ws->SetStreamAffinity(comm_stream_);
+      ws->start();
+      ws->wait();
+      seq_.fetch_add(1, std::memory_order_relaxed);
+      return c10::make_intrusive<SpyreCCLWork>(
+          OpType::REDUCE_SCATTER, std::move(ws),
+          std::vector<at::Tensor>{output, ins[me]},
+          std::vector<at::Tensor>{output}, op_timeout_);
+    }
+
+    // Seed the accumulator (output) with this rank's own contribution to its
+    // own chunk; the copy runs on the caller stream after the inputs' own H2D.
+    // The fence then guarantees BOTH the seed and every input chunk are fully
+    // written before the exchange DMAs read them (A5).
+    output.copy_(ins[me]);
+    order_after_caller_stream(output);
+
+    // One reused scratch for the received peer contribution — this rank always
+    // receives its own chunk's share (sizes[me] bytes) from every peer, so a
+    // single sizes[me]-sized buffer serves all rounds. Allocated once (no
+    // per-round alloc/free), so the free-mid-collective UAF class cannot arise.
+    at::Tensor recv_scratch = at::empty_like(output);
+    spyre_comms::BufferDesc scratch_buf = prepare_buffer_desc(recv_scratch);
+
+    std::unique_ptr<spyre_comms::WorkSchedule> last_ws;
+    for (int r = 0; r < world; ++r) {
+      const int p = ((r - me) % world + world) % world;
+      if (p == me) {
+        continue;  // own chunk already seeded into output
+      }
+      // Send my chunk destined for p (in_bufs[p], sizes[p]); receive p's chunk
+      // destined for me into the scratch (sizes[me]).
+      auto ws = exchange_uneven(in_bufs[p], scratch_buf, p, r);
+      if (ws) {
+        last_ws = std::move(ws);
+      }
+      // Accumulate the received contribution on-device. exchange_uneven already
+      // host-waited, so recv_scratch is fully written before this add reads it;
+      // the fence after ensures the add completes before the next round's recv
+      // reuses the scratch.
+      output.add_(recv_scratch);
+      order_after_caller_stream(output);
+    }
+
+    seq_.fetch_add(1, std::memory_order_relaxed);
+    std::vector<at::Tensor> hold = {output, recv_scratch};
+    hold.insert(hold.end(), ins.begin(), ins.end());
+    if (!last_ws) {
+      // Degenerate: no cross-rank bytes moved (every chunk 0). The seed already
+      // produced the result; synthesize a completed Work so the Future/wait
+      // path is well-formed (mirrors alltoall_base / all_gatherv).
+      last_ws = group_context_->device_copy(output_buf, output_buf);
+      last_ws->SetStreamAffinity(comm_stream_);
+      last_ws->start();
+      last_ws->wait();
+    }
+    return c10::make_intrusive<SpyreCCLWork>(
+        OpType::REDUCE_SCATTER, std::move(last_ws), std::move(hold),
+        std::vector<at::Tensor>{output}, op_timeout_);
+  }
+  catch (const std::exception& e) {
+    report_and_abort(std::string("reduce_scatter: ") + e.what());
+    throw;
+  }
+  catch (...) {
+    report_and_abort("reduce_scatter: unknown error");
+    throw;
+  }
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::scatter(
@@ -1326,8 +1679,7 @@ void SpyreCCLBackend::report_and_abort(const std::string& msg) {
 
   if (store_) {
     try {
-      store_->set(kSpyreCCLErrorStoreKey,
-                  std::to_string(getRank()) + ":" + msg);
+      store_->set(error_store_key_, std::to_string(getRank()) + ":" + msg);
     }
     catch (...) {
       // Best-effort: a failed Store write must not mask the original
@@ -1362,7 +1714,7 @@ void SpyreCCLBackend::watchdog_loop() {
 
     bool peer_failed = false;
     try {
-      peer_failed = store_ && store_->check({kSpyreCCLErrorStoreKey});
+      peer_failed = store_ && store_->check({error_store_key_});
     }
     catch (...) {
       // Transient Store errors (e.g. during teardown) are not actionable
@@ -1373,7 +1725,7 @@ void SpyreCCLBackend::watchdog_loop() {
       std::string detail =
           "(peer failure detected, but could not read detail from Store)";
       try {
-        detail = store_->get_to_str(kSpyreCCLErrorStoreKey);
+        detail = store_->get_to_str(error_store_key_);
       }
       catch (...) {
         // Keep the fallback message above.
@@ -1540,8 +1892,7 @@ bool SpyreCCLWork::isCompleted() {
 bool SpyreCCLWork::isSuccess() const {
   if (state_) {
     std::lock_guard<std::mutex> lk(state_->m);
-    return state_->state !=
-           torch_spyre::distributed::ProgressState::DONE_ERROR;
+    return state_->state != torch_spyre::distributed::ProgressState::DONE_ERROR;
   }
   if (!work_schedule_) return true;
   return work_schedule_->getState() !=
