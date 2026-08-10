@@ -20,6 +20,46 @@ Debug-oriented variables (`TORCH_SPYRE_DEBUG`, `TORCH_COMPILE_DEBUG`,
 | `TORCH_LOGS="+inductor"` | Verbose PyTorch Inductor logging |
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress `int64 → int32` downcast warnings |
 
+### Programmatic Configuration
+
+For log levels not supported by `TORCH_LOGS` (WARNING, CRITICAL, DISABLED), use the
+programmatic API:
+
+```python
+from torch_spyre import logging_config
+
+# Set any log level programmatically
+logging_config.set_log_level('spyre.inductor', 'CRITICAL')
+logging_config.set_log_level('spyre.runtime', 'WARNING')
+logging_config.disable('spyre.execution')  # DISABLED level
+
+# Convenience functions
+logging_config.enable('spyre.inductor')   # INFO level
+```
+
+**Per-pass DEBUG logging** requires setting both the log level and pass filter:
+
+```python
+from torch_spyre import logging_config
+
+# Enable DEBUG level for passes
+logging_config.set_log_level('spyre.inductor.passes', 'DEBUG')
+
+# Configure which passes to log
+logging_config.set_log_passes('all')                              # All passes
+logging_config.set_log_passes('split_multi_ops,insert_restickify') # Specific passes
+logging_config.set_log_passes('')                                  # Disable
+
+# Query current configuration
+level = logging_config.get_log_level('spyre.inductor.passes')
+log_passes = logging_config.get_log_passes()
+```
+
+Available levels: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`, `DISABLED`
+
+**Note:** Use internal `spyre.*` namespace in programmatic calls, not `torch_spyre.*`.
+The `torch_spyre.*` namespace is only for the `TORCH_LOGS` environment variable.
+
 ## Compiler configuration
 
 | Variable | Effect |

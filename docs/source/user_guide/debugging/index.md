@@ -62,6 +62,26 @@ The following environment variables control the level of diagnostic output:
 | `TORCH_SPYRE_DOWNCAST_WARN=0` | Suppress int64→int32 warnings |
 | `TORCH_LOGS="+inductor"` | PyTorch provided tool to selectively enable Inductor or other parts of the `torch.compile` to the log |
 
+### Programmatic Logging Control
+
+For log levels not supported by `TORCH_LOGS` (WARNING, CRITICAL, DISABLED) or
+for runtime control, use the programmatic API:
+
+```python
+from torch_spyre import logging_config
+
+# Set specific log levels
+logging_config.set_log_level('spyre.inductor', 'WARNING')
+logging_config.set_log_level('spyre.runtime', 'CRITICAL')
+
+# Per-pass DEBUG logging (for compiler pipeline debugging)
+logging_config.set_log_level('spyre.inductor.passes', 'DEBUG')
+logging_config.set_log_passes('all')  # or specific passes
+```
+
+See [Programmatic Configuration](../profiling/environment_variables.md#programmatic-configuration)
+for complete API documentation.
+
 Run your reproducer with all three enabled:
 
 ```bash

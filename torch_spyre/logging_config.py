@@ -420,6 +420,52 @@ def disable(component: str):
     set_log_level(component, "DISABLED")
 
 
+def set_log_passes(pass_names: str):
+    """Enable per-pass logging for compiler pipelines.
+
+    Controls which compiler passes emit DEBUG-level output after execution.
+    This is required in addition to setting the logger level to DEBUG for
+    the spyre.inductor.passes component.
+
+    Args:
+        pass_names: One of:
+            - "all" or "1": Log after every pass
+            - Comma-separated list of pass names (e.g., "split_multi_ops,insert_restickify")
+            - "" (empty): Disable per-pass logging
+
+    Example:
+        >>> from torch_spyre import logging_config
+        >>> # Enable DEBUG logging for passes
+        >>> logging_config.set_log_level('spyre.inductor.passes', 'DEBUG')
+        >>> # Enable all passes to emit DEBUG output
+        >>> logging_config.set_log_passes('all')
+
+        >>> # Or enable only specific passes
+        >>> logging_config.set_log_passes('split_multi_ops,insert_restickify')
+
+    Note:
+        This is an inductor-specific configuration that controls the
+        ``_should_log_pass`` check in ``torch_spyre._inductor.passes``.
+        It complements the standard log level configuration.
+    """
+    # Import here to avoid circular dependency at module load time
+    from torch_spyre._inductor import config
+
+    config.log_passes = pass_names
+
+
+def get_log_passes() -> str:
+    """Get the current per-pass logging configuration.
+
+    Returns:
+        Current value of log_passes (e.g., "all", "split_multi_ops", or "")
+    """
+    # Import here to avoid circular dependency at module load time
+    from torch_spyre._inductor import config
+
+    return config.log_passes
+
+
 def get_log_file() -> Optional[str]:
     """Get the configured log file path, if any."""
     if not _initialized:
