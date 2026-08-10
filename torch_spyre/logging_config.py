@@ -100,13 +100,14 @@ def _normalize_component(component: str) -> str:
 def _parse_torch_logs() -> Dict[str, LogLevel]:
     """Parse TORCH_LOGS environment variable for spyre namespaces.
 
-    Supported formats (the ``torch_spyre.*`` spelling is preferred because it
-    is the only one torch's own validator accepts; it is normalized onto the
-    internal ``spyre.*`` namespace):
-    - TORCH_LOGS="torch_spyre.inductor:DEBUG"
-    - TORCH_LOGS="+torch_spyre.inductor"  (enables at INFO)
-    - TORCH_LOGS="-torch_spyre.inductor"  (disables)
-    - TORCH_LOGS="torch_spyre:INFO,torch_spyre.inductor:DEBUG"
+    Matches PyTorch's TORCH_LOGS syntax exactly:
+    - TORCH_LOGS="+torch_spyre.inductor"  (enables at DEBUG)
+    - TORCH_LOGS="torch_spyre.inductor"   (enables at INFO, no prefix)
+    - TORCH_LOGS="-torch_spyre.inductor"  (sets to ERROR)
+
+    The ``torch_spyre.*`` spelling is required because PyTorch validates
+    with importlib.util.find_spec(), which only accepts real packages.
+    It is normalized onto the internal ``spyre.*`` namespace.
 
     Returns:
         Dictionary mapping component names to log levels
@@ -125,27 +126,19 @@ def _parse_torch_logs() -> Dict[str, LogLevel]:
         if entry.startswith("+"):
             component = _normalize_component(entry[1:])
             if component.startswith("spyre"):
-                config[component] = LogLevel.INFO
+                config[component] = LogLevel.DEBUG
                 _config_source[component] = "TORCH_LOGS"
         elif entry.startswith("-"):
             component = _normalize_component(entry[1:])
             if component.startswith("spyre"):
-                config[component] = LogLevel.DISABLED
+                config[component] = LogLevel.ERROR
                 _config_source[component] = "TORCH_LOGS"
-        elif ":" in entry:
-            component, level_str = entry.split(":", 1)
-            component = _normalize_component(component.strip())
-            level_str = level_str.strip()
+        else:
+            # No prefix = INFO level (matches PyTorch behavior)
+            component = _normalize_component(entry)
             if component.startswith("spyre"):
-                try:
-                    level = getattr(LogLevel, level_str.upper())
-                    config[component] = level
-                    _config_source[component] = "TORCH_LOGS"
-                except AttributeError:
-                    warnings.warn(
-                        f"Invalid log level '{level_str}' for {component}",
-                        stacklevel=3,
-                    )
+                config[component] = LogLevel.INFO
+                _config_source[component] = "TORCH_LOGS"
 
     return config
 
