@@ -82,6 +82,65 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         torch.testing.assert_close(out[1:2], torch.full((1, 64), -1.0, dtype=DTYPE))
         torch.testing.assert_close(out[3:4], torch.full((1, 64), -1.0, dtype=DTYPE))
 
+    def test_wide_row_slice_multi_stick(self):
+        """dim-0 (row) narrow of a WIDE tensor (>1 stick per row).
+
+        Regression for the compile-crash sibling of issue #3264:
+        ``narrow(0, 2, 2)`` of an [8, 4096] fp16 tensor (4096 = 64 sticks/row)
+        reaches codegen as a [2, 4096] VIEW whose interior device dim extent
+        already equals the iteration size, so superdsc's
+        ``dev_dim_size > it_dim_size`` gate never fired and the re-injected flat
+        storage_offset (flat 2*4096=8192) never landed as a per-dim offset. The
+        interior coordinate ``d0 + 2`` then addressed a tile outside the trimmed
+        dim, aborting the dxp_standalone compile with "There must be at least
+        one valid candidate" (L3DlOpsScheduler.cpp:1075). VALUE-checked, not
+        just non-crash: rows [2:4) must match the source rows."""
+        x = torch.arange(8 * 4096, dtype=DTYPE, device=DEVICE).reshape(8, 4096)
+        out = x.narrow(0, 2, 2).clone()  # rows [2:4), each spanning 64 sticks
+        torch.testing.assert_close(out.cpu(), x.cpu()[2:4])
+
+    def test_wide_row_slice_multi_stick_offsets(self):
+        """dim-0 narrow of a WIDE tensor at multiple nonzero offsets.
+
+        Companion to test_wide_row_slice_multi_stick that exercises the
+        offsets the first fix attempt missed (off=4 and off=6). The
+        allreduce_2d_compose path stacks SRC clones at off=4/6, so a
+        single-offset test did not cover it. The proven
+        ``dev_dim_size > it_dim_size`` gate (superdsc.py) must bake the
+        per-dim device offset (off * 64 device-memory stride) for each. The
+        SRC arg carries the PARENT interior device extent (8), inherited
+        unchanged from the [8,4096] parent through the eager view, so the
+        gate fires for every offset. VALUE-checked."""
+        x = torch.arange(8 * 4096, dtype=DTYPE, device=DEVICE).reshape(8, 4096)
+        for off in (4, 6):
+            out = x.narrow(0, off, 2).clone()
+            torch.testing.assert_close(
+                out.cpu(),
+                x.cpu()[off : off + 2],
+                msg=f"wide row slice off={off}",
+            )
+
+    def test_wide_narrowed_dst_multi_stick(self):
+        """Write a wide multi-stick block into a narrowed-DST slice.
+
+        The reassembly step of allreduce_2d_compose does
+        ``tensor.narrow(0, k, len).copy_(block)`` where both operands span
+        >1 stick per row. This exercises the DST side of copy_from_d2d with a
+        nonzero dst_off on a wide tensor: a [2,4096] block is written into
+        rows [4:6) of an [8,4096] tensor. Rows outside [4:6) must be
+        untouched. VALUE-checked."""
+        dst = torch.full((8, 4096), -1.0, dtype=DTYPE, device=DEVICE)
+        block = torch.arange(2 * 4096, dtype=DTYPE, device=DEVICE).reshape(2, 4096)
+        dst.narrow(0, 4, 2).copy_(block)
+        out = dst.cpu()
+        torch.testing.assert_close(out[4:6], block.cpu())
+        torch.testing.assert_close(
+            out[0:4], torch.full((4, 4096), -1.0, dtype=DTYPE)
+        )
+        torch.testing.assert_close(
+            out[6:8], torch.full((2, 4096), -1.0, dtype=DTYPE)
+        )
+
     @unittest.expectedFailure
     def test_column_slice_inner_offset(self):
         """Offset along the last (stick) dim: narrow columns at an offset.

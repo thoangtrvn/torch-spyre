@@ -45,6 +45,7 @@ from .pass_utils import (
     splits_by_index_coeff,
     apply_splits_from_index_coeff,
 )
+from collections.abc import Iterable
 from typing import Callable
 
 from .logging_utils import get_inductor_logger
@@ -105,12 +106,43 @@ def _most_splittable_dim(
     return (best_dim, best_split) if best_split > 1 else None
 
 
+def coordinate_mask_blocked_vars(
+    reduction_vars: Iterable[Symbol],
+    stick_vars: dict[Symbol, int],
+    it_space: dict[Symbol, Expr],
+) -> set[Symbol]:
+    """Return reduction stick vars that cannot be split across cores (PR #3340).
+
+    The backend compiler cannot apply coordinate masking to a dimension spread
+    over cores (ddc ddcv1.cpp:3433), and masking is applied to a dim that is
+    padded, reduced, and the stick dim -- mirrors ``_get_coordinate_mask`` in
+    codegen/superdsc.py. A stick var is guaranteed non-symbolic, so its element
+    count concretizes; it is padded iff not stick-aligned (element count not a
+    multiple of elems_per_stick).
+
+    ``it_space`` must be the element-valued iteration space (not the
+    stick-adjusted copy), since padding is defined on element counts.
+    ``stick_vars`` maps each stick var to its elems_per_stick (as returned by
+    ``adjust_it_space_for_sticks``).
+
+    Both work-division paths consult this: the greedy ``_default_split`` drops
+    these from its reduction candidates, and every split path refuses to commit
+    a split > 1 on one of them.
+    """
+    return {
+        v
+        for v in reduction_vars
+        if v in stick_vars and concretize_expr(it_space[v]) % stick_vars[v] != 0
+    }
+
+
 def multi_dim_iteration_space_split(
     iteration_space: dict[Symbol, Expr],
     max_cores: int,
     output_dims: list[Symbol],
     reduction_dims: list[Symbol],
     min_splits: dict[Symbol, int] | None = None,
+    blocked: set[Symbol] | None = None,
 ) -> dict[Symbol, int]:
     """Distribute max_cores across the iteration space.
 
@@ -120,8 +152,16 @@ def multi_dim_iteration_space_split(
       3. If this is a reduction op, pick the single most-splittable reduction dim
          for any remaining cores.
 
+    Vars in ``blocked`` (coordinate-masked dims, see
+    ``coordinate_mask_blocked_vars``) are never assigned a split > 1: the
+    backend compiler cannot spread such a dim over cores.
+
     The product of all splits will be <= max_cores.
     """
+    blocked = blocked or set()
+    # A blocked var must never be core-split: drop it from every candidate list.
+    output_dims = [v for v in output_dims if v not in blocked]
+    reduction_dims = [v for v in reduction_dims if v not in blocked]
     is_reduction_included = bool(reduction_dims)
 
     splits = {v: 1 for v in iteration_space.keys()}
@@ -522,7 +562,22 @@ def span_reduction_pass(
     )
 
     coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
-    reduction_vars_to_split = set(min_splits) - coord_vars
+
+    # Never core-split a coordinate-masked dim (#3340): the backend compiler
+    # can't apply coordinate masking to a dim spread over cores. span_reduction
+    # only splits to satisfy the 256MB span limit; if a blocked dim were the
+    # only lever the compile would fail anyway, so dropping it here is safe.
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+    dropped = [v for v in min_splits if v in blocked and min_splits[v] > 1]
+    for v in dropped:
+        logger.debug(
+            f"span_reduction {op.get_name()}: dropping split on backend-blocked "
+            f"var {v} (coordinate-masked)"
+        )
+        min_splits[v] = 1
+
+    reduction_vars_to_split = {v for v in min_splits if min_splits[v] > 1} - coord_vars
     # Each entry in Reduction.reduction_ranges maps to at most one Symbol via
     # index_vars_squeeze (size-1 entries are squeezed away). So len > 1 means
     # genuinely distinct reduction dimensions, not multiple symbols from one dim.
@@ -550,12 +605,19 @@ def _default_split(
     output_td: TensorDep,
     committed_splits: dict[Symbol, int],
     max_cores: int,
+    blocked: set[Symbol] | None = None,
 ) -> tuple[dict[Symbol, int], list[Symbol], list[Symbol]]:
     """Distribute max_cores by priority on top of span_reduction's commits.
 
     Returns the chosen splits and the (output, reduction) priority dims the
     caller logs. Shared by work_distribution_pass and cost_model_matmul_division.
+
+    ``blocked`` is ``coordinate_mask_blocked_vars`` (#3340: padded reduction
+    stick dims). The backend compiler can't spread these over cores, so we drop
+    them from both the reduction candidates here and (defensively) inside
+    ``multi_dim_iteration_space_split``.
     """
+    blocked = blocked or set()
     # TODO: The final dim committed by span_reduction_pass holds the minimum
     #       split that gets the span under the limit, so it may have headroom
     #       for additional parallelism (outer dims committed before it are
@@ -573,6 +635,11 @@ def _default_split(
     if any(v not in coord_vars for v in committed_splits):
         reduction_dims = []
 
+    # Drop dims the backend compiler can't split across cores (coordinate-
+    # masked, #3340) before the greedy distributor commits them.
+    reduction_dims = [v for v in reduction_dims if v not in blocked]
+    output_dims = [v for v in output_dims if v not in blocked]
+
     # Pass max_cores, not remaining_cores: multi_dim_iteration_space_split
     # accounts for committed_splits in its first pass, consuming those cores
     # itself before distributing the rest by priority.
@@ -582,6 +649,7 @@ def _default_split(
         output_dims,
         reduction_dims,
         committed_splits,
+        blocked,
     )
     return splits, output_dims, reduction_dims
 
@@ -600,7 +668,7 @@ def work_distribution_pass(
     input_tds, output_td = collect_tensor_deps(op, args)
     all_tds = input_tds + [output_td]
 
-    it_space_adjusted, _ = adjust_it_space_for_sticks(it_space, all_tds)
+    it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
 
     # Recover splits committed by span_reduction_pass using the same
     # coeff-keyed encoding that codegen uses — stable across passes.
@@ -618,8 +686,14 @@ def work_distribution_pass(
     # dims with actual committed splits so they don't overlap with priorities.
     committed_splits = {s: v for s, v in min_splits.items() if v > 1}
 
+    # #3340: never core-split a padded reduction stick dim -- the backend
+    # compiler can't apply coordinate masking to a dim spread over cores.
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+
     splits, output_dims, reduction_dims = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores
+        it_space_adjusted, output_td, committed_splits, max_cores, blocked
     )
 
     apply_splits(op, splits, output_td)
@@ -944,8 +1018,12 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
     else:
         committed_splits = {}
 
+    coord_vars = {v for e in output_td.device_coords[:-1] for v in e.free_symbols}
+    reduction_vars = [v for v in it_space_adjusted if v not in coord_vars]
+    blocked = coordinate_mask_blocked_vars(reduction_vars, stick_vars, it_space)
+
     default_splits, _, _ = _default_split(
-        it_space_adjusted, output_td, committed_splits, max_cores
+        it_space_adjusted, output_td, committed_splits, max_cores, blocked
     )
     splits = _cost_model_matmul_planner(
         op,

@@ -524,7 +524,20 @@ def align_tensors(
 
             # distribute work division for old var to new vars
             for v in reversed(remap[var]):
-                new_op_it_space_splits[v] = math.gcd(div, new_var_ranges[v])
+                # Re-intersect the committed split against the basis work
+                # division used for this var (PR #3340). Work division commits a
+                # stick (last) dim's core count against the *stick* count
+                # (adjust_it_space_for_sticks), so the element range would drop a
+                # legal split when the element size is coprime with it
+                # (e.g. gcd(2, 67) == 1), silently collapsing the split to one
+                # core and corrupting every element past the first stick.
+                if v == var and v in stick_dim:
+                    eps = int(stick_size[stick_dim.index(v)])
+                    basis = (int(new_var_ranges[v]) + eps - 1) // eps  # stick count
+                else:
+                    # Non-stick var (or synthetic sub-dim): element range.
+                    basis = new_var_ranges[v]
+                new_op_it_space_splits[v] = math.gcd(div, basis)
                 div //= new_op_it_space_splits[v]
         else:
             # no splits keep existing var, range, and work division
