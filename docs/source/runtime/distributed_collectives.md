@@ -66,14 +66,29 @@ Measured TP=4, fp16, p50 (`bench_allreduce_2d.sh`):
 | `[512,4096]` | ~19000 |
 | `[2048,4096]` | ~59000 |
 
-**Known bottleneck — a ~4.5ms fixed per-op floor.** Even an 8 KB decode
-`all_reduce` costs ~4.5ms, so latency at small/decode sizes is dominated by
-fixed per-collective overhead (per-call OOB address re-exchange + wireup +
-synchronous `start()`/`wait()` on the single comm stream), not the reduction
-itself. For TP inference (2 reduces/layer) this floor — not bandwidth — is the
-dominant cost. Eliminating it (address-exchange caching across stable-buffer
-steps + async overlap) is a tracked follow-up; use `SPYRE_COMMS_TIMING=1` and
-`prof_allreduce_floor.sh` to attribute the build-vs-execute split.
+### Known bottlenecks (attributed via `prof_allreduce_floor.sh`, TP=4)
+
+Two distinct scaling issues, both tracked follow-ups (neither affects
+correctness). Steady-state p50 at TP=4:
+
+| shape | total | build (construct+convert) | execute (start/wait) |
+|-------|-------|---------------------------|----------------------|
+| `[1,4096]` 8 KB decode | ~5.3ms | ~0.85ms (0.38+0.44) | **~4.5ms (84%)** |
+| `[2048,4096]` 16 MB | ~14.6ms | ~8.1ms (0.40+**7.6**) | ~6.5ms |
+
+1. **Small/decode — `start()`/`wait()` dominates (~4.5ms, 84%).** Build is only
+   ~0.85ms, so the decode floor is the synchronous DMA launch + completion on
+   the single comm stream, NOT address exchange. Fix: **async overlap of the
+   DMA path** (async-start redesign).
+2. **Large/prefill — `convert()` (OOB address-exchange + schedule build)
+   dominates (~7.6ms).** This is a real per-size cost that scales with chunk
+   count, separate from the one-time add-kernel JIT compile (which is now cached
+   via `SPYRE_COMMS_KERNEL_JIT=1`; the first-call ~400ms was that compile). Fix:
+   **cache the address exchange across steps** with stable buffers (decode/
+   prefill reuse the same activation buffers every iteration).
+
+Attribute with `SPYRE_COMMS_TIMING=1` (prints `construct_us`/`convert_us`/
+`build_us` per call) and `prof_allreduce_floor.sh` (build-vs-execute split).
 
 ## Test / bench tooling
 
