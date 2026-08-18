@@ -103,9 +103,8 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
         """dim-0 narrow of a WIDE tensor at multiple nonzero offsets.
 
         Companion to test_wide_row_slice_multi_stick that exercises the
-        offsets the first fix attempt missed (off=4 and off=6). The
-        allreduce_2d_compose path stacks SRC clones at off=4/6, so a
-        single-offset test did not cover it. The proven
+        offsets a single-offset test misses (off=4 and off=6), e.g. a
+        dim-0-chunked collective that clones several row-slices. The proven
         ``dev_dim_size > it_dim_size`` gate (superdsc.py) must bake the
         per-dim device offset (off * 64 device-memory stride) for each. The
         SRC arg carries the PARENT interior device extent (8), inherited
@@ -123,7 +122,7 @@ class TestCopyFromD2DContiguousOffsets(unittest.TestCase):
     def test_wide_narrowed_dst_multi_stick(self):
         """Write a wide multi-stick block into a narrowed-DST slice.
 
-        The reassembly step of allreduce_2d_compose does
+        A dim-0-chunked reassembly does
         ``tensor.narrow(0, k, len).copy_(block)`` where both operands span
         >1 stick per row. This exercises the DST side of copy_from_d2d with a
         nonzero dst_off on a wide tensor: a [2,4096] block is written into

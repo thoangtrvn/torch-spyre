@@ -15,25 +15,22 @@
 """Correctness regression for 2-D [tokens, hidden] all_reduce(SUM) on the Spyre
 CCL backend -- the tensor-parallel activation reduce.
 
-A >=2-D all_reduce routes through SpyreCCLBackend::allreduce_2d_compose, which
-has two HW-verified paths (chunked reduce_scatter+all_gather by default;
-whole-tensor all_gather+on-device-sum when SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1,
-and always for tokens<world). This test pins that BOTH paths reduce fully and
-correctly across:
+A >=2-D all_reduce takes the same native LIBCOLL Ring path as 1-D
+(SpyreCCLBackend::allreduce -> enqueue_async -> ctx.allreduce). This test pins
+that it reduces fully and correctly across:
   * even token split       [8, 4096]  (tokens % world == 0 at world 2/4)
   * uneven token split     [6, 4096]  (tokens % world != 0 at world 4)
-  * decode / tokens<world  [1, 4096]  (forces the whole-tensor path)
+  * decode / tokens<world  [1, 4096]
   * larger prefill         [32, 4096]
 on the WORLD group and, at world_size>=2, on a [0,1] subgroup.
 
 Historically this shape SILENTLY under-reduced at 4 ranks (only numel/ROWS
 elements summed) and later CRASHED at compile ("no valid candidate"); both were
-the transposed torch.ones layout, fixed by the aten::ones/aten::full kernels.
-This test guards against regression of that fix.
+the transposed torch.ones layout, fixed by registering the aten::ones/
+aten::full kernels (torch_spyre/ops/eager.py). This test guards that fix.
 
 Run (needs Spyre hardware + torchrun), from torch-spyre/tests/distributed/:
     torchrun --nproc-per-node 4 -m pytest test_allreduce_2d.py -v -m "not upstream"
-    SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1 torchrun --nproc-per-node 4 -m pytest test_allreduce_2d.py -v
 """
 
 import os
