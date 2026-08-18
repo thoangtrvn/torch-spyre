@@ -971,7 +971,12 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_2d_compose(
   const char* wt_env = std::getenv("SPYRE_ALLREDUCE_2D_WHOLE_TENSOR");
   const bool use_whole_tensor =
       wt_env != nullptr && std::atoi(wt_env) != 0;
-  if (use_whole_tensor) {
+  // tokens < world (e.g. decode, tokens==1): dim-0 chunking is impossible
+  // (base = tokens/world == 0 -> empty chunks), so ALWAYS use the whole-tensor
+  // path here regardless of the env default. It is correct for any token count
+  // by construction (no chunking). This subsumes the decode fallback.
+  const int world = static_cast<int>(group_context_->getSize());
+  if (use_whole_tensor || tensor.size(0) < world) {
     return allreduce_2d_whole_tensor(tensor, opts);
   }
   return allreduce_2d_chunked(tensor, opts);
