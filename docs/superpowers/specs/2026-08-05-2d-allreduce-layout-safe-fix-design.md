@@ -1,6 +1,33 @@
 # 2-D all_reduce layout-safe fix + reduce_scatter/subgroup un-park — Design
 
-**Status:** Approved design (brainstorming complete); ready for implementation plan.
+> **SUPERSEDED — ACTUAL RESOLUTION (2026-08-18).** This design's premise (that
+> the LIBCOLL Ring reduce-scatter under-reduces a stickified 2-D tensor and must
+> be replaced by a layout-safe pairwise compose) was WRONG. Implementation
+> proved the under-reduce was caused by torch-spyre lacking `aten::ones`/
+> `aten::full` kernels: `torch.ones([tokens,hidden])` (used to build the test/
+> collective buffers) got a TRANSPOSED stickified layout, and every downstream
+> crash/under-reduce was a symptom of that.
+>
+> **What actually shipped:**
+> 1. Register `aten::ones`/`aten::full` (`torch_spyre/ops/eager.py`) so they
+>    build via `torch.empty`+fill and get the normal layout — THE fix.
+> 2. With that, the NATIVE LIBCOLL Ring path (`ctx.allreduce`) reduces 2-D
+>    correctly (HW-verified 4 ranks: even/uneven/decode/prefill + subgroup), so
+>    2-D takes the SAME path as 1-D. The pairwise reduce_scatter+all_gather
+>    compose that this design proposed was implemented, then REMOVED as
+>    unnecessary.
+> 3. Kept the reference-faithful #3340 work-division hardening
+>    (`coordinate_mask_blocked_vars` + `align_tensors` stick-count gcd).
+> 4. Task-1's reduce_scatter/exchange_uneven/subgroup un-park stayed (useful
+>    first-class collectives), independent of the allreduce fix.
+>
+> **Perf follow-up (not a correctness issue):** a ~4.5ms FIXED per-op latency
+> floor dominates (see `docs/issues/` and the memory
+> `spyre-allreduce-per-op-latency-floor`). See `docs/issues/`
+> `2d-allreduce-restickify-split-and-pivot.md` for the full investigation
+> history. The design below is retained as the record of the (superseded) plan.
+
+**Status:** SUPERSEDED (see resolution above). Original: Approved design.
 **Date:** 2026-08-05
 **Branch:** `phase-1-overlap-communicate-compute` (same branch as the closed async Phase-1 work, per prior user decision to land both together).
 
