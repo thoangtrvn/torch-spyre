@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -908,6 +909,15 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
         static_cast<size_t>(world_sz) * kStickBytes,
         " (>= 1 stick of 128 bytes per rank).");
 
+    // Layout-safe ≥2-D path: the flat-byte Ring reduce-scatter under-reduces a
+    // stickified ≥2-D tensor (a linear byte chunk straddles sticks of
+    // interleaved rows). Compose from reduce_scatter+all_gather over whole
+    // per-rank chunk tensors instead. 1-D stays on the (correct) enqueue path.
+    const int world_sz2 = static_cast<int>(group_context_->getSize());
+    if (world_sz2 > 1 && tensors[0].dim() >= 2) {
+      return allreduce_2d_compose(tensors[0], opts);
+    }
+
     auto caller_stream = spyre::getCurrentStream(tensors[0].device());
     // Collective op: every rank in the group issues this, so seq_ stays in
     // sync across ranks.
@@ -925,6 +935,176 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     report_and_abort("allreduce: unknown error");
     throw;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 2-D all_reduce(SUM) compose: dispatcher.
+//
+// Both implementations are HW-verified correct at 4 ranks (2-D [8,4096] fp16
+// FULL reduction). The original crashes were NOT caused by chunking / narrow /
+// clone -- they were caused by torch.ones([tokens,hidden]) getting a TRANSPOSED
+// SpyreTensorLayout because torch-spyre lacked aten::ones/aten::full kernels;
+// once those are registered (torch_spyre/ops/eager.py) both paths compile and
+// reduce correctly. See docs/issues/2d-allreduce-restickify-split-and-pivot.md.
+//
+// TWO IMPLEMENTATIONS:
+//   * chunked (DEFAULT): reduce_scatter + all_gather over per-rank dim-0
+//     chunks. Bandwidth-optimal (~2*S*(N-1)/N bytes/rank).
+//   * whole_tensor (FALLBACK, SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1): every rank
+//     all_gathers all N WHOLE [tokens,hidden] tensors and sums on-device.
+//     Correct-by-construction (no narrow/clone) but moves ~(N-1)*S bytes/rank
+//     (~2x at N=4, ~4x at N=8) and holds all N tensors resident. Retained as a
+//     safe escape hatch should the chunked path regress on some shape.
+// ---------------------------------------------------------------------------
+c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_2d_compose(
+    at::Tensor& tensor, const AllreduceOptions& opts) {
+  // DEFAULT = chunked (bandwidth-optimal reduce_scatter + all_gather). Both
+  // paths are HW-verified correct at 4 ranks once the aten::ones/aten::full
+  // layout fix landed (the transposed torch.ones layout, not chunking, was the
+  // original crash trigger -- see torch_spyre/ops/eager.py and
+  // docs/issues/2d-allreduce-restickify-split-and-pivot.md).
+  //
+  // SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1 selects the whole-tensor all_gather +
+  // on-device sum FALLBACK: correct-by-construction (no narrow/clone) but moves
+  // ~world*bytes (~2x-4x). Retained as a safe escape hatch should the chunked
+  // path regress on some shape.
+  const char* wt_env = std::getenv("SPYRE_ALLREDUCE_2D_WHOLE_TENSOR");
+  const bool use_whole_tensor =
+      wt_env != nullptr && std::atoi(wt_env) != 0;
+  if (use_whole_tensor) {
+    return allreduce_2d_whole_tensor(tensor, opts);
+  }
+  return allreduce_2d_chunked(tensor, opts);
+}
+
+// FALLBACK path (SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1): whole-tensor all_gather +
+// on-device sum. No narrow/clone/storage-offset; correct-by-construction and
+// correct for ALL token counts including tokens < world (subsumes the
+// decode fallback). See the trade-off note on allreduce_2d_compose above.
+c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_2d_whole_tensor(
+    at::Tensor& tensor, const AllreduceOptions& opts) {
+  (void)opts;  // SUM already validated by the allreduce() caller
+  const int world = static_cast<int>(group_context_->getSize());
+
+  // Degenerate single-rank group: the tensor is already its own all-reduce.
+  // Synthesize a completed Work so the Future/wait path is well-formed
+  // (mirrors reduce_scatter / all_gatherv degenerate tails).
+  if (world <= 1) {
+    seq_.fetch_add(1, std::memory_order_relaxed);
+    auto ws = group_context_->device_copy(prepare_buffer_desc(tensor),
+                                          prepare_buffer_desc(tensor));
+    ws->SetStreamAffinity(comm_stream_);
+    ws->start();
+    ws->wait();
+    return c10::make_intrusive<SpyreCCLWork>(
+        OpType::ALLREDUCE, std::move(ws),
+        /*hold=*/std::vector<at::Tensor>{tensor},
+        /*result=*/std::vector<at::Tensor>{tensor}, op_timeout_);
+  }
+
+  // ── all_gather every rank's WHOLE contribution ──
+  // world identical [tokens,hidden] slots; this rank's input is the whole
+  // tensor. All slots are the same byte size, so allgather takes its uniform
+  // fast path.
+  std::vector<at::Tensor> ag_slots;
+  ag_slots.reserve(world);
+  for (int i = 0; i < world; ++i) {
+    ag_slots.push_back(at::empty_like(tensor));
+  }
+  std::vector<std::vector<at::Tensor>> ag_out_list = {ag_slots};
+  std::vector<at::Tensor> ag_in_list = {tensor};
+  allgather(ag_out_list, ag_in_list, AllgatherOptions{})->wait();
+
+  // ── on-device reduce: tensor = sum_i ag_slots[i] ──
+  // Whole-tensor copy_/add_ (no sliced/narrowed operand), so the restickify
+  // bug is not hit. allgather host-waited above, so every slot is fully
+  // written before these reads; fence after each op the way reduce_scatter's
+  // accumulation does.
+  order_after_caller_stream(tensor);
+  tensor.copy_(ag_slots[0]);
+  order_after_caller_stream(tensor);
+  for (int i = 1; i < world; ++i) {
+    tensor.add_(ag_slots[i]);
+    order_after_caller_stream(tensor);
+  }
+
+  seq_.fetch_add(1, std::memory_order_relaxed);
+  auto ws = group_context_->device_copy(prepare_buffer_desc(tensor),
+                                        prepare_buffer_desc(tensor));
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  ws->wait();
+  std::vector<at::Tensor> hold = {tensor};
+  hold.insert(hold.end(), ag_slots.begin(), ag_slots.end());
+  return c10::make_intrusive<SpyreCCLWork>(
+      OpType::ALLREDUCE, std::move(ws),
+      /*hold=*/std::move(hold),
+      /*result=*/std::vector<at::Tensor>{tensor}, op_timeout_);
+}
+
+// DEFAULT path: bandwidth-optimal reduce_scatter + all_gather over per-rank
+// dim-0 chunks (narrow(0).clone()). HW-verified correct at 4 ranks once the
+// aten::ones/aten::full layout fix landed (torch_spyre/ops/eager.py) -- the
+// transposed torch.ones layout, not chunking, was the original crash trigger.
+c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_2d_chunked(
+    at::Tensor& tensor, const AllreduceOptions& opts) {
+  (void)opts;  // SUM already validated by the allreduce() caller
+  const int world = static_cast<int>(group_context_->getSize());
+  const int me = static_cast<int>(group_context_->getRank());
+  const int64_t tokens = tensor.size(0);
+  const int64_t base = tokens / world;
+  const int64_t rem = tokens % world;
+
+  // ── chunk dim-0 into `world` whole tensors at the TORCH layer ──
+  // narrow(0)+clone: each chunk is its own freshly-tiled tensor (never a
+  // byte-range slice of the tiled input). Uneven tokens: first `rem` chunks
+  // get one extra row. (This is the narrow().clone() that triggers the
+  // transposing-restickify codegen crash today.)
+  std::vector<at::Tensor> chunks;
+  chunks.reserve(world);
+  int64_t off = 0;
+  for (int i = 0; i < world; ++i) {
+    const int64_t len = base + (i < rem ? 1 : 0);
+    chunks.push_back(tensor.narrow(0, off, len).clone());
+    off += len;
+  }
+
+  // ── reduce_scatter: this rank ends with chunks[me] fully reduced ──
+  std::vector<at::Tensor> rs_out_list = {at::empty_like(chunks[me])};
+  std::vector<std::vector<at::Tensor>> rs_in_list = {chunks};
+  ReduceScatterOptions rs_opts;
+  rs_opts.reduceOp = ReduceOp::SUM;
+  reduce_scatter(rs_out_list, rs_in_list, rs_opts)->wait();
+
+  // ── all_gather: every rank reassembles all `world` reduced chunks ──
+  std::vector<at::Tensor> ag_slots;
+  ag_slots.reserve(world);
+  for (int i = 0; i < world; ++i) {
+    const int64_t len = base + (i < rem ? 1 : 0);
+    ag_slots.push_back(at::empty({len, tensor.size(1)}, tensor.options()));
+  }
+  std::vector<std::vector<at::Tensor>> ag_out_list = {ag_slots};
+  std::vector<at::Tensor> ag_in_list = {rs_out_list[0]};
+  allgather(ag_out_list, ag_in_list, AllgatherOptions{})->wait();
+
+  // ── concat reduced chunks back into the caller's tensor (torch layer) ──
+  off = 0;
+  for (int i = 0; i < world; ++i) {
+    const int64_t len = ag_slots[i].size(0);
+    tensor.narrow(0, off, len).copy_(ag_slots[i]);
+    off += len;
+  }
+
+  seq_.fetch_add(1, std::memory_order_relaxed);
+  auto ws = group_context_->device_copy(prepare_buffer_desc(tensor),
+                                        prepare_buffer_desc(tensor));
+  ws->SetStreamAffinity(comm_stream_);
+  ws->start();
+  ws->wait();
+  return c10::make_intrusive<SpyreCCLWork>(
+      OpType::ALLREDUCE, std::move(ws),
+      /*hold=*/std::vector<at::Tensor>{tensor},
+      /*result=*/std::vector<at::Tensor>{tensor}, op_timeout_);
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce_coalesced(

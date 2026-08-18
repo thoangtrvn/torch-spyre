@@ -265,6 +265,24 @@ class SpyreCCLBackend : public c10d::Backend {
   [[nodiscard]] spyre_comms::BufferDesc prepare_buffer_desc(
       const at::Tensor& input_tensor);
 
+  // Layout-safe all_reduce(SUM) for a ≥2-D tensor. Both paths are HW-verified
+  // correct (the original crashes were the transposed torch.ones layout, fixed
+  // by the aten::ones/aten::full kernels in ops/eager.py -- NOT chunking).
+  // Dispatches on SPYRE_ALLREDUCE_2D_WHOLE_TENSOR: default (unset/0) ->
+  // allreduce_2d_chunked (bandwidth-optimal); =1 -> allreduce_2d_whole_tensor
+  // (correct-by-construction fallback, ~2x-4x bytes). See the note above
+  // allreduce_2d_compose() in spyre_ccl.cpp and
+  // docs/issues/2d-allreduce-restickify-split-and-pivot.md.
+  c10::intrusive_ptr<c10d::Work> allreduce_2d_compose(
+      at::Tensor& tensor, const c10d::AllreduceOptions& opts);
+  // DEFAULT: bandwidth-optimal reduce_scatter + all_gather over dim-0 chunks.
+  c10::intrusive_ptr<c10d::Work> allreduce_2d_chunked(
+      at::Tensor& tensor, const c10d::AllreduceOptions& opts);
+  // FALLBACK (SPYRE_ALLREDUCE_2D_WHOLE_TENSOR=1): whole-tensor all_gather +
+  // on-device sum (no narrow/clone/offset); correct-by-construction.
+  c10::intrusive_ptr<c10d::Work> allreduce_2d_whole_tensor(
+      at::Tensor& tensor, const c10d::AllreduceOptions& opts);
+
   // Build a request wired to this backend and enqueue it onto the process-
   // global async progress worker. Increments inflight_ BEFORE enqueue; the
   // worker's on_terminal hook decrements (release) and notifies inflight_cv_.
