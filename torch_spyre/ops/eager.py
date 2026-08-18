@@ -132,6 +132,53 @@ def spyre__fill_scalar(
     return self
 
 
+# NOTE (layout bug fix): without dedicated aten::ones / aten::full kernels,
+# torch.ones([tokens, hidden]) on spyre falls through to the generic aten path,
+# which assigns a TRANSPOSED/degenerate SpyreTensorLayout -- e.g. ones([8,4096])
+# fp16 gets device_size=[1,4096,64] (stick=dim0/rows) instead of the normal
+# [64,8,64] (stick=dim1). A copy_/pointwise between such a ones-tensor and any
+# normally-laid-out tensor (e.g. an empty_like allgather slot) is then a
+# stick-dim transpose the backend cannot resolve ("no mechanism to resolve stick
+# incompatibility" / deeptools "no valid candidate"). This silently broke 2-D
+# TP all_reduce whose inputs are built with torch.ones. Register ones/full to
+# build via torch.empty (which gets the normal layout) then fill in-place, so
+# the result carries the standard stickified layout. Mirrors the upstream
+# spyre_ones/spyre_full kernels.
+@torch.library.register_kernel("aten::ones", ["spyre"])  # type:ignore
+def spyre__ones(
+    size: list | tuple,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    t = torch.empty(size, dtype=dtype, device=device)  # normal stickified layout
+    t.fill_(1.0)
+    return t
+
+
+@torch.library.register_kernel("aten::full", ["spyre"])  # type:ignore
+def spyre__full(
+    size: list | tuple,
+    fill_value: int | float | bool | complex,
+    *,
+    dtype: torch.dtype | None = None,
+    layout: torch.layout | None = None,
+    device: torch.device | None = None,
+    pin_memory: bool | None = None,
+) -> torch.Tensor:
+    assert layout in (torch.strided, None), f"doesn't support layout={layout}"
+    assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    if isinstance(fill_value, complex):
+        raise TypeError("spyre full does not support complex fill values")
+    t = torch.empty(size, dtype=dtype, device=device)  # normal stickified layout
+    t.fill_(float(fill_value))
+    return t
+
+
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     # "normal_" generates a random tensor, thus copying
