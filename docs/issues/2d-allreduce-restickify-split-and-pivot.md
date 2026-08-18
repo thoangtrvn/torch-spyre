@@ -1,7 +1,23 @@
 # 2-D TP all_reduce: layout-transposing restickify work-division crash, and the whole-tensor pivot
 
-**Status:** collective fixed by pivot (whole-tensor all_gather + on-device sum);
-underlying codegen bug filed as a tracked follow-up (below).
+> **RESOLUTION (2026-08-18) — read this first.** The real root cause was NOT a
+> restickify/work-division/codegen defect. torch-spyre lacked `aten::ones`/
+> `aten::full` kernels, so `torch.ones([tokens,hidden])` (used to build the
+> collective's test buffers) got a TRANSPOSED stickified layout; every crash
+> below was a symptom of that. Fix: register `aten::ones`/`aten::full`
+> (`torch_spyre/ops/eager.py`) so they build via `torch.empty`+fill and get the
+> normal layout. With that fix, the NATIVE LIBCOLL Ring path (`ctx.allreduce`)
+> reduces 2-D correctly at 4 ranks across even/uneven/decode/prefill + subgroup
+> -- HW-verified. So the whole-tensor pivot AND the chunked compose were both
+> REMOVED; 2-D all_reduce now takes the same native Ring path as 1-D, with no
+> special 2-D code, no env guards. The narrow/clone/restickify investigation
+> below is retained as history (all symptoms). See memory
+> `spyre-ones-full-transposed-layout-rootcause`. The genuine per-op latency
+> floor found while benchmarking is tracked separately
+> (`spyre-allreduce-per-op-latency-floor`).
+
+**Status:** RESOLVED by the aten::ones/aten::full layout fix; 2-D uses native
+LIBCOLL Ring (compose + pivot removed). History below.
 **Labels:** bug, inductor, distributed
 **Related:** #3236 (fixed), #3264 (open, stick-dim column narrow), and the
 sibling doc `copy_from_d2d-sliced-2d-tiled-view.md`.
