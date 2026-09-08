@@ -13,8 +13,20 @@
 # limitations under the License.
 """Living coverage CONTRACT for softmax(dim=-1) — the attention softmax — on spyre.
 
-STATUS (2026-08-04): ROUTED and HW-VERIFIED at exactly ONE shape.
+STATUS (2026-09-08): this file's own ULP-vs-CPU-fp32 table is NOT the routed-shape
+allow-list -- read it as the stricter accuracy contract for the shapes it actually
+tests, not as a census of what is routed.
 ================================================================================
+The routed-shape source of truth is
+`sentient_codegen.encoder.softmax_dispatch.SOFTMAX_WITNESSED_SHAPES`, surfaced through
+`torch_spyre/ops/softmax.py` (read that module's docstring for the current set --
+as of codegen steps 27/28 it is three `N=64` shapes plus one exact `N=128` shape).
+This file encodes a DIFFERENT, stricter measurement (a real CPU-fp32 ULP reference,
+see below) for only the shapes in `_HW_VERIFIED_SOFTMAX`, currently `M=1024` and
+`M=2048`, both `N=64,C=32,DL16`. A shape being routed elsewhere does not make it green
+here; a shape untested here (e.g. the N=128 shape above) does not mean it is unrouted
+-- check codegen for admission, this file only for its own ULP evidence.
+
 `torch.softmax(x, dim=-1)` at M=1024, N=64, C=32, DL16 routes end-to-end to the
 five-packet device kernel through the `spyre::softmax` custom op, and is HW-verified
 eager AND torch.compile at 3.28 ULP_DL16 with zero outliers — including all 3630
@@ -22,17 +34,27 @@ fp16-subnormal outputs, measurable only after the #111 readback fix. Both entry
 points reproduced the bytes-launch KAT's number at the same input range, which is
 what establishes that the routed path runs the same proven bytes (#112).
 
-ONE SHAPE IS NOT SUPPORT. Attention needs `[seq, seq]` prefill and `[1, seq]` decode;
-both are REFUSED, and `1x2048` is refused outright (the cross-lane reduce is one stick
-per row, N==64). This file therefore tests TWO things of equal weight:
-  (a) the witnessed shape computes correctly through both entry points, and
-  (b) every OTHER shape FAILS LOUD rather than silently computing something.
+MORE ROUTED SHAPES DOES NOT MEAN ATTENTION IS SUPPORTED. Attention needs `[seq, seq]`
+prefill and `[1, seq]` decode; both are REFUSED, and `1x2048` is refused. The DEEP
+architectural reason decode/attention are not servable is that the cross-lane reduce
+this file's witnessed shapes use is one stick per row, N==64 (a separate N=128 shape is
+routed and torch-route HW-verified elsewhere, per the source of truth above, just not by
+this file's ULP table) -- but as of 2026-09-08, `SoftmaxPlan(1,2048,1,16)` itself
+constructs without error, so the CODE PATH THIS TEST ACTUALLY EXERCISES refuses `1x2048`
+via the same generic witnessed-shape pin as `refuse_64x64_unwitnessed_pin` below, not via
+a demonstrated N=2048-specific structural wall -- see that case's own comment before
+changing either. This file therefore tests TWO things of equal weight for the shapes in
+its own table:
+  (a) the witnessed shapes compute correctly through both entry points, and
+  (b) every OTHER case in this table FAILS LOUD rather than silently computing something.
 (b) is not filler. The routed path admits only shapes in
 `sentient_codegen.encoder.softmax_dispatch.SOFTMAX_WITNESSED_SHAPES`, and the reason
 that pin exists is a real defect caught during #112: `SoftmaxPlan`'s constraints are
 NECESSARY BUT NOT SUFFICIENT — it enforces `M == 32*C`, which M=32/C=1, M=64/C=2 and
-M=512/C=16 all satisfy, and it BUILT all three. None has a golden; none has ever run
-on silicon. Without (b) a future edit re-opens that hole and looks gated while doing it.
+M=512/C=16 (note: C=16 here, NOT the witnessed `M=512,N=64,C=32` shape above -- a
+different, unrelated shape) all satisfy, and it BUILT all three. None of those three
+has a golden; none has ever run on silicon. Without (b) a future edit re-opens that
+hole and looks gated while doing it.
 
 WHY THE TOLERANCE IS NOT max_diff == 0
 --------------------------------------
@@ -109,11 +131,18 @@ _OK, _REFUSE = "ok", "refuse"
 # observationally identical at M=1024 (rows == 32 AND C == 32) and therefore survived a
 # byte-match, a silicon HW-KAT and review — the 32x32 small-constant aliasing.
 #
-# Correcting it COLLAPSED the structural envelope to a single point: the confound
-# constraint is `rows*ns_row == 32`, so at ns_row=1 and C=32 only M=1024 is admissible.
-# Consequence worth stating, because it is the safety win: there is no longer ANY
-# "structurally buildable but unwitnessed" case. Every refusal below is a REAL structural
-# limit, so the witnessed-shape pin is now defence in depth rather than the sole barrier.
+# Historical note, corrected 2026-09-08: this comment used to say only M=1024 was
+# admissible and that no structurally-buildable pin-only refusal remained. That is
+# stale on BOTH counts. M=2048 (2026-08-05, Band A) and M=512 (2026-08-17, #45 R1
+# Part A) were each individually HW-witnessed and added to codegen's
+# SOFTMAX_WITNESSED_SHAPES. Separately, `64x64` and the `1x2048` decode shape were
+# found (2026-09-08) to currently construct fine but remain refused by the SAME
+# generic witnessed-shape pin, NOT a structural row_unroll/N-specific reason as their
+# names once implied -- that is a LIVE case of exactly the class this paragraph used
+# to say was empty. The table below distinguishes the one genuinely structural
+# refusal it currently checks (`736x64`: row_unroll divisibility) from the two
+# generic pin-only refusals (`64x64`, `1x2048`) -- see each case's own comment for
+# the live-message evidence, not this paragraph's history.
 #
 # Every reason below was verified against the real dispatch at the corrected C — not
 # predicted. `reason_substr` pins WHICH guard fires so a rename cannot silently re-point
@@ -127,25 +156,57 @@ _SOFTMAX_CASES = [
     # byte-matched (28416 B) AND silicon HW-KAT PASS (3.74 ULP, 0 bad, 3x clean, 2026-08-05).
     ("witnessed_2048x64_c32", 2048, 64, 32, _OK, None),
 
-    # rows=16 (< 32): UNWITNESSED, refused by the witnessed-shape PIN (not a chained
-    # structural reason — it constructs fine). The message says "admits only witnessed
-    # shapes"; "admits only" is the discriminating substring (unique to the pin, and NOT
-    # a substring of any structural reason — avoids the "witnessed" ⊂ "unwitnessed" clash).
-    ("refuse_512x64_unwitnessed_pin", 512, 64, 32, _REFUSE, "admits only"),
+    # rows=16: WITNESSED since 2026-08-17 (commit 072deaf / #45 R1 Part A) --
+    # silicon HW-KAT PASS, max_diff==0 vs a captured anchor reference output. NOT
+    # byte-matched to a tracked golden binary, unlike M=1024/M=2048 (see
+    # torch_spyre/ops/softmax.py's own docstring for that distinction). This case
+    # was `refuse_512x64_unwitnessed_pin` / `_REFUSE` / "admits only" until
+    # 2026-09-08 -- that was correct THEN (codegen had not yet witnessed this
+    # shape) and went stale the moment codegen's admission landed without this
+    # table being updated in the same change, exactly the discipline
+    # "WHEN DOES A NEW SHAPE FLIP GREEN?" above asks for. Left OUT of
+    # _HW_VERIFIED_SOFTMAX below deliberately -- this file's own ULP-vs-CPU-fp32
+    # protocol has not been run for this shape, so the torch-path tests xfail for
+    # it until someone actually runs and adds it. Do not add it speculatively.
+    ("witnessed_512x64_c32", 512, 64, 32, _OK, None),
 
     # rows=23: u=4 does not divide 23 (the mvloopcnt trip is rows/u) and no remainder-row
-    # tail is built. A REAL capability limit -- and note a golden for this shape EXISTS,
-    # so it becomes byte-match-gatable the moment the tail is built.
-    ("refuse_736x64_no_row_tail", 736, 64, 32, _REFUSE, "must divide"),
+    # tail is built. A REAL capability limit -- a genuine structural refusal, not the
+    # witnessed-shape pin -- and note a golden for this shape EXISTS, so it becomes
+    # byte-match-gatable the moment the tail is built. Reason pin corrected 2026-09-08
+    # (was "must divide", which has never matched codegen's actual message): the live
+    # message's own per-case suffix is "Underlying reason: mvloopcnt: rows_per_core=23
+    # not divisible by row_unroll=4" -- "not divisible" is the discriminating substring,
+    # confirmed absent from every OTHER case's message (verified directly, not assumed).
+    ("refuse_736x64_no_row_tail", 736, 64, 32, _REFUSE, "not divisible"),
 
-    # rows=2 -> row_unroll u=2, a value no golden witnesses. Refused rather than
-    # extrapolated: u is derived from rows, and 2 is outside the witnessed set.
-    ("refuse_64x64_unwitnessed_unroll", 64, 64, 32, _REFUSE, "unwitnessed"),
+    # rows=2: NOT actually a structural row_unroll=2 refusal today (renamed + reason
+    # corrected 2026-09-08 -- was `refuse_64x64_unwitnessed_unroll` / "unwitnessed",
+    # which has never matched codegen's actual message, confirmed by direct history
+    # search). codegen's own message says plainly: "The shape is structurally
+    # buildable -- every SoftmaxPlan constraint passes -- but it is not present in
+    # SOFTMAX_WITNESSED_SHAPES". That is the SAME generic witnessed-shape-pin class
+    # `witnessed_512x64_c32` above used to be in before it was witnessed -- this case
+    # just hasn't been witnessed (no golden, no HW-KAT), not blocked by a demonstrated
+    # row_unroll structural wall.
+    ("refuse_64x64_unwitnessed_pin", 64, 64, 32, _REFUSE,
+     "not present in SOFTMAX_WITNESSED_SHAPES"),
 
-    # N != 64: the cross-lane reduce is ONE STICK PER ROW; N=2048 is 32 sticks/row.
-    # THIS IS THE DECODE SHAPE -- refusing it is exactly why softmax is not yet servable
-    # for attention, and no amount of M-widening changes that (N is the binding axis).
-    ("refuse_1x2048_decode", 1, 2048, 1, _REFUSE, "one stick per row"),
+    # N != 64, M=1, decode shape. THIS IS THE DECODE SHAPE -- attention is not yet
+    # servable, and that remains true (see module docstring). But the reason_substr
+    # pin here must reflect what THIS test path actually exercises, not the deep
+    # architectural reason: corrected 2026-09-08 (was "one stick per row", which is
+    # boilerplate present in EVERY refusal message including `refuse_736x64_no_row_tail`'s
+    # genuinely-different structural one -- confirmed directly -- so it was passing for
+    # the wrong reason, exactly the failure mode this file's own design says it guards
+    # against). `SoftmaxPlan(1,2048,1,16)` itself constructs without error (confirmed:
+    # codegen's message says "structurally buildable... every SoftmaxPlan constraint
+    # passes"), so today this refuses via the SAME generic witnessed-shape pin as
+    # `refuse_64x64_unwitnessed_pin` above, not a demonstrated N=2048-specific wall in
+    # this code path. If a future change makes SoftmaxPlan itself reject N=2048
+    # structurally, update this reason to match that new, more specific message.
+    ("refuse_1x2048_decode", 1, 2048, 1, _REFUSE,
+     "not present in SOFTMAX_WITNESSED_SHAPES"),
 ]
 
 #: The corrected law: C is CONSTANT at 32 (clamped for M<32), rows is derived. Mirrored
@@ -354,17 +415,35 @@ def test_refusal_reasons_are_discriminating():
     match a DIFFERENT class's message.
     """
     specific = {r for _, _, _, _, e, r in _SOFTMAX_CASES if e == _REFUSE and r}
-    # After Band A: M=2048/rows=64 is WITNESSED (no longer a "confounded" refusal), so the
-    # confound reason is gone. The remaining refusals are: a witnessed-shape PIN (rows=16,
-    # "admits only") and three REAL structural limits (u∤rows "must divide"; u=2
-    # "unwitnessed"; N>64 "one stick per row").
+    # After Band A: M=2048/rows=64 is WITNESSED (no longer a "confounded" refusal). After
+    # #45 R1 Part A (2026-08-17): M=512/rows=16 is ALSO witnessed, so the witnessed-shape
+    # PIN's OLD reason string ("admits only") no longer has a live case. Corrected
+    # 2026-09-08 (review round 3): the remaining refusals split into exactly ONE genuine
+    # structural limit (736, u∤rows, "not divisible") and TWO cases that share the SAME
+    # generic witnessed-shape-pin message today (64 and the decode shape) -- neither
+    # "must divide" nor "unwitnessed" nor "one stick per row" ever matched codegen's
+    # actual message (confirmed directly against live dispatch, and by searching this
+    # repo's history for where those substrings might have come from -- nowhere). Two
+    # DIFFERENT cases sharing one reason string is honest here, not a discrimination
+    # failure: they dedupe to one element of `specific`, and that element is still
+    # disjoint from "not divisible" -- the real distinction the pairwise check below
+    # protects is structural-limit vs generic-pin, not "one string per case".
     assert "confounded" not in specific, (
         "a case still claims the 'confounded' reason, but the second-operand distance "
         "confound was RESOLVED (rows-independent) and M=2048 is now witnessed.")
-    assert {"admits only", "must divide", "unwitnessed", "one stick per row"} <= specific
+    assert "admits only" not in specific, (
+        "a case still claims the witnessed-shape-PIN's OLD reason string, but that "
+        "wording was retired 2026-09-08 in favor of the live message's own "
+        "'not present in SOFTMAX_WITNESSED_SHAPES' -- if codegen's wording changes "
+        "again, re-verify against the LIVE message, don't guess.")
+    assert {"not divisible", "not present in SOFTMAX_WITNESSED_SHAPES"} <= specific
     # No reason may be a substring of another, or a case could pass on the wrong guard.
     # (This CAUGHT the "witnessed" ⊂ "unwitnessed" clash when 512's reason was first set to
-    # "witnessed"; "admits only" is disjoint from all three structural reasons.)
+    # "witnessed". Also caught, review round 2/3: "one stick per row" is boilerplate
+    # present in EVERY refusal message including 736's genuinely-different structural
+    # one -- it was passing 1x2048's test for the wrong reason. Any new reason_substr
+    # MUST be checked against the live message text before being added here, not
+    # written by analogy to what a case's NAME suggests.)
     for a in specific:
         for b in specific:
             if a != b:

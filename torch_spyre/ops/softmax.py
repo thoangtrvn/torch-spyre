@@ -50,15 +50,31 @@ instead of becoming a new unknown.
 
 ENVELOPE: WITNESSED SHAPES ONLY, FAIL-LOUD
 ------------------------------------------
-Admitted: ``M=1024`` (rows=32) and ``M=2048`` (rows=64), both ``N=64, C=32`` DL16 —
-each byte-matched AND silicon-verified, enforced in codegen by
-``SOFTMAX_WITNESSED_SHAPES``.  Everything else raises ``SoftmaxEnvelopeError`` (a
-``NotImplementedError``, so it PROPAGATES and fails the compile).  There is
-deliberately no CPU fallback (#70): a silent host softmax is worse than a hard error.
-This is STILL NOT servable attention — it is "more M at N=64".  ``N != 64``
-(``[1, seq]`` decode, ``[seq, seq]`` prefill = multi-stick rows) and ``dim=0`` remain
-refused (separate unbuilt datapaths).  Widening needs a golden or an HW-KAT, never a
-relaxed guard.
+This op has no shape gate of its own.  Every admission check happens in codegen's
+``sentient_codegen.encoder.softmax_dispatch.build_softmax_launch_plan``, keyed by
+``SOFTMAX_WITNESSED_SHAPES`` — that frozenset is the SOLE source of truth for which
+shapes route; do not duplicate it here, and do not treat the summary below as
+authoritative if it and codegen ever disagree (read codegen).  Everything not in
+that set raises ``SoftmaxEnvelopeError`` (a ``NotImplementedError``, so it PROPAGATES
+and fails the compile) — there is deliberately no CPU fallback (#70): a silent host
+softmax is worse than a hard error.
+
+Summary, as of codegen's step 27/28 N=128 admission: the witnessed set holds ``N=64``
+at ``M=512`` (rows=16, silicon-verified — max_diff==0 vs a captured reference output,
+NOT byte-matched to a tracked golden binary), ``M=1024`` (rows=32) and ``M=2048``
+(rows=64) — both of the latter byte-matched AND silicon-verified — PLUS exactly one
+``N=128`` shape, ``M=1024, N=128, C=32`` DL16:
+launch-admitted and torch-route HW-verified (eager AND compiled, bit-identical to its
+own golden-direct hardware output on both entry points) but NOT byte-identical to its
+tracked golden binary (13 known, pinned residual bytes — see
+codegen/docs/op-milestones/softmax-n128-r3-topology-spec.md).  Its
+structurally-similar neighbors — ``M=512, N=128`` and ``M=1024, N=256`` — are NOT
+admitted and still refuse, same as before.
+
+This is STILL NOT servable attention.  ``[1, seq]`` decode and ``[seq, seq]`` prefill
+(multi-stick rows beyond the one exact witnessed N=128 point above) and ``dim=0``
+remain refused (separate unbuilt datapaths).  Widening needs a golden or an HW-KAT,
+never a relaxed guard.
 """
 from __future__ import annotations
 

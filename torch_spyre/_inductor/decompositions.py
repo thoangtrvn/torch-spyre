@@ -610,8 +610,12 @@ def spyre_softmax(
     must SURVIVE on the triton path so the opaque op replaces the generic lowering.
     Ops in that set do the opposite (they fall back to standard aten).
 
-    ENVELOPE: only M=1024 N=64 C=32 DL16 is routed; the op raises for anything else and
-    the error PROPAGATES (no CPU fallback, #70).
+    ENVELOPE: admission is decided in ``torch_spyre/ops/softmax.py`` (this
+    decomposition adds no shape check of its own) — see that module's docstring
+    for the current witnessed-shape summary and its own pointer to
+    ``sentient_codegen.encoder.softmax_dispatch.SOFTMAX_WITNESSED_SHAPES``, the
+    actual source of truth.  Everything outside that set raises
+    ``SoftmaxEnvelopeError`` and the error PROPAGATES (no CPU fallback, #70).
     """
     if half_to_float:
         raise NotImplementedError(
