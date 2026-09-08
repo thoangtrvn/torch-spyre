@@ -23,9 +23,10 @@ The routed-shape source of truth is
 as of codegen steps 27/28 it is three `N=64` shapes plus one exact `N=128` shape).
 This file encodes a DIFFERENT, stricter measurement (a real CPU-fp32 ULP reference,
 see below) for only the shapes in `_HW_VERIFIED_SOFTMAX`, currently `M=512`, `M=1024`,
-and `M=2048`, all `N=64,C=32,DL16` (M=512 added 2026-09-08, step 30). A shape being
-routed elsewhere does not make it green here; a shape untested here (e.g. the N=128
-shape above) does not mean it is unrouted -- check codegen for admission, this file
+and `M=2048` at `N=64,C=32,DL16` (M=512 added 2026-09-08, step 30), plus the one exact
+`M=1024,N=128,C=32,DL16` shape (added 2026-09-08, step 31 -- does NOT generalize to any
+other N=128 shape). A shape being routed elsewhere does not make it green here; a shape
+untested here does not mean it is unrouted -- check codegen for admission, this file
 only for its own ULP evidence.
 
 `torch.softmax(x, dim=-1)` at M=1024, N=64, C=32, DL16 routes end-to-end to the
@@ -38,9 +39,10 @@ what establishes that the routed path runs the same proven bytes (#112).
 MORE ROUTED SHAPES DOES NOT MEAN ATTENTION IS SUPPORTED. Attention needs `[seq, seq]`
 prefill and `[1, seq]` decode; both are REFUSED, and `1x2048` is refused. The DEEP
 architectural reason decode/attention are not servable is that the cross-lane reduce
-this file's witnessed shapes use is one stick per row, N==64 (a separate N=128 shape is
-routed and torch-route HW-verified elsewhere, per the source of truth above, just not by
-this file's ULP table) -- but as of 2026-09-08, `SoftmaxPlan(1,2048,1,16)` itself
+this file's N=64 witnessed shapes use is one stick per row (the one exact N=128 shape
+this file DOES cover, `M=1024,N=128,C=32`, uses two sticks/row and is NOT a step toward
+decode -- it does not generalize to any other N=128 shape, least of all the `[1,seq]`
+decode shape's own, much larger multi-stick row) -- but as of 2026-09-08, `SoftmaxPlan(1,2048,1,16)` itself
 constructs without error, so the CODE PATH THIS TEST ACTUALLY EXERCISES refuses `1x2048`
 via the same generic witnessed-shape pin as `refuse_64x64_unwitnessed_pin` below, not via
 a demonstrated N=2048-specific structural wall -- see that case's own comment before
@@ -174,6 +176,23 @@ _SOFTMAX_CASES = [
     # above -- still NOT byte-matched to a tracked golden binary, that is unchanged.
     ("witnessed_512x64_c32", 512, 64, 32, _OK, None),
 
+    # N=128 (2 sticks/row, not the N=64 one-stick-per-row shape every other case here
+    # uses): launch-admitted in codegen step 27, and the REAL torch.softmax route
+    # confirmed reaching that admitted binary in codegen step 28 -- eager AND compiled,
+    # both bit-identical to golden-direct's own pinned hardware SHA256. That is
+    # DIFFERENT evidence from what this file measures: bit-identity to golden-direct is
+    # a binary/route-provenance check, not a CPU-fp32 ULP measurement, and the binary is
+    # separately known NOT to be byte-identical to its tracked golden (13 pinned
+    # residual bytes, see softmax-n128-r3-topology-spec.md). Step 31 (2026-09-08) ran
+    # this file's OWN torch-path ULP-vs-CPU-fp32 protocol against real hardware,
+    # unchanged tolerance (REL_TOL_ULPS=4.0): eager and compiled both PASSED,
+    # max_rel=3.07 ULP_DL16, row-sum error=1.73 ULP_DL16 (identical between entry
+    # points, real margin under tolerance). Promoted into _HW_VERIFIED_SOFTMAX below on
+    # that evidence. Still NOT byte-matched to a tracked golden binary -- that distinction
+    # is unchanged and does not follow from this ULP pass. This does NOT generalize to
+    # any other N=128 shape (M=512,N=128; M=1024,N=256; etc. all remain refused).
+    ("witnessed_1024x128_c32", 1024, 128, 32, _OK, None),
+
     # rows=23: u=4 does not divide 23 (the mvloopcnt trip is rows/u) and no remainder-row
     # tail is built. A REAL capability limit -- a genuine structural refusal, not the
     # witnessed-shape pin -- and note a golden for this shape EXISTS, so it becomes
@@ -236,8 +255,16 @@ _SOFTMAX_CORES = 32
 #: tolerance was touched to make this pass. This is torch-path ULP evidence, separate
 #: from and in addition to the max_diff==0-vs-anchor-ref silicon evidence that already
 #: witnessed this shape in codegen (see the case's own comment above).
+#: M=1024,N=128 (rows=32, the exact N=128 shape) populated 2026-09-08 (step 31):
+#: torch-path eager AND compiled, BOTH max_rel=3.07 ULP_DL16, row-sum error=1.73
+#: ULP_DL16, identical between entry points, unchanged tolerance. This is a
+#: DIFFERENT oracle from the bit-identical-to-golden-direct route evidence codegen
+#: step 28 already established -- that proved the ROUTE reaches the admitted binary;
+#: this proves the OUTPUT meets this file's own CPU-fp32 ULP guide. Does NOT
+#: generalize to any other N=128 shape.
 _HW_VERIFIED_SOFTMAX = {
     "witnessed_1024x64_c32", "witnessed_2048x64_c32", "witnessed_512x64_c32",
+    "witnessed_1024x128_c32",
 }
 
 
@@ -370,12 +397,16 @@ def test_softmax_verified_membership_locked():
     """
     assert _HW_VERIFIED_SOFTMAX == {
         "witnessed_1024x64_c32", "witnessed_2048x64_c32", "witnessed_512x64_c32",
+        "witnessed_1024x128_c32",
     }, (
         "Softmax verified set changed. Silicon-passed shapes: M=1024 N=64 C=32 "
         "(2026-08-04, 3.28 ULP) and M=2048 N=64 C=32 (2026-08-05, 3.74 ULP, 0 bad, "
         "3x clean, bytes-launch HW-KAT); M=512 N=64 C=32 (2026-09-08, step 30, "
-        "torch-path eager+compiled, both 3.05 ULP max_rel / 1.60 ULP row-sum error). "
-        "Confirm on hardware before widening, then update this lock."
+        "torch-path eager+compiled, both 3.05 ULP max_rel / 1.60 ULP row-sum error); "
+        "M=1024 N=128 C=32 (2026-09-08, step 31, torch-path eager+compiled, both "
+        "3.07 ULP max_rel / 1.73 ULP row-sum error -- does NOT generalize to any "
+        "other N=128 shape). Confirm on hardware before widening, then update this "
+        "lock."
     )
 
 
