@@ -22,10 +22,11 @@ The routed-shape source of truth is
 `torch_spyre/ops/softmax.py` (read that module's docstring for the current set --
 as of codegen steps 27/28 it is three `N=64` shapes plus one exact `N=128` shape).
 This file encodes a DIFFERENT, stricter measurement (a real CPU-fp32 ULP reference,
-see below) for only the shapes in `_HW_VERIFIED_SOFTMAX`, currently `M=1024` and
-`M=2048`, both `N=64,C=32,DL16`. A shape being routed elsewhere does not make it green
-here; a shape untested here (e.g. the N=128 shape above) does not mean it is unrouted
--- check codegen for admission, this file only for its own ULP evidence.
+see below) for only the shapes in `_HW_VERIFIED_SOFTMAX`, currently `M=512`, `M=1024`,
+and `M=2048`, all `N=64,C=32,DL16` (M=512 added 2026-09-08, step 30). A shape being
+routed elsewhere does not make it green here; a shape untested here (e.g. the N=128
+shape above) does not mean it is unrouted -- check codegen for admission, this file
+only for its own ULP evidence.
 
 `torch.softmax(x, dim=-1)` at M=1024, N=64, C=32, DL16 routes end-to-end to the
 five-packet device kernel through the `spyre::softmax` custom op, and is HW-verified
@@ -164,10 +165,13 @@ _SOFTMAX_CASES = [
     # 2026-09-08 -- that was correct THEN (codegen had not yet witnessed this
     # shape) and went stale the moment codegen's admission landed without this
     # table being updated in the same change, exactly the discipline
-    # "WHEN DOES A NEW SHAPE FLIP GREEN?" above asks for. Left OUT of
-    # _HW_VERIFIED_SOFTMAX below deliberately -- this file's own ULP-vs-CPU-fp32
-    # protocol has not been run for this shape, so the torch-path tests xfail for
-    # it until someone actually runs and adds it. Do not add it speculatively.
+    # "WHEN DOES A NEW SHAPE FLIP GREEN?" above asks for. Step 30 (2026-09-08) ran
+    # this file's own torch-path ULP-vs-CPU-fp32 protocol against real hardware,
+    # unchanged tolerance (REL_TOL_ULPS=4.0): eager and compiled both PASSED,
+    # max_rel=3.05 ULP_DL16, row-sum error=1.60 ULP_DL16 (identical between entry
+    # points). Promoted into _HW_VERIFIED_SOFTMAX below on that evidence. This is
+    # a DIFFERENT, stricter oracle than the "max_diff==0 vs anchor ref" evidence
+    # above -- still NOT byte-matched to a tracked golden binary, that is unchanged.
     ("witnessed_512x64_c32", 512, 64, 32, _OK, None),
 
     # rows=23: u=4 does not divide 23 (the mvloopcnt trip is rows/u) and no remainder-row
@@ -217,10 +221,24 @@ _SOFTMAX_CORES = 32
 #: Ids HW-verified on silicon (bytes-launch KAT; torch-path eager+compiled where run).
 #: M=1024 populated 2026-08-04 (3.28 ULP_DL16, 0 outliers, 3630 subnormal outputs clean).
 #: M=2048 (Band A, rows=64) populated 2026-08-05 (3.74 ULP_DL16, 0 bad, 3x clean unpadded
-#: bytes-launch KAT). NOTE: M=2048 silicon was proven via the bytes-launch KAT
-#: (scripts/softmax_dim_neg1_hw_kat.py KAT_M=2048); the torch-path eager/compiled twin at
-#: M=2048 should be box-run to confirm routing before treating the torch entry as verified.
-_HW_VERIFIED_SOFTMAX = {"witnessed_1024x64_c32", "witnessed_2048x64_c32"}
+#: bytes-launch KAT). The "should be box-run to confirm routing" note that used to sit
+#: here was itself stale: corrected 2026-09-08 (step 30 follow-up) -- the torch-path
+#: eager/compiled twin at M=2048 HAS been box-run (repeatedly, across steps 28/29/30's
+#: own full-suite runs) and reports PASSED, not xfail, every time; a one-shot diagnostic
+#: confirmed the measured values directly (max_rel=3.05 ULP_DL16, row_err=1.60 ULP_DL16,
+#: identical between entry points -- and identical to M=512's below, consistent with
+#: `_make_input`'s periodic pattern repeating regardless of M). If this ever needs
+#: re-confirming, rerun `pytest tests/test_op_softmax.py -k witnessed_2048x64_c32 -s`
+#: on the box and read the assertion, don't assume from this comment.
+#: M=512 (rows=16) populated 2026-09-08 (step 30): torch-path eager AND compiled, BOTH
+#: max_rel=3.05 ULP_DL16 (identical between entry points), row-sum error=1.60 ULP_DL16,
+#: unchanged REL_TOL_ULPS=4.0/FP16_MIN_NORMAL/_check_softmax()/row-sum check -- no
+#: tolerance was touched to make this pass. This is torch-path ULP evidence, separate
+#: from and in addition to the max_diff==0-vs-anchor-ref silicon evidence that already
+#: witnessed this shape in codegen (see the case's own comment above).
+_HW_VERIFIED_SOFTMAX = {
+    "witnessed_1024x64_c32", "witnessed_2048x64_c32", "witnessed_512x64_c32",
+}
 
 
 def _make_input(M, N):
@@ -350,11 +368,14 @@ def test_softmax_verified_membership_locked():
     actually passed on silicon. Widening requires a golden or an HW-KAT for the new
     shape, an entry in SOFTMAX_WITNESSED_SHAPES, and an edit here — same change.
     """
-    assert _HW_VERIFIED_SOFTMAX == {"witnessed_1024x64_c32", "witnessed_2048x64_c32"}, (
+    assert _HW_VERIFIED_SOFTMAX == {
+        "witnessed_1024x64_c32", "witnessed_2048x64_c32", "witnessed_512x64_c32",
+    }, (
         "Softmax verified set changed. Silicon-passed shapes: M=1024 N=64 C=32 "
         "(2026-08-04, 3.28 ULP) and M=2048 N=64 C=32 (2026-08-05, 3.74 ULP, 0 bad, "
-        "3x clean, bytes-launch HW-KAT). Confirm on hardware before widening, then "
-        "update this lock."
+        "3x clean, bytes-launch HW-KAT); M=512 N=64 C=32 (2026-09-08, step 30, "
+        "torch-path eager+compiled, both 3.05 ULP max_rel / 1.60 ULP row-sum error). "
+        "Confirm on hardware before widening, then update this lock."
     )
 
 
