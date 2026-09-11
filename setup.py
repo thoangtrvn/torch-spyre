@@ -42,6 +42,12 @@ def get_torch_spyre_version() -> str:
 
 
 version = get_torch_spyre_version()
+CODEGEN_ONLY = os.environ.get("TORCH_SPYRE_CODEGEN_ONLY", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def check_libflex():
@@ -81,40 +87,39 @@ INCLUDE_DIRS = [
     # "tracy/public"
 ]
 LIBRARY_DIRS = []
-
-
-INCLUDE_DIRS += [maybe_download_nlohmann_json()]
-
-cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
-extra_include_dirs = cmake_include_path.split(":") if cmake_include_path else []
-INCLUDE_DIRS += [Path(p) for p in extra_include_dirs if p]
-
-cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
-extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
-LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
-
-if "RUNTIME_INSTALL_DIR" in os.environ:
-    # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
-    RUNTIME_DIR = Path(os.environ["RUNTIME_INSTALL_DIR"])
-    SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
-    DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
-    INCLUDE_DIRS += [
-        RUNTIME_DIR / "include",
-    ]
-    INCLUDE_DIRS += [
-        RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
-    ]
-    INCLUDE_DIRS += [
-        SENLIB_DIR / "include",
-    ]
-    INCLUDE_DIRS += [
-        DEEPTOOLS_DIR / "include",
-    ]
-    LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
-
-INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
-
 LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+
+if not CODEGEN_ONLY:
+    INCLUDE_DIRS += [maybe_download_nlohmann_json()]
+
+    cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
+    extra_include_dirs = cmake_include_path.split(":") if cmake_include_path else []
+    INCLUDE_DIRS += [Path(p) for p in extra_include_dirs if p]
+
+    cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
+    extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
+    LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
+
+    if "RUNTIME_INSTALL_DIR" in os.environ:
+        # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
+        RUNTIME_DIR = Path(os.environ["RUNTIME_INSTALL_DIR"])
+        SENLIB_DIR = Path(os.environ["SENLIB_INSTALL_DIR"])
+        DEEPTOOLS_DIR = Path(os.environ["DEEPTOOLS_INSTALL_DIR"])
+        INCLUDE_DIRS += [
+            RUNTIME_DIR / "include",
+        ]
+        INCLUDE_DIRS += [
+            RUNTIME_DIR / "include" / "concurrentqueue" / "moodycamel",
+        ]
+        INCLUDE_DIRS += [
+            SENLIB_DIR / "include",
+        ]
+        INCLUDE_DIRS += [
+            DEEPTOOLS_DIR / "include",
+        ]
+        LIBRARY_DIRS += [RUNTIME_DIR / "lib"]
+
+    INCLUDE_DIRS += [os.environ["SEN_COMMON_HEADERS"]]
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
 # - we need to fix there
@@ -155,7 +160,7 @@ if __name__ == "__main__":
         cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
     )
 
-    if is_meta:
+    if is_meta or CODEGEN_ONLY:
         setup(
             entry_points={
                 "torch.backends": [

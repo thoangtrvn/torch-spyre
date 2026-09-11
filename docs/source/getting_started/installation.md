@@ -29,6 +29,20 @@ x = torch.tensor([1, 2], dtype=torch.float16, device="spyre")
 print(x.device)  # device(type='spyre', index=0)
 ```
 
+## Codegen-only Installation
+
+For compiler and TTIR-capture work on a machine without the Sentient runtime
+libraries, install without building the runtime extensions:
+
+```bash
+TORCH_SPYRE_CODEGEN_ONLY=1 python -m pip install -e .
+```
+
+This mode is intentionally narrow: `import torch_spyre`, backend registration, and
+`torch_spyre._inductor` imports work, but device allocation and kernel launch APIs
+fail loudly. See [Codegen-only mode](../compiler/codegen_only.md) for the exact
+boundary.
+
 ## Running the Test Suite
 
 ```bash

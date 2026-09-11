@@ -83,11 +83,25 @@ def enable_spyre_context(
         # Disable fusing of mm + permute/transpose for now.
         "permute_fusion": False,
         "allow_buffer_reuse": False,  # For now, as buffer reuse does not consider stride_map.
+        # Prefer Triton 3.7+ TensorDescriptor-backed TTIR for regular tensor
+        # accesses. This is a frontend evidence knob only: Sentient still must
+        # prove stick layout, packet contracts, launch ABI, and HW correctness.
+        "triton.use_tensor_descriptor": True,
+        # Let Inductor assume aligned inputs so descriptor/TMA-style paths are
+        # not blocked by conservative alignment uncertainty. This does not prove
+        # 128B Sentient stick alignment; backend checks still own that contract.
+        "assume_aligned_inputs": True,
         # Enable native matmul (ops.dot + make_reduction("dot")) for Spyre.
         # Required for TritonKernel to set is_native_matmul=True on the kernel,
         # which gates the tl.dot codegen path (simd.py:440-449).
         "triton.native_matmul": True,
     }
+
+    # PyTorch versions differ on this option. Enable it when available so
+    # pointwise kernels retain a tiled grid instead of being flattened into a
+    # 1D XBLOCK form that destroys useful descriptor/layout evidence.
+    if hasattr(torch._inductor.config.triton, "tile_pointwise"):
+        new_config["triton.tile_pointwise"] = True
 
     from torch._inductor.fx_passes import joint_graph
 

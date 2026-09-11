@@ -80,7 +80,7 @@ from __future__ import annotations
 
 import torch
 
-from torch_spyre._C import launch_kernel_from_bytes
+from torch_spyre._runtime import require_runtime
 
 __all__ = ["softmax", "SoftmaxHostError"]
 
@@ -141,6 +141,9 @@ def _build_launch_plan(m: int, n: int, num_cores: int, dtype_bits: int):
 @torch.library.custom_op("spyre::softmax", mutates_args=(), device_types="spyre")
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     """softmax over the trailing dimension of a 2-D ``[M, N]`` DL16 activation."""
+    require_runtime("spyre softmax")
+    from torch_spyre._C import launch_kernel_from_bytes
+
     if x.device.type != "spyre":
         raise ValueError(f"spyre softmax: input must be on spyre, got {x.device}")
     if x.dtype not in _DTYPE_BITS:

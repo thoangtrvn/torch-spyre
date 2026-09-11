@@ -18,8 +18,12 @@ import types
 import importlib
 
 from .constants import DEVICE_NAME
+from ._runtime import (
+    SpyreRuntimeUnavailableError,
+    codegen_only_available,
+    require_runtime,
+)
 
-from . import memory
 from . import profiler
 
 _runtime_init_lock = threading.Lock()
@@ -53,6 +57,7 @@ class _SpyreImpl:
     def _lazy_init(self):
         if self._initialized:
             return
+        require_runtime("torch.spyre runtime initialization")
         with _runtime_init_lock:
             if self._initialized:
                 return
@@ -134,6 +139,8 @@ class _SpyreImpl:
                 self.manual_seed(seed, device=idx)
 
     def is_available(self) -> bool:
+        if codegen_only_available():
+            return False
         if self._is_in_bad_fork():
             return True
         else:
@@ -143,6 +150,8 @@ class _SpyreImpl:
         return self._initialized and not self._is_in_bad_fork()
 
     def device_count(self) -> int:
+        if codegen_only_available():
+            return 0
         from . import _hooks
 
         return _hooks.device_count()
@@ -178,10 +187,16 @@ def make_spyre_module() -> types.ModuleType:
     mod.is_available = lambda: impl.is_available()
     mod.is_initialized = lambda: impl.is_initialized()
     mod.device_count = lambda: impl.device_count()
+    mod.codegen_only_available = codegen_only_available
     mod.current_device = lambda: impl.current_device()
     mod.set_device = lambda idx: impl.set_device(idx)
     mod._is_compiled = lambda: True
-    mod.memory = memory
+    if codegen_only_available():
+        mod.memory = None
+    else:
+        from . import memory
+
+        mod.memory = memory
 
     import torch  # noqa: E402
 
@@ -193,10 +208,10 @@ def make_spyre_module() -> types.ModuleType:
             # Important: raising AttributeError ensures hasattr() returns False
             # without triggering our lazy loader.
             raise AttributeError(name)
-        if hasattr(impl, name):
-            return getattr(impl, name)
-        if not hasattr(impl, "_C"):
-            impl._lazy_init()
+        try:
+            return object.__getattribute__(impl, name)
+        except AttributeError:
+            pass
         if name in {
             "Stream",
             "stream",
@@ -221,6 +236,14 @@ def make_spyre_module() -> types.ModuleType:
                 "synchronize": synchronize,
             }
             return streams_map[name]
+        if codegen_only_available():
+            from torch_spyre import _C
+
+            if hasattr(_C, name):
+                return getattr(_C, name)
+            raise AttributeError(name)
+        if not hasattr(impl, "_C"):
+            impl._lazy_init()
         if hasattr(impl._C, name):
             return getattr(impl._C, name)
         raise AttributeError(name)
@@ -249,12 +272,14 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    from . import _hooks  # noqa: F401
+    if not codegen_only_available():
+        from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-    import torch_spyre.ops.eager  # noqa: F401
+    if not codegen_only_available():
+        import torch_spyre.ops.eager  # noqa: F401
     from torch_spyre._inductor import _light_autoload
 
     _light_autoload()

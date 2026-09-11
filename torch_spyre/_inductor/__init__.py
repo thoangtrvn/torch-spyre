@@ -121,6 +121,7 @@ def enable_spyre_compile_fx_wrapper():
 
 
 def _light_autoload():
+    import torch_spyre._inductor.customops  # noqa: F401
     from . import decompositions  # noqa: F401
 
     enable_spyre_compile_fx_wrapper()

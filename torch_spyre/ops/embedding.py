@@ -53,7 +53,7 @@ from __future__ import annotations
 import torch
 import numpy as np
 
-from torch_spyre._C import launch_kernel_from_bytes
+from torch_spyre._runtime import require_runtime
 from ._embedding_host import (
     build_embedding_launches,
     build_ibr_address_table,
@@ -65,6 +65,14 @@ from ._embedding_weight_cache import get_row_contiguous_weight
 
 __all__ = ["embedding", "EmbeddingHostError"]
 
+
+def _launch_kernel_from_bytes(binary, args) -> None:
+    require_runtime("spyre embedding launch")
+    from torch_spyre._C import launch_kernel_from_bytes
+
+    launch_kernel_from_bytes(binary, args)
+
+
 _DTYPE_BITS = {torch.float16: 16}  # DL16 on 1p0; extend per generation
 # elements per stick at each element width (128 bytes / element_bytes).
 _ELEMENTS_PER_STICK = {16: 64}  # float16: 128 / 2 = 64
@@ -72,6 +80,8 @@ _ELEMENTS_PER_STICK = {16: 64}  # float16: 128 / 2 = 64
 
 @torch.library.custom_op("spyre::embedding", mutates_args=(), device_types="spyre")
 def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    require_runtime("spyre embedding")
+
     if weight.device.type != "spyre":
         raise ValueError(f"embedding weight must be on spyre device, got {weight.device}")
     if indices.dtype not in (torch.int32, torch.int64):
@@ -108,7 +118,7 @@ def embedding(weight: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         # Allocate a full-sized device buffer so the binary never overruns a shorter
         # slice, then copy only the real rows to the CPU staging tensor.
         buf = torch.empty((tokens_per_launch, d_model), dtype=weight.dtype, device=weight.device)
-        launch_kernel_from_bytes(binary, [weight, buf])
+        _launch_kernel_from_bytes(binary, [weight, buf])
         out_cpu[start:end] = buf[: end - start].cpu()
     return out_cpu.to(weight.device).reshape(*indices.shape, d_model)
 
@@ -227,7 +237,7 @@ def _embedding_ibr(
 
         # Launch: [weight_rc, ibr_table, output_buf]
         # XLAT[0]=weight_rc (seg0), XLAT[1]=ibr_dev (seg1), XLAT[2]=buf (seg2).
-        launch_kernel_from_bytes(binary, [weight_rc, ibr_dev, buf])
+        _launch_kernel_from_bytes(binary, [weight_rc, ibr_dev, buf])
 
         # Extract real token rows from the row-contiguous buf.
         # buf row (t*spt+s) = token t plane s; reshape to (n_launch, spt, 64) then

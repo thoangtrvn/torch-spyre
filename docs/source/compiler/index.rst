@@ -18,6 +18,7 @@ The pipeline consists of two compilers:
    architecture
    inductor_frontend
    backend
+   codegen_only
    work_division_planning
    adding_operations
    op_enablement
