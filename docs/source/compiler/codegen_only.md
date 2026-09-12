@@ -78,7 +78,15 @@ TORCH_SPYRE_EXPERIMENTAL_DESCRIPTOR_POINTWISE=1
 
 With `TORCH_SPYRE_CODEGEN_ONLY=1`, this opt-in route lets the Spyre Inductor
 context admit TensorDescriptor lowering for the validated `512 x 128` pointwise
-identity canary. The expected TTIR evidence is:
+identity canary. Inside the Spyre Inductor context, `spyre` inputs are treated as
+aligned when `assume_aligned_inputs=True`; PyTorch's upstream helper otherwise
+only applies that assumption to GPU device types and records PrivateUse1 inputs in
+`V.graph.unaligned_buffers`, which blocks TensorDescriptor loads. The same
+context disables Triton's implicit fp16/bf16 compute upcast (`triton.codegen_upcast_to_fp32=False`)
+so AIU 1.0 DL16 pointwise kernels do not silently widen loads to fp32 and truncate
+on store unless the user requested an explicit dtype conversion.
+
+The expected TTIR evidence is:
 
 ```text
 tt.make_tensor_descriptor
@@ -99,7 +107,7 @@ The route is intentionally fail-closed:
 - the diagnostic shape is restricted to `512 x 128`;
 - `no_x_dim` stores are rejected;
 - unaligned buffer names are rejected using Inductor's base-pointer alignment
-  guard;
+  guard after the Spyre context has applied its PrivateUse1 alignment policy;
 - unresolved constant offsets are rejected instead of assumed aligned.
 
 The current boundary is frontend evidence only. Downstream Sentient codegen still

@@ -66,7 +66,7 @@ def test_spyre_autoload_enables_descriptor_friendly_inductor_defaults():
     assert result.returncode == 0, result.stderr
 
 
-def test_spyre_context_preserves_descriptor_defaults_after_exit():
+def test_spyre_context_preserves_descriptor_and_dtype_defaults_after_exit():
     result = _run_script(
         """
         import torch
@@ -78,11 +78,23 @@ def test_spyre_context_preserves_descriptor_defaults_after_exit():
         original_assume_aligned_inputs = (
             torch._inductor.config.assume_aligned_inputs
         )
+        import torch._inductor.graph as inductor_graph
+        import torch._inductor.utils as inductor_utils
+
         original_use_block_ptr = torch._inductor.config.triton.use_block_ptr
+        original_codegen_upcast_to_fp32 = (
+            torch._inductor.config.triton.codegen_upcast_to_fp32
+        )
+        original_graph_alignment_helper = inductor_graph.should_assume_input_aligned
+        original_utils_alignment_helper = inductor_utils.should_assume_input_aligned
+        spyre_input = torch.empty((512, 128), dtype=torch.float16).to('spyre')
         with enable_spyre_context([]):
             assert torch._inductor.config.triton.use_tensor_descriptor is True
             assert torch._inductor.config.assume_aligned_inputs is True
             assert torch._inductor.config.triton.use_block_ptr is original_use_block_ptr
+            assert torch._inductor.config.triton.codegen_upcast_to_fp32 is False
+            assert inductor_graph.should_assume_input_aligned(spyre_input) is True
+            assert inductor_utils.should_assume_input_aligned(spyre_input) is True
         assert (
             torch._inductor.config.triton.use_tensor_descriptor
             is original_use_tensor_descriptor
@@ -92,6 +104,12 @@ def test_spyre_context_preserves_descriptor_defaults_after_exit():
             is original_assume_aligned_inputs
         )
         assert torch._inductor.config.triton.use_block_ptr is original_use_block_ptr
+        assert (
+            torch._inductor.config.triton.codegen_upcast_to_fp32
+            is original_codegen_upcast_to_fp32
+        )
+        assert inductor_graph.should_assume_input_aligned is original_graph_alignment_helper
+        assert inductor_utils.should_assume_input_aligned is original_utils_alignment_helper
         """,
         descriptor_pointwise=False,
     )
@@ -136,6 +154,51 @@ def test_spyre_descriptor_env_disables_block_ptr_only_when_enabled():
         with enable_spyre_context([]):
             assert torch._inductor.config.triton.use_block_ptr is False
         assert torch._inductor.config.triton.use_block_ptr is original_use_block_ptr
+        """,
+        descriptor_pointwise=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+
+def test_spyre_pointwise_identity_capture_does_not_implicitly_upcast_to_fp32():
+    result = _run_script(
+        """
+        import torch
+        from triton.backends.spyre.compiler import SpyreBackend
+
+        captured = []
+
+        class CapturedTTIR(RuntimeError):
+            pass
+
+        def capture_spyre_ir(mod, metadata, options):
+            text = mod.str_nodebug() if hasattr(mod, 'str_nodebug') else str(mod)
+            captured.append(text)
+            raise CapturedTTIR('captured')
+
+        SpyreBackend._make_spyre_ir = staticmethod(capture_spyre_ir)
+
+        @torch.compile
+        def identity(x):
+            return x.clone()
+
+        x = torch.empty((512, 128), dtype=torch.float16).to('spyre')
+        try:
+            identity(x)
+        except Exception:
+            if not captured:
+                raise
+
+        text = captured[0]
+        assert 'tt.make_tensor_descriptor' in text
+        assert 'tt.descriptor_load' in text
+        assert 'tt.descriptor_store' in text
+        assert 'tt.load' not in text
+        assert 'tt.store' not in text
+        assert 'arith.extf' not in text
+        assert 'arith.truncf' not in text
         """,
         descriptor_pointwise=True,
     )

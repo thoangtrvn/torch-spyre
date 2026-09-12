@@ -94,7 +94,7 @@ def enable_spyre_context(
     Context manager that sets up the Spyre compilation environment.
 
     This CM configures PyTorch Inductor to compile graphs for the Spyre device by:
-      - Enabling Spyre-specific data type handling (bfloat16 computation)
+      - Enabling Spyre-specific data type handling without implicit fp32 upcasts
       - Activating Spyre lowerings and decompositions
       - Disabling incompatible optimizations (reduction splitting, permute fusion)
 
@@ -144,6 +144,10 @@ def enable_spyre_context(
         # Required for TritonKernel to set is_native_matmul=True on the kernel,
         # which gates the tl.dot codegen path (simd.py:440-449).
         "triton.native_matmul": True,
+        # AIU 1.0 uses DL16 as its native 16-bit compute representation. Do not
+        # silently widen f16/bf16 pointwise loads to fp32 and truncate on store;
+        # dtype changes must come from explicit PyTorch conversion operations.
+        "triton.codegen_upcast_to_fp32": False,
     }
 
     # TensorDescriptorOptions is mutually exclusive with the older block-ptr
@@ -179,8 +183,11 @@ def enable_spyre_context(
     import torch._inductor.kernel.mm_common as mm_common
     import torch._inductor.kernel.mm as mm
     import torch._inductor.kernel.bmm as bmm
+    import torch._inductor.graph as inductor_graph
+    import torch._inductor.utils as inductor_utils
 
     _orig_use_native_matmul = mm_common.use_native_matmul
+    _orig_should_assume_input_aligned = inductor_utils.should_assume_input_aligned
 
     _log = logging.getLogger("torch_spyre.patches")
 
@@ -206,9 +213,16 @@ def enable_spyre_context(
         _log.debug("use_native_matmul: dev=%s -> orig returned %s", _dev, result)
         return result
 
+    def _spyre_aware_should_assume_input_aligned(example_input):
+        if getattr(getattr(example_input, "device", None), "type", None) == DEVICE_NAME:
+            return torch._inductor.config.assume_aligned_inputs
+        return _orig_should_assume_input_aligned(example_input)
+
     mm_common.use_native_matmul = _spyre_aware_use_native_matmul
     mm.use_native_matmul = _spyre_aware_use_native_matmul
     bmm.use_native_matmul = _spyre_aware_use_native_matmul
+    inductor_utils.should_assume_input_aligned = _spyre_aware_should_assume_input_aligned
+    inductor_graph.should_assume_input_aligned = _spyre_aware_should_assume_input_aligned
 
     import torch._inductor.codegen.triton as triton_codegen
     from torch._inductor.codegen.triton import is_unaligned_buffer_name
@@ -337,6 +351,8 @@ def enable_spyre_context(
             mm_common.use_native_matmul = _orig_use_native_matmul
             mm.use_native_matmul = _orig_use_native_matmul
             bmm.use_native_matmul = _orig_use_native_matmul
+            inductor_utils.should_assume_input_aligned = _orig_should_assume_input_aligned
+            inductor_graph.should_assume_input_aligned = _orig_should_assume_input_aligned
             triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
                 _orig_tma_compatibility_checker_cls
             )
