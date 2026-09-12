@@ -162,6 +162,43 @@ def test_spyre_descriptor_env_disables_block_ptr_only_when_enabled():
 
 
 
+def test_spyre_descriptor_context_logs_shadow_alignment_diagnostic():
+    result = _run_script(
+        """
+        import logging
+        import torch
+        from torch_spyre._inductor.patches import enable_spyre_context
+
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record.getMessage())
+
+        logger = logging.getLogger('torch_spyre.patches')
+        logger.setLevel(logging.DEBUG)
+        handler = Capture()
+        logger.addHandler(handler)
+        try:
+            spyre_input = torch.empty((512, 128), dtype=torch.float16).to('spyre')
+            with enable_spyre_context([spyre_input]):
+                pass
+        finally:
+            logger.removeHandler(handler)
+
+        assert any(
+            'descriptor pointwise alignment diagnostic:' in message
+            and 'aligned=' in message
+            for message in records
+        ), records
+        """,
+        descriptor_pointwise=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+
 def test_spyre_pointwise_identity_capture_does_not_implicitly_upcast_to_fp32():
     result = _run_script(
         """

@@ -24,6 +24,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor.descriptor_abi import check_descriptor_pointer_alignments
 
 
 _DESCRIPTOR_POINTWISE_ENV = "TORCH_SPYRE_EXPERIMENTAL_DESCRIPTOR_POINTWISE"
@@ -69,6 +70,71 @@ def _spyre_descriptor_shape_allowed(buffer_name: str | None) -> bool:
     except (TypeError, ValueError, AttributeError):
         return False
     return shape == _DESCRIPTOR_POINTWISE_SHAPE
+
+
+def _diagnose_descriptor_argument_alignment(example_inputs: list[InputType]) -> None:
+    """Shadow-only 128-byte Sentient-stick alignment diagnostic for the
+    descriptor pointwise capture route's example inputs.
+
+    Logs (never raises) a ``DescriptorAlignmentReport`` for every Spyre-device
+    tensor argument whose shape matches the diagnostic canary shape
+    (``_DESCRIPTOR_POINTWISE_SHAPE``). This intentionally never gates
+    compilation: on today's Spyre codegen-only backend,
+    ``Tensor.data_ptr()`` is the SpyreAllocator host-side bookkeeping token,
+    not the real on-device address (see
+    ``torch_spyre._inductor.descriptor_abi`` module docstring), so raising on
+    its alignment here would fail on a value that is not evidence of a real
+    ABI violation. The storage_offset-derived half of the report remains a
+    genuine signal regardless of that caveat, which is why this still logs
+    rather than skipping the check outright.
+    """
+    log = logging.getLogger("torch_spyre.patches")
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    candidates = []
+    for inp in example_inputs:
+        if not isinstance(inp, torch.Tensor):
+            continue
+        if getattr(getattr(inp, "device", None), "type", None) != DEVICE_NAME:
+            continue
+        if tuple(inp.shape) != _DESCRIPTOR_POINTWISE_SHAPE:
+            continue
+        if isinstance(inp, FakeTensor):
+            # FakeTensor.data_ptr() is upstream-deprecated (UserWarning today,
+            # documented to become a hard error) and, unlike a real tensor,
+            # carries no allocator-token identity worth reporting on -- skip
+            # rather than trip that deprecation path on every real compile
+            # that reaches this opt-in diagnostic.
+            log.debug(
+                "descriptor pointwise alignment diagnostic: skipping FakeTensor "
+                "example input (data_ptr() is deprecated/unreliable on FakeTensor)"
+            )
+            continue
+        candidates.append(inp)
+    if not candidates:
+        return
+
+    try:
+        reports = check_descriptor_pointer_alignments(
+            candidates,
+            context="descriptor pointwise example input",
+            raise_on_misalignment=False,
+        )
+    except Exception:
+        # Best-effort diagnostic: never let it break a real compile.
+        log.debug(
+            "descriptor pointwise alignment diagnostic failed to evaluate", exc_info=True
+        )
+        return
+
+    for tensor, report in zip(candidates, reports):
+        log.debug(
+            "descriptor pointwise alignment diagnostic: shape=%s dtype=%s aligned=%s report=%s",
+            tuple(tensor.shape),
+            tensor.dtype,
+            report.aligned,
+            report.to_dict(),
+        )
 
 
 @contextmanager
@@ -121,6 +187,9 @@ def enable_spyre_context(
     import torch_spyre._inductor.lowering  # noqa: F401
 
     _descriptor_pointwise_enabled = _env_flag_enabled(_DESCRIPTOR_POINTWISE_ENV)
+
+    if _descriptor_pointwise_enabled:
+        _diagnose_descriptor_argument_alignment(example_inputs)
 
     # Inductor config tweaks (saved/restored)
     new_config = {

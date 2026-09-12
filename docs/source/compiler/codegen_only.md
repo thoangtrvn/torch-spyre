@@ -110,6 +110,23 @@ The route is intentionally fail-closed:
   guard after the Spyre context has applied its PrivateUse1 alignment policy;
 - unresolved constant offsets are rejected instead of assumed aligned.
 
+The Sentient stick ABI is stronger than Triton's `{tt.divisibility = 16}` TTIR
+metadata. That attribute is only a compiler-visible lower-bound hint; it is not
+proof that a runtime tensor argument is 128-byte stick-aligned. The descriptor
+ABI diagnostic in `torch_spyre._inductor.descriptor_abi` checks the effective
+tensor pointer (`tensor.data_ptr()`, not merely the allocation base) and the
+storage-offset composition against the 128-byte Sentient stick boundary. For
+AIU 1.0 DL16/f16 tensors, a view preserves stick alignment only when its
+2-byte-element storage offset remains a multiple of 64 elements.
+
+Today's real Spyre allocator exposes a host-side bookkeeping token through
+`Tensor.data_ptr()`, while the real on-device address lives below Python in the
+Flex composite address. Therefore the opt-in descriptor pointwise path logs the
+alignment report as shadow-only evidence and does not gate compilation on that
+host token. The storage-offset part of the report is still load-bearing: a view
+whose offset is not a whole 128-byte stick must not be treated as a legal
+stick-native descriptor argument.
+
 The current boundary is frontend evidence only. Downstream Sentient codegen still
 must add descriptor analysis, pointwise scheduler inputs, QGInit/packet parity,
 launch ABI proof, and HW-KAT evidence before TensorDescriptor pointwise can be
