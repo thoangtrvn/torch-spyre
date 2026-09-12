@@ -265,6 +265,13 @@ def make_spyre_module() -> types.ModuleType:
     return mod
 
 
+def _autoload_codegen_only():
+    from ._runtime import force_codegen_only
+
+    force_codegen_only()
+    return _autoload()
+
+
 def _autoload():
     # guard if autoload may run more than once
     if getattr(_autoload, "_ran", False):

@@ -37,6 +37,12 @@ used on compiler-only hosts:
 TORCH_SPYRE_CODEGEN_ONLY=1 python -m pip install -e .
 ```
 
+A codegen-only install persists this mode in the Python environment's
+`torch.backends` entry point. After installing with `TORCH_SPYRE_CODEGEN_ONLY=1`,
+that environment can import `torch`/`torch_spyre` without setting the environment
+variable on every command. Reinstall without `TORCH_SPYRE_CODEGEN_ONLY=1` when you
+want a full runtime build.
+
 The Python `_C` and `_hooks` shim modules exist only so compiler modules that need
 schema/layout symbols can import. They are not substitutes for the C++ runtime.
 

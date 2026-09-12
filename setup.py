@@ -48,6 +48,7 @@ CODEGEN_ONLY = os.environ.get("TORCH_SPYRE_CODEGEN_ONLY", "0").strip().lower() i
     "yes",
     "on",
 }
+BACKEND_AUTOLOAD = "_autoload_codegen_only" if CODEGEN_ONLY else "_autoload"
 
 
 def check_libflex():
@@ -164,7 +165,7 @@ if __name__ == "__main__":
         setup(
             entry_points={
                 "torch.backends": [
-                    "torch_spyre = torch_spyre:_autoload",
+                    f"torch_spyre = torch_spyre:{BACKEND_AUTOLOAD}",
                 ],
             },
         )
@@ -252,7 +253,7 @@ if __name__ == "__main__":
             },
             entry_points={
                 "torch.backends": [
-                    "torch_spyre = torch_spyre:_autoload",
+                    f"torch_spyre = torch_spyre:{BACKEND_AUTOLOAD}",
                 ],
             },
         )

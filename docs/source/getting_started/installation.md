@@ -40,8 +40,10 @@ TORCH_SPYRE_CODEGEN_ONLY=1 python -m pip install -e .
 
 This mode is intentionally narrow: `import torch_spyre`, backend registration, and
 `torch_spyre._inductor` imports work, but device allocation and kernel launch APIs
-fail loudly. See [Codegen-only mode](../compiler/codegen_only.md) for the exact
-boundary.
+fail loudly. The editable install records a codegen-only backend entry point in the
+Python environment, so subsequent `import torch` / `import torch_spyre` commands do
+not need to set `TORCH_SPYRE_CODEGEN_ONLY=1` again. See [Codegen-only
+mode](../compiler/codegen_only.md) for the exact boundary.
 
 ## Running the Test Suite
 

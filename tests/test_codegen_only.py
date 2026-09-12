@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 
 def _run_codegen_only_script(script: str) -> subprocess.CompletedProcess[str]:
@@ -28,6 +29,56 @@ def _run_codegen_only_script(script: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=120,
     )
+
+
+def test_codegen_only_backend_entrypoint_autoload_without_env():
+    env = os.environ.copy()
+    env.pop("TORCH_SPYRE_CODEGEN_ONLY", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import torch
+                import torch_spyre
+
+                assert torch._C._get_privateuse1_backend_name() == "spyre"
+                assert torch_spyre.codegen_only_available() is True
+                assert torch.spyre.codegen_only_available() is True
+                assert torch.spyre.is_available() is False
+                assert torch.spyre.device_count() == 0
+                """
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_metadata_detection(monkeypatch):
+    from torch_spyre import _runtime
+
+    dist = SimpleNamespace(
+        entry_points=(
+            SimpleNamespace(
+                group="torch.backends",
+                name="torch_spyre",
+                value="torch_spyre:_autoload_codegen_only",
+            ),
+        )
+    )
+    monkeypatch.delenv("TORCH_SPYRE_CODEGEN_ONLY", raising=False)
+    monkeypatch.setattr(_runtime.metadata, "distribution", lambda name: dist)
+    _runtime._installed_codegen_only_entrypoint.cache_clear()
+
+    try:
+        assert _runtime.codegen_only_available() is True
+    finally:
+        _runtime._installed_codegen_only_entrypoint.cache_clear()
 
 
 def test_codegen_only_import_autoload_and_inductor_modules():
@@ -66,7 +117,8 @@ def test_codegen_only_runtime_use_fails_loud():
         try:
             _C.launch_kernel_from_bytes(b"", [])
         except SpyreRuntimeUnavailableError as e:
-            assert "TORCH_SPYRE_CODEGEN_ONLY=1" in str(e)
+            assert "codegen-only mode" in str(e)
+            assert "TORCH_SPYRE_CODEGEN_ONLY" in str(e)
         else:
             raise AssertionError("runtime launch unexpectedly succeeded")
         """

@@ -62,9 +62,6 @@ lint = [
     "uv~=0.10.0",
 ]
 
-[project.entry-points."torch.backends"]
-torch_spyre = "torch_spyre:_autoload"
-
 [tool.setuptools]
 package-dir = { torch_spyre = "torch_spyre" }
 package-data = { torch_spyre = ["*.dll", "*.dylib", "*.so"] }
