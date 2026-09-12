@@ -14,21 +14,23 @@
 
 
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._runtime import codegen_only_available
 
 from typing import Optional
-from torch_spyre._C import (
-    get_spyre_tensor_layout,
-    empty_with_layout,
-    spyre_empty_with_layout,
-    copy_tensor,
-)
+
+import torch
 
 from torch._dynamo.guards import GuardBuilder
-from torch_spyre._C import SpyreTensorLayout
 
 
 def _patch_tensor_for_spyre():
-    import torch
+    from torch_spyre._C import (
+        SpyreTensorLayout,
+        copy_tensor,
+        empty_with_layout,
+        get_spyre_tensor_layout,
+        spyre_empty_with_layout,
+    )
 
     if getattr(torch.Tensor, "_spyre_tensor_patched", False):
         return
@@ -36,6 +38,7 @@ def _patch_tensor_for_spyre():
     orig_repr = torch.Tensor.__repr__
     orig_to = torch.Tensor.to
     orig_empty = torch.empty
+    orig_empty_strided = torch.empty_strided
 
     def spyre_aware_repr(self):
         dev = getattr(self, "device", None)
@@ -69,56 +72,113 @@ def _patch_tensor_for_spyre():
             return None
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
-        if (
-            device_layout is None
-        ):  # use original implementation if no layout is provided
-            return orig_to(self, *args, **kwargs)
+        requested_device = kwargs.get("device")
+        if requested_device is None and args:
+            requested_device = args[0]
+        if codegen_only_available() and requested_device is not None:
+            try:
+                requested_device = torch.device(requested_device)
+            except (TypeError, RuntimeError):
+                requested_device = None
         else:
-            # Check if copy kwarg is explicitly set
-            copy = kwargs.get("copy")
+            requested_device = None
 
-            # Determine dtype from various possible sources
-            dtype = None
-            if len(args) > 0:
-                # If args[0] is a dtype instance, use it
-                if isinstance(args[0], torch.dtype):
-                    dtype = args[0]
-                # If args[0] is a Tensor, use its dtype
-                elif isinstance(args[0], torch.Tensor):
-                    dtype = args[0].dtype
+        # Check if copy kwarg is explicitly set
+        copy = kwargs.get("copy")
 
-            # Check for dtype in kwargs
-            if dtype is None and "dtype" in kwargs:
-                dtype = kwargs["dtype"]
+        # Determine dtype from various possible sources
+        dtype = None
+        if len(args) > 0:
+            # If args[0] is a dtype instance, use it
+            if isinstance(args[0], torch.dtype):
+                dtype = args[0]
+            # If args[0] is a Tensor, use its dtype
+            elif isinstance(args[0], torch.Tensor):
+                dtype = args[0].dtype
 
-            # Check for tensor kwarg
-            if dtype is None and "tensor" in kwargs:
-                tensor_arg = kwargs["tensor"]
-                if isinstance(tensor_arg, torch.Tensor):
-                    dtype = tensor_arg.dtype
+        # Check for dtype in kwargs
+        if dtype is None and "dtype" in kwargs:
+            dtype = kwargs["dtype"]
 
-            # Fall back to self.dtype if no dtype was specified
-            if dtype is None:
-                dtype = self.dtype
+        # Check for tensor kwarg
+        if dtype is None and "tensor" in kwargs:
+            tensor_arg = kwargs["tensor"]
+            if isinstance(tensor_arg, torch.Tensor):
+                dtype = tensor_arg.dtype
 
-            dst = spyre_empty_with_layout(
-                self.size(), self.stride(), dtype, device_layout
-            )
+        # Fall back to self.dtype if no dtype was specified
+        if dtype is None:
+            dtype = self.dtype
 
-            if self.device.type == "cpu":
-                copy_tensor(self, dst, non_blocking=False)
-                return dst
-            else:  # device to device copy
-                # If device_layout is the same as self and copy is not True, return self
-                current_layout = device_tensor_layout(self)
-                if (
-                    not copy
-                    and current_layout is not None
-                    and current_layout == device_layout
-                ):
-                    return self
-                else:
-                    return torch.ops.spyre.copy_from_d2d(self, dst)
+        if device_layout is None:
+            if requested_device is not None and requested_device.type == DEVICE_NAME:
+                device_layout = SpyreTensorLayout(list(self.size()), dtype)
+            if device_layout is None:
+                return orig_to(self, *args, **kwargs)
+
+        fake = _maybe_fake_spyre_tensor(
+            self.size(),
+            self.stride(),
+            dtype,
+            requested_device or torch.device(DEVICE_NAME),
+            requires_grad=self.requires_grad,
+        )
+        if fake is not None:
+            return fake
+
+        dst = spyre_empty_with_layout(self.size(), self.stride(), dtype, device_layout)
+
+        if self.device.type == "cpu":
+            copy_tensor(self, dst, non_blocking=False)
+            return dst
+        else:  # device to device copy
+            # If device_layout is the same as self and copy is not True, return self
+            current_layout = device_tensor_layout(self)
+            if not copy and current_layout is not None and current_layout == device_layout:
+                return self
+            else:
+                return torch.ops.spyre.copy_from_d2d(self, dst)
+
+    def _codegen_requested_spyre_device(device):
+        if not codegen_only_available() or device is None:
+            return None
+        try:
+            requested_device = torch.device(device)
+        except (TypeError, RuntimeError):
+            return None
+        if requested_device.type != DEVICE_NAME:
+            return None
+        return requested_device
+
+    def _normalize_empty_size(args):
+        if not args:
+            raise TypeError("torch.empty requires a size argument")
+        if len(args) == 1:
+            size = args[0]
+            if isinstance(size, int):
+                return (size,)
+            return tuple(size)
+        return tuple(args)
+
+    def _current_fake_mode():
+        from torch._C import _TorchDispatchModeKey
+
+        return torch._C._get_dispatch_mode(_TorchDispatchModeKey.FAKE)
+
+    def _maybe_fake_spyre_tensor(size, stride, dtype, requested_device, requires_grad=False):
+        fake_mode = _current_fake_mode()
+        if fake_mode is None:
+            return None
+        from torch._subclasses.fake_tensor import FakeTensor
+
+        dtype = dtype or torch.get_default_dtype()
+        meta = orig_empty_strided(tuple(size), tuple(stride), dtype=dtype, device="meta")
+        return FakeTensor(
+            fake_mode,
+            meta,
+            device=requested_device,
+            requires_grad=requires_grad,
+        )
 
     def spyre_empty(
         *args,
@@ -131,9 +191,12 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
-        if (
-            device_layout is None
-        ):  # use original implementation if no layout is provided
+        requested_device = _codegen_requested_spyre_device(device)
+        if device_layout is None and requested_device is not None:
+            size = _normalize_empty_size(args)
+            device_layout = SpyreTensorLayout(list(size), dtype or torch.get_default_dtype())
+
+        if device_layout is None:  # use original implementation if no layout is provided
             return orig_empty(
                 *args,
                 out=out,
@@ -144,19 +207,70 @@ def _patch_tensor_for_spyre():
                 pin_memory=pin_memory,
                 memory_format=memory_format,
             )
-        else:
-            # layout_opt is omitted; c10::Layout has no pybind11 type caster,
-            # so py_empty_with_layout drops that parameter and always uses
-            # the default (Strided).
-            return empty_with_layout(
-                *args, device_layout, dtype, device, pin_memory, memory_format
+
+        size = _normalize_empty_size(args)
+        fake = _maybe_fake_spyre_tensor(
+            size,
+            orig_empty(size, dtype=dtype, device="meta", memory_format=memory_format).stride(),
+            dtype,
+            requested_device or device,
+            requires_grad=requires_grad,
+        )
+        if fake is not None:
+            return fake
+
+        # layout_opt is omitted; c10::Layout has no pybind11 type caster,
+        # so py_empty_with_layout drops that parameter and always uses
+        # the default (Strided).
+        return empty_with_layout(
+            size,
+            device_layout,
+            dtype,
+            requested_device or device,
+            pin_memory,
+            memory_format,
+        )
+
+    def spyre_empty_strided(
+        size,
+        stride,
+        *,
+        dtype=None,
+        layout=torch.strided,
+        device=None,
+        requires_grad=False,
+        pin_memory=False,
+    ):
+        requested_device = _codegen_requested_spyre_device(device)
+        if requested_device is None:
+            return orig_empty_strided(
+                size,
+                stride,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                requires_grad=requires_grad,
+                pin_memory=pin_memory,
             )
+        resolved_dtype = dtype or torch.get_default_dtype()
+        fake = _maybe_fake_spyre_tensor(
+            size,
+            stride,
+            resolved_dtype,
+            requested_device,
+            requires_grad=requires_grad,
+        )
+        if fake is not None:
+            return fake
+        device_layout = SpyreTensorLayout(list(size), list(stride), resolved_dtype, list(range(len(size))))
+        return spyre_empty_with_layout(size, stride, resolved_dtype, device_layout)
 
     torch.Tensor.__repr__ = spyre_aware_repr
     torch.Tensor.device_tensor_layout = device_tensor_layout
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
     torch.empty = spyre_empty
+    torch.empty_strided = spyre_empty_strided
 
     # ── SpyreTensorLayout Guard Extension ────────────
     # Extends TENSOR_MATCH to guard on SpyreTensorLayout

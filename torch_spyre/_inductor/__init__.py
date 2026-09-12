@@ -96,7 +96,8 @@ def enable_spyre_compile_fx_wrapper():
             )
 
             if _uses_spyre(gm, example_inputs):
-                torch.spyre._impl._lazy_init()
+                if not torch.spyre.codegen_only_available():
+                    torch.spyre._impl._lazy_init()
 
                 with enable_spyre_context(
                     example_inputs, decomps=decomps
@@ -120,10 +121,21 @@ def enable_spyre_compile_fx_wrapper():
         cfx._spyre_wrapped = True
 
 
+def _enable_spyre_inductor_descriptor_defaults():
+    import torch
+
+    # Make the Spyre compile path descriptor-friendly by default. These flags
+    # only let Inductor consider TensorDescriptor lowering; concrete Spyre
+    # descriptor admission remains gated in enable_spyre_context().
+    torch._inductor.config.triton.use_tensor_descriptor = True
+    torch._inductor.config.assume_aligned_inputs = True
+
+
 def _light_autoload():
     import torch_spyre._inductor.customops  # noqa: F401
     from . import decompositions  # noqa: F401
 
+    _enable_spyre_inductor_descriptor_defaults()
     enable_spyre_compile_fx_wrapper()
 
 

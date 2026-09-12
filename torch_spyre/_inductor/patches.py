@@ -15,13 +15,60 @@
 from contextlib import contextmanager
 
 import logging
+import os
+from typing import Callable, Optional
 
+import sympy
 import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 from torch_spyre.constants import DEVICE_NAME
-from typing import Callable, Optional
+
+
+_DESCRIPTOR_POINTWISE_ENV = "TORCH_SPYRE_EXPERIMENTAL_DESCRIPTOR_POINTWISE"
+_DESCRIPTOR_POINTWISE_SHAPE = (512, 128)
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _static_int(dim) -> int | None:
+    try:
+        return int(dim)
+    except (TypeError, ValueError):
+        pass
+    try:
+        sizevars = V.graph.sizevars
+    except AttributeError:
+        return None
+    for attr in ("statically_known_int", "guard_int", "size_hint"):
+        helper = getattr(sizevars, attr, None)
+        if helper is None:
+            continue
+        try:
+            return int(helper(dim))
+        except (TypeError, ValueError, AttributeError, RuntimeError):
+            pass
+    return None
+
+
+def _spyre_descriptor_shape_allowed(buffer_name: str | None) -> bool:
+    if buffer_name is None:
+        return False
+    try:
+        buf = V.graph.try_get_buffer(buffer_name)
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+    if buf is None or not hasattr(buf, "get_size"):
+        return False
+    try:
+        shape = tuple(_static_int(dim) for dim in buf.get_size())
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return shape == _DESCRIPTOR_POINTWISE_SHAPE
 
 
 @contextmanager
@@ -73,6 +120,8 @@ def enable_spyre_context(
 
     import torch_spyre._inductor.lowering  # noqa: F401
 
+    _descriptor_pointwise_enabled = _env_flag_enabled(_DESCRIPTOR_POINTWISE_ENV)
+
     # Inductor config tweaks (saved/restored)
     new_config = {
         "split_reductions": False,
@@ -96,6 +145,12 @@ def enable_spyre_context(
         # which gates the tl.dot codegen path (simd.py:440-449).
         "triton.native_matmul": True,
     }
+
+    # TensorDescriptorOptions is mutually exclusive with the older block-ptr
+    # path in TritonKernel.indexing(); disable block pointers only for the
+    # opt-in diagnostic capture route so regular Spyre compilation is unchanged.
+    if _descriptor_pointwise_enabled:
+        new_config["triton.use_block_ptr"] = False
 
     # PyTorch versions differ on this option. Enable it when available so
     # pointwise kernels retain a tiled grid instead of being flattened into a
@@ -155,6 +210,108 @@ def enable_spyre_context(
     mm.use_native_matmul = _spyre_aware_use_native_matmul
     bmm.use_native_matmul = _spyre_aware_use_native_matmul
 
+    import torch._inductor.codegen.triton as triton_codegen
+    from torch._inductor.codegen.triton import is_unaligned_buffer_name
+
+    _orig_tma_compatibility_checker_cls = (
+        triton_codegen.TritonKernel.tma_compatibility_checker_cls
+    )
+
+    class SpyreTMACompatibilityChecker(_orig_tma_compatibility_checker_cls):
+        """Diagnostic-only TensorDescriptor eligibility for Spyre pointwise capture."""
+
+        def _is_spyre_graph(self):
+            return V.graph.get_current_device_or_throw().type == DEVICE_NAME
+
+        def can_use_tma(self):
+            if not self._is_spyre_graph():
+                return super().can_use_tma()
+            if not _descriptor_pointwise_enabled:
+                _log.debug(
+                    "Spyre TensorDescriptor path disabled; set %s=1 to enable diagnostics",
+                    _DESCRIPTOR_POINTWISE_ENV,
+                )
+                return False
+            if not torch._inductor.config.triton.use_tensor_descriptor:
+                _log.debug("Spyre TensorDescriptor path requires triton.use_tensor_descriptor")
+                return False
+            if not torch._inductor.config.assume_aligned_inputs:
+                _log.debug("Spyre TensorDescriptor path requires assume_aligned_inputs")
+                return False
+            if self.for_store and self.kernel.no_x_dim:
+                _log.debug("Spyre TensorDescriptor path rejects stores with no_x_dim")
+                return False
+            if not _spyre_descriptor_shape_allowed(self.buffer_name):
+                _log.debug(
+                    "Spyre TensorDescriptor path only supports diagnostic shape %s; buffer=%s",
+                    _DESCRIPTOR_POINTWISE_SHAPE,
+                    self.buffer_name,
+                )
+                return False
+            _log.debug(
+                "Spyre TensorDescriptor diagnostic path enabled for buffer=%s store=%s dtype=%s",
+                self.buffer_name,
+                self.for_store,
+                self.dtype,
+            )
+            return True
+
+        def are_block_parameters_compatible(
+            self,
+            block_params,
+            constant_offset: sympy.Expr | int = 0,
+        ):
+            if not self._is_spyre_graph():
+                return super().are_block_parameters_compatible(
+                    block_params,
+                    constant_offset=constant_offset,
+                )
+            if not _descriptor_pointwise_enabled:
+                return super().are_block_parameters_compatible(
+                    block_params,
+                    constant_offset=constant_offset,
+                )
+            def _resolve_expr(expr):
+                value = _static_int(expr)
+                if value is not None:
+                    return value
+                if self.kernel.fixed_config and isinstance(expr, sympy.Expr):
+                    substitutions = {
+                        symbol: self.kernel.fixed_config[str(symbol)]
+                        for symbol in expr.free_symbols
+                        if str(symbol) in self.kernel.fixed_config
+                    }
+                    if substitutions:
+                        return _static_int(expr.subs(substitutions))
+                return None
+
+            constant_offset_value = _resolve_expr(constant_offset)
+            if constant_offset_value is None:
+                return False
+            if self.buffer_name is not None and is_unaligned_buffer_name(self.buffer_name):
+                return False
+
+            innermost_block = _resolve_expr(block_params.block_shape[-1])
+            return (
+                _static_int(block_params.strides[-1]) == 1
+                and all(
+                    ((_static_int(stride) or -1) * self.dtype.itemsize) % 16 == 0
+                    for stride in block_params.strides[:-1]
+                )
+                and (constant_offset_value * self.dtype.itemsize) % 16 == 0
+                and innermost_block is not None
+                and innermost_block * self.dtype.itemsize >= 16
+            )
+
+        def can_lift(self):
+            if self._is_spyre_graph() and _descriptor_pointwise_enabled:
+                return True
+            return super().can_lift()
+
+    triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
+        SpyreTMACompatibilityChecker
+    )
+
     # Verify patches applied correctly
     _log.debug("mm.use_native_matmul = %s", mm.use_native_matmul)
     _log.debug("mm_common.use_native_matmul = %s", mm_common.use_native_matmul)
@@ -180,4 +337,7 @@ def enable_spyre_context(
             mm_common.use_native_matmul = _orig_use_native_matmul
             mm.use_native_matmul = _orig_use_native_matmul
             bmm.use_native_matmul = _orig_use_native_matmul
+            triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
+                _orig_tma_compatibility_checker_cls
+            )
             joint_graph.pass_patterns[:] = origin_pass

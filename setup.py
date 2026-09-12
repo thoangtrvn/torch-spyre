@@ -161,7 +161,7 @@ if __name__ == "__main__":
         cmd in sys.argv for cmd in ["dist_info", "egg_info", "install_egg_info"]
     )
 
-    if is_meta or CODEGEN_ONLY:
+    if is_meta:
         setup(
             entry_points={
                 "torch.backends": [
@@ -174,23 +174,44 @@ if __name__ == "__main__":
 
         sources = list(CSRC_DIR.glob("*.cpp"))
 
-        # Filenames that belong to the tiny hooks module.
-        # "shared" files are compiled into both _hooks.so and _C.so.
-        hooks_only_files = {"spyre_hooks.cpp"}
-        shared_files = {"spyre_device_enum.cpp", "logging.cpp"}
-        hooks_src_paths = [
-            p for p in sources if p.name in hooks_only_files | shared_files
-        ]
-        core_src_paths = [p for p in sources if p.name not in hooks_only_files]
-        hooks_src_paths = [
-            p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
-        ]
-        core_src_paths = [
-            p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
-        ]
+        if CODEGEN_ONLY:
+            ext_modules = [
+                CppExtension(
+                    name=f"{PACKAGE_NAME}._codegen_backend",
+                    sources=[
+                        (CSRC_DIR / "codegen_backend.cpp").relative_to(ROOT_DIR).as_posix()
+                    ],
+                    include_dirs=[str(p) for p in INCLUDE_DIRS],
+                    extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+                    define_macros=[
+                        ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+                        ("MODULE_NAME", f'"{PACKAGE_NAME}._codegen_backend"'),
+                    ],
+                )
+            ]
+        else:
+            # Filenames that belong to the tiny hooks module.
+            # "shared" files are compiled into both _hooks.so and _C.so.
+            hooks_only_files = {"spyre_hooks.cpp"}
+            shared_files = {"spyre_device_enum.cpp", "logging.cpp"}
+            codegen_only_files = {"codegen_backend.cpp"}
+            hooks_src_paths = [
+                p for p in sources if p.name in hooks_only_files | shared_files
+            ]
+            core_src_paths = [
+                p
+                for p in sources
+                if p.name not in hooks_only_files | codegen_only_files
+            ]
+            hooks_src_paths = [
+                p.relative_to(ROOT_DIR).as_posix() for p in sorted(hooks_src_paths)
+            ]
+            core_src_paths = [
+                p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
+            ]
 
-        ext_modules = [
-            CppExtension(
+            ext_modules = [
+                CppExtension(
                 name=f"{PACKAGE_NAME}._C",
                 sources=core_src_paths,
                 include_dirs=[str(p) for p in INCLUDE_DIRS],

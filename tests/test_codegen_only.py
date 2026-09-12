@@ -140,3 +140,87 @@ def test_codegen_only_layout_helper_is_importable():
         """
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_materializes_fake_spyre_tensor_without_runtime():
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        x = torch.empty((512, 128), dtype=torch.float16)
+        y = x.to("spyre")
+
+        assert y.device.type == "spyre"
+        assert y.device.index == 0
+        assert tuple(y.shape) == (512, 128)
+        assert tuple(y.stride()) == (128, 1)
+        layout = y.device_tensor_layout()
+        assert layout.device_size == [512, 2, 64]
+        assert layout.stride_map == [128, 64, 1]
+        assert layout.elems_per_stick() == 64
+        assert torch.spyre.is_available() is False
+        assert torch.spyre.device_count() == 0
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_to_spyre_dtype_matches_layout_dtype():
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        x = torch.empty((512, 128), dtype=torch.float16)
+        y = x.to("spyre", dtype=torch.float32)
+
+        assert y.dtype == torch.float32
+        assert y.device.type == "spyre"
+        layout = y.device_tensor_layout()
+        assert "IEEE_FP32" in repr(layout)
+        assert layout.device_size == [512, 4, 32]
+        assert layout.stride_map == [128, 32, 1]
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_to_spyre_bfloat16_dtype_matches_layout_dtype():
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        x = torch.empty((512, 128), dtype=torch.float16)
+        y = x.to("spyre", dtype=torch.bfloat16)
+
+        assert y.dtype == torch.bfloat16
+        assert y.device.type == "spyre"
+        layout = y.device_tensor_layout()
+        assert "BFLOAT16" in repr(layout)
+        assert layout.device_size == [512, 2, 64]
+        assert layout.stride_map == [128, 64, 1]
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_torch_empty_spyre_allocates_fake_tensor():
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        y = torch.empty((512, 128), device="spyre", dtype=torch.float16)
+
+        assert y.device.type == "spyre"
+        assert y.device.index == 0
+        assert tuple(y.shape) == (512, 128)
+        assert tuple(y.stride()) == (128, 1)
+        layout = y.device_tensor_layout()
+        assert layout.device_size == [512, 2, 64]
+        assert layout.stride_map == [128, 64, 1]
+        """
+    )
+    assert result.returncode == 0, result.stderr

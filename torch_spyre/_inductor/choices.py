@@ -24,6 +24,10 @@ from torch._inductor.virtualized import V
 
 class SpyreHeuristics(InductorChoices):
     @staticmethod
+    def uuid():
+        return "torch_spyre._inductor.choices.SpyreHeuristics.v1"
+
+    @staticmethod
     def _recover_pointwise_shape(features, x_val):
         """Recover the TRUE 2D (M, N) of a 1D-flattened pointwise kernel.
 
@@ -36,12 +40,24 @@ class SpyreHeuristics(InductorChoices):
         old flat decompose (safe for aligned / M=1; fails safe, never silent-wrong).
         """
         try:
-            ski = getattr(V.graph.sizevars, "statically_known_int", None)
+            sizevars = V.graph.sizevars
+            helpers = tuple(
+                helper
+                for helper in (
+                    getattr(sizevars, "statically_known_int", None),
+                    getattr(sizevars, "guard_int", None),
+                    getattr(sizevars, "size_hint", None),
+                )
+                if helper is not None
+            )
 
             def _to_int(dim):
-                if ski is not None:
-                    return ski(dim)
-                return int(V.graph.sizevars.size_hint(dim))
+                for helper in helpers:
+                    try:
+                        return int(helper(dim))
+                    except (TypeError, ValueError, AttributeError, RuntimeError):
+                        pass
+                return int(dim)
 
             for node in features.scheduler_nodes():
                 buf = getattr(node, "node", None)
@@ -139,6 +155,8 @@ class SpyreHeuristics(InductorChoices):
         tiling = groups[0] if groups and isinstance(groups[0], dict) else {}
         problem_dims = {}
         _ski = getattr(V.graph.sizevars, "statically_known_int", None)
+        _guard_int = getattr(V.graph.sizevars, "guard_int", None)
+        _size_hint = getattr(V.graph.sizevars, "size_hint", None)
 
         def _resolve_dim(tiling_key):
             val = tiling.get(tiling_key)
@@ -147,10 +165,14 @@ class SpyreHeuristics(InductorChoices):
             try:
                 if _ski is not None:
                     concrete = _ski(val)
+                elif _guard_int is not None:
+                    concrete = _guard_int(val)
+                elif _size_hint is not None:
+                    concrete = int(_size_hint(val))
                 else:
-                    concrete = int(V.graph.sizevars.size_hint(val))
+                    concrete = int(val)
                 return concrete
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, AttributeError, RuntimeError):
                 return None
 
         if is_matmul:

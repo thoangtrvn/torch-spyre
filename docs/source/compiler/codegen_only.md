@@ -17,7 +17,6 @@ TORCH_SPYRE_CODEGEN_ONLY=1 python - <<'PY'
 import torch
 import torch_spyre
 
-torch_spyre._autoload()
 print(torch._C._get_privateuse1_backend_name())  # spyre
 print(torch.spyre.codegen_only_available())      # True
 print(torch.spyre.is_available())                # False
@@ -30,8 +29,9 @@ import torch_spyre._inductor.ir
 PY
 ```
 
-The mode also skips C++ extension builds in `setup.py`, so editable installs can be
-used on compiler-only hosts:
+The mode builds only a minimal C++ codegen backend extension in `setup.py`, so
+editable installs can be used on compiler-only hosts without linking the
+Sentient/Flex runtime libraries:
 
 ```bash
 TORCH_SPYRE_CODEGEN_ONLY=1 python -m pip install -e .
@@ -43,16 +43,77 @@ that environment can import `torch`/`torch_spyre` without setting the environmen
 variable on every command. Reinstall without `TORCH_SPYRE_CODEGEN_ONLY=1` when you
 want a full runtime build.
 
-The Python `_C` and `_hooks` shim modules exist only so compiler modules that need
-schema/layout symbols can import. They are not substitutes for the C++ runtime.
+The Python `_C` shim aliases `torch_spyre._codegen_backend` when that extension is
+available. That extension registers a synthetic `spyre:0` PrivateUse1 backend and
+can materialize layout-bearing fake/codegen tensors for compiler capture:
+
+```python
+x = torch.empty((512, 128), dtype=torch.float16)
+y = x.to("spyre")
+assert y.device.type == "spyre"
+assert y.device_tensor_layout().device_size == [512, 2, 64]
+```
+
+See [Codegen-only fake backend design](codegen_fake_backend.md) for the boundary
+and alternatives considered.
+
+## Diagnostic TensorDescriptor pointwise capture
+
+Torch-Spyre autoload makes the Spyre Inductor path descriptor-friendly by
+default:
+
+```python
+torch._inductor.config.triton.use_tensor_descriptor is True
+torch._inductor.config.assume_aligned_inputs is True
+```
+
+Those defaults only let Inductor consider TensorDescriptor lowering. They do not
+make descriptor pointwise a production route.
+
+For the narrow frontend-capture diagnostic, set:
+
+```bash
+TORCH_SPYRE_EXPERIMENTAL_DESCRIPTOR_POINTWISE=1
+```
+
+With `TORCH_SPYRE_CODEGEN_ONLY=1`, this opt-in route lets the Spyre Inductor
+context admit TensorDescriptor lowering for the validated `512 x 128` pointwise
+identity canary. The expected TTIR evidence is:
+
+```text
+tt.make_tensor_descriptor
+tt.descriptor_load
+tt.descriptor_store
+```
+
+and raw-pointer fallback evidence remains rejected for this milestone:
+
+```text
+tl.load
+tl.store
+```
+
+The route is intentionally fail-closed:
+
+- the environment flag is required;
+- the diagnostic shape is restricted to `512 x 128`;
+- `no_x_dim` stores are rejected;
+- unaligned buffer names are rejected using Inductor's base-pointer alignment
+  guard;
+- unresolved constant offsets are rejected instead of assumed aligned.
+
+The current boundary is frontend evidence only. Downstream Sentient codegen still
+must add descriptor analysis, pointwise scheduler inputs, QGInit/packet parity,
+launch ABI proof, and HW-KAT evidence before TensorDescriptor pointwise can be
+claimed as a supported compile route.
 
 ## What is refused
 
 Any action that needs a device allocator, tensor transfer, stream operation, or
 kernel launch fails loudly with `SpyreRuntimeUnavailableError`. Examples include:
 
-- `torch.empty(..., device="spyre")`
-- CPU↔Spyre tensor copies
+- real Spyre device allocation despite `torch.empty(..., device="spyre")` returning a fake/codegen tensor
+- real CPU↔Spyre tensor copies despite `x.to("spyre")` returning a layout-bearing fake/codegen tensor
 - `torch.spyre.Stream`, `torch.spyre.synchronize`, and runtime initialization
 - custom-op launch paths such as `spyre::embedding` and `spyre::softmax`
 

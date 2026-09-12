@@ -29,6 +29,31 @@ from . import profiler
 _runtime_init_lock = threading.Lock()
 
 
+def _activate_spyre_triton_driver() -> None:
+    try:
+        from triton.runtime.driver import driver as triton_driver
+        from triton.backends.spyre.driver import SpyreDriver
+
+        triton_driver.set_active(SpyreDriver())
+
+        # Patch triton_helpers.set_driver_to_gpu to recognize the already-active
+        # SpyreDriver. Without this, generated Triton kernel wrappers call
+        # set_driver_to_gpu(), which cannot discover SpyreDriver because
+        # is_active() returns False by design to avoid CUDA auto-discovery conflicts.
+        import torch._inductor.runtime.triton_helpers as _triton_helpers
+
+        _original_set_driver_to_gpu = _triton_helpers.set_driver_to_gpu
+
+        def _spyre_aware_set_driver_to_gpu():
+            if isinstance(triton_driver.active, SpyreDriver):
+                return
+            _original_set_driver_to_gpu()
+
+        _triton_helpers.set_driver_to_gpu = _spyre_aware_set_driver_to_gpu
+    except ImportError:
+        pass  # triton-spyre not installed — Triton path unavailable
+
+
 class _SpyreImpl:
     def __init__(self):
         self._initialized = False
@@ -79,31 +104,8 @@ class _SpyreImpl:
 
             # Activate SpyreDriver as Triton's active driver BEFORE registering
             # the Inductor backend, so any Triton compilation triggered during
-            # registration finds the correct driver. SpyreDriver.is_active()
-            # returns False to avoid conflicting with CUDA during auto-discovery.
-            try:
-                from triton.runtime.driver import driver as triton_driver
-                from triton.backends.spyre.driver import SpyreDriver
-
-                triton_driver.set_active(SpyreDriver())
-
-                # Patch triton_helpers.set_driver_to_gpu to recognize the
-                # already-active SpyreDriver. Without this, the generated
-                # Triton kernel wrapper calls set_driver_to_gpu() which can't
-                # find SpyreDriver because is_active() returns False (by
-                # design, to avoid CUDA auto-discovery conflicts).
-                import torch._inductor.runtime.triton_helpers as _triton_helpers
-
-                _original_set_driver_to_gpu = _triton_helpers.set_driver_to_gpu
-
-                def _spyre_aware_set_driver_to_gpu():
-                    if isinstance(triton_driver.active, SpyreDriver):
-                        return
-                    _original_set_driver_to_gpu()
-
-                _triton_helpers.set_driver_to_gpu = _spyre_aware_set_driver_to_gpu
-            except ImportError:
-                pass  # triton-spyre not installed — Triton path unavailable
+            # registration finds the correct driver.
+            _activate_spyre_triton_driver()
 
             from torch_spyre._inductor import _autoload as ts_autoload
 
@@ -279,17 +281,27 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
-    if not codegen_only_available():
+    if codegen_only_available():
+        from . import _codegen_backend  # noqa: F401
+    else:
         from . import _hooks  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
-    if not codegen_only_available():
-        import torch_spyre.ops.eager  # noqa: F401
-    from torch_spyre._inductor import _light_autoload
+    if codegen_only_available():
+        import torch_spyre._C  # noqa: F401
+        _activate_spyre_triton_driver()
+        from torch_spyre._inductor import _autoload as ts_autoload
+        from torch_spyre._inductor import _light_autoload
 
-    _light_autoload()
+        ts_autoload()
+        _light_autoload()
+    else:
+        import torch_spyre.ops.eager  # noqa: F401
+        from torch_spyre._inductor import _light_autoload
+
+        _light_autoload()
 
     # Set correct state for dynamo to support eager ops
     import torch._dynamo.config
