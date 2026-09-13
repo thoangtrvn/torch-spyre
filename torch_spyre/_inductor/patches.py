@@ -232,8 +232,18 @@ def enable_spyre_context(
         new_config["triton.tile_pointwise"] = True
 
     from torch._inductor.fx_passes import joint_graph
+    from torch._inductor.fx_passes import fuse_attention
 
     origin_pass = list(joint_graph.pass_patterns)
+    _orig_sfdp_init = fuse_attention._sfdp_init
+
+    def _spyre_skip_sfdp_init(input_device=None):
+        if getattr(input_device, "type", None) == DEVICE_NAME:
+            _log.debug("skipping Inductor SFDP pattern initialization for Spyre device")
+            return None
+        return _orig_sfdp_init(input_device)
+
+    fuse_attention._sfdp_init = _spyre_skip_sfdp_init
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
@@ -425,4 +435,5 @@ def enable_spyre_context(
             triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
                 _orig_tma_compatibility_checker_cls
             )
+            fuse_attention._sfdp_init = _orig_sfdp_init
             joint_graph.pass_patterns[:] = origin_pass
