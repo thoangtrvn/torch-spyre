@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -94,6 +93,7 @@ INCLUDE_DIRS = [
 ]
 LIBRARY_DIRS = []
 
+
 INCLUDE_DIRS += [maybe_download_nlohmann_json()]
 
 cmake_include_path = os.environ.get("CMAKE_INCLUDE_PATH", "")
@@ -162,45 +162,6 @@ else:
             "Set USE_SPYRE_CCL=0 to build without Multi-Spyre support, "
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
-
-
-# PinnedStagingCache is currently provided by the Flex source-tree headers.
-# Prefer source-tree headers over the runtime install so incremental Flex ABI
-# changes cannot silently compile against stale installed struct layouts.
-# SEN_COMMON_HEADERS has historically named either the Flex checkout itself or
-# its monorepo parent, so normalize both forms and include the checkout root for
-# headers spelled as common/... in addition to its public include directory.
-def find_flex_checkout(path):
-    path = Path(path).resolve()
-    candidates = [path, path / "flex"]
-    for candidate in candidates:
-        if (candidate / "include" / "flex").is_dir() and (
-            candidate / "common"
-        ).is_dir():
-            return candidate
-    raise RuntimeError(
-        f"SEN_COMMON_HEADERS={path} is neither a Flex checkout nor a monorepo "
-        "root containing flex/"
-    )
-
-
-flex_checkout_candidates = []
-sen_common_headers = os.environ.get("SEN_COMMON_HEADERS")
-if sen_common_headers:
-    flex_checkout_candidates.append(find_flex_checkout(sen_common_headers))
-local_flex_checkout = ROOT_DIR.parent / "flex"
-if (local_flex_checkout / "include" / "flex").is_dir():
-    flex_checkout_candidates.append(local_flex_checkout.resolve())
-
-flex_source_include_dirs = []
-for checkout in flex_checkout_candidates:
-    for include_dir in (checkout, checkout / "include", checkout / "src"):
-        if include_dir not in flex_source_include_dirs:
-            flex_source_include_dirs.append(include_dir)
-for include_dir in reversed(flex_source_include_dirs):
-    if include_dir in INCLUDE_DIRS:
-        INCLUDE_DIRS.remove(include_dir)
-    INCLUDE_DIRS.insert(0, include_dir)
 
 LIBRARIES = ["flex"]
 
@@ -382,43 +343,14 @@ if __name__ == "__main__":
                 super().finalize_options()
                 self.build_temp = str(BUILD_DIR)
 
-            @staticmethod
-            def _flex_headers_fingerprint():
-                digest = hashlib.sha256()
-                headers = []
-                for checkout in flex_checkout_candidates:
-                    for header_root in (
-                        checkout / "common",
-                        checkout / "include" / "flex",
-                        checkout / "src" / "memory_interface",
-                    ):
-                        if header_root.exists():
-                            headers.extend(header_root.rglob("*.h"))
-                            headers.extend(header_root.rglob("*.hpp"))
-                for header in sorted(set(headers)):
-                    digest.update(str(header).encode())
-                    digest.update(header.read_bytes())
-                return digest.hexdigest()
-
             def build_extension(self, ext):
-                # Use a per-extension subdirectory so each gets its own build.ninja.
-                # PyTorch's extension builder does not reliably invalidate objects
-                # when external Flex headers change, so make the source-header ABI
-                # fingerprint part of the compile command.
+                # Use a per-extension subdirectory so each gets its own build.ninja
                 original_build_temp = self.build_temp
-                original_compile_args = ext.extra_compile_args
-                flex_fingerprint = self._flex_headers_fingerprint()
-                ext.extra_compile_args = {
-                    **original_compile_args,
-                    "cxx": list(original_compile_args["cxx"])
-                    + [f'-DTORCH_SPYRE_FLEX_HEADERS_SHA="{flex_fingerprint}"'],
-                }
                 self.build_temp = os.path.join(original_build_temp, ext.name)
                 os.makedirs(self.build_temp, exist_ok=True)
                 try:
                     super().build_extension(ext)
                 finally:
-                    ext.extra_compile_args = original_compile_args
                     self.build_temp = original_build_temp
 
         setup(
