@@ -18,8 +18,10 @@
 
 #include <c10/util/Exception.h>
 
+#include <cstdint>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -34,8 +36,165 @@
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyre_stream.h"
+#include "spyre_tensor_impl.h"
 
 namespace fs = std::filesystem;
+
+namespace {
+
+std::mutex g_last_launch_observation_mtx;
+json g_last_launch_observation;
+
+constexpr uint64_t kSegmentSizeBytes = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr uint64_t kSegmentOffsetMask = kSegmentSizeBytes - 1ULL;
+constexpr uint64_t kReadWriteXlatMode = 3ULL;
+constexpr uint64_t kDeviceAlignmentBytes = 128ULL;
+
+std::string hex64(uint64_t value) {
+  std::ostringstream os;
+  os << std::hex << std::setw(16) << std::setfill('0') << value;
+  return os.str();
+}
+
+std::string fnv1a256(const std::vector<uint8_t>& bytes) {
+  // Non-cryptographic placeholder with SHA-256-shaped output. It is diagnostic
+  // only until torch-spyre links a real SHA-256 implementation.
+  uint64_t h0 = 0xcbf29ce484222325ULL;
+  uint64_t h1 = 0x84222325cbf29ce4ULL;
+  uint64_t h2 = 0x9e3779b97f4a7c15ULL;
+  uint64_t h3 = 0x100000001b3ULL;
+  for (uint8_t b : bytes) {
+    h0 ^= static_cast<uint64_t>(b);
+    h0 *= 0x100000001b3ULL;
+    h1 ^= static_cast<uint64_t>(b) + (h0 << 6) + (h0 >> 2);
+    h1 *= 0x100000001b3ULL;
+    h2 ^= static_cast<uint64_t>(b) + (h1 << 7) + (h1 >> 3);
+    h2 *= 0x100000001b3ULL;
+    h3 ^= static_cast<uint64_t>(b) + (h2 << 8) + (h2 >> 4);
+    h3 *= 0x100000001b3ULL;
+  }
+  return "fnv256:" + hex64(h0) + hex64(h1) + hex64(h2) + hex64(h3);
+}
+
+std::string contractDeviceDtype(const DataFormats& dtype) {
+  switch (dtype) {
+    case DataFormats::SEN169_FP16:
+      return "DL16";
+    case DataFormats::IEEE_FP32:
+      return "Float";
+    case DataFormats::BFLOAT16:
+      return "BF16";
+    case DataFormats::SEN143_FP8:
+      return "SEN143_FP8";
+    case DataFormats::SEN152_FP8:
+      return "SEN152_FP8";
+    case DataFormats::SEN153_FP9:
+      return "SEN153_FP9";
+    case DataFormats::SENINT2:
+      return "SENINT2";
+    case DataFormats::SENINT4:
+      return "SENINT4";
+    case DataFormats::SENINT8:
+      return "SENINT8";
+    case DataFormats::SENINT16:
+      return "SENINT16";
+    case DataFormats::SENINT24:
+      return "SENINT24";
+    case DataFormats::IEEE_INT64:
+      return "Int64";
+    case DataFormats::IEEE_INT32:
+      return "Int";
+    case DataFormats::SENUINT32:
+      return "UInt32";
+    case DataFormats::SENUINT2:
+      return "SENUINT2";
+    case DataFormats::IEEE_FP16:
+      return "Half";
+    case DataFormats::BOOL:
+      return "Bool";
+    case DataFormats::SEN18F_FP24:
+      return "SEN18F_FP24";
+    case DataFormats::INVALID:
+      return "INVALID";
+  }
+  return "UNKNOWN";
+}
+
+json tensorLaunchObservation(const at::Tensor& tensor, size_t index) {
+  auto* ctx = static_cast<spyre::SharedOwnerCtx*>(
+      tensor.storage().data_ptr().get_context());
+  json observation;
+  observation["arg_index"] = index;
+  observation["selected_segment_index"] = index;
+  observation["storage_offset_bytes"] = tensor.storage_offset() * tensor.element_size();
+  observation["device_bytes"] = tensor.nbytes();
+  observation["torch_scalar_type"] = c10::toString(tensor.scalar_type());
+  observation["device_dtype"] = c10::toString(tensor.scalar_type());
+  if (tensor.is_privateuseone()) {
+    const auto layout = spyre::get_spyre_tensor_layout(tensor);
+    observation["device_encoding_dtype"] = contractDeviceDtype(layout.device_dtype);
+    observation["device_encoding_data_format"] =
+        static_cast<int64_t>(layout.device_dtype);
+    observation["device_encoding_proof_source"] =
+        "torch_spyre.spyre_tensor_allocation";
+    observation["device_encoding_layout"] = {
+        {"device_size", layout.device_size},
+        {"stride_map", layout.stride_map},
+    };
+  }
+  observation["alignment_bytes"] = kDeviceAlignmentBytes;
+  observation["allocation_base_observed"] = false;
+  observation["effective_pointer_alignment_proven"] = false;
+  if (ctx == nullptr || !ctx->composite_addr.is_single_chunk()) {
+    observation["allocation_observation_status"] =
+        ctx == nullptr ? "missing_spyre_allocation_context"
+                       : "multi_chunk_allocation_unobserved";
+    return observation;
+  }
+
+  const auto& chunk = ctx->composite_addr.chunks().at(0);
+  const uint64_t allocation_base = chunk.addr.region_id + chunk.addr.offset;
+  const uint64_t allocation_end = allocation_base + chunk.size;
+  const uint64_t storage_offset_bytes = observation["storage_offset_bytes"];
+  const uint64_t effective_pointer = allocation_base + storage_offset_bytes;
+
+  observation["allocation_base"] = allocation_base;
+  observation["allocation_end"] = allocation_end;
+  observation["allocation_region_id"] = chunk.addr.region_id;
+  observation["allocation_region_offset"] = chunk.addr.offset;
+  observation["allocation_chunk_size"] = chunk.size;
+  observation["allocation_domain_id"] = chunk.domain_id;
+  observation["allocation_total_size"] = ctx->composite_addr.total_size();
+  observation["allocation_base_observed"] = true;
+  observation["effective_pointer"] = effective_pointer;
+  observation["effective_pointer_alignment_proven"] =
+      effective_pointer % kDeviceAlignmentBytes == 0;
+  observation["xlat_xa"] = allocation_base;
+  observation["xlat_xl"] = kSegmentSizeBytes;
+  observation["xlat_xm"] = index;
+  observation["xlat_slot_index"] = index;
+  observation["xlat"] = {
+      {"XA", allocation_base},
+      {"XL", kSegmentSizeBytes},
+      {"XM", index},
+      {"mode", kReadWriteXlatMode},
+  };
+  observation["xlat_realization_source"] =
+      "flex_graph_free_compute_tensor_paddrs";
+  observation["xlat_xm_semantics"] = "runtime_translation_slot_index";
+  observation["xlat_length_semantics"] = "flex_graph_free_segment_size";
+  observation["xlat_base_uses_storage_offset"] = false;
+  observation["xlat_segment_size_bytes"] = kSegmentSizeBytes;
+  observation["xlat_segment_offset"] = allocation_base & kSegmentOffsetMask;
+  return observation;
+}
+
+void recordLastLaunchObservation(json observation) {
+  std::lock_guard<std::mutex> lock(g_last_launch_observation_mtx);
+  g_last_launch_observation = std::move(observation);
+}
+
+}  // namespace
 
 namespace spyre {
 std::ostream& operator<<(std::ostream& os, const KernelArtifacts& k) {
@@ -251,8 +410,37 @@ static std::shared_mutex g_bytes_cache_mtx;
 // Per-key mutexes to prevent concurrent loads of the same binary.
 static std::unordered_map<size_t, std::unique_ptr<std::mutex>> g_bytes_key_mtxs;
 
-void launchKernelFromBytes(const std::vector<uint8_t>& binary,
-                           const std::vector<at::Tensor>& args) {
+void addCachedBinaryObservation(json& observation,
+                                const std::vector<uint8_t>& launched_binary,
+                                const std::vector<uint8_t>& cached_binary) {
+  observation["cached_binary_size"] = cached_binary.size();
+  observation["cached_binary_matches_launched_bytes"] =
+      cached_binary == launched_binary;
+  observation["cached_binary_match_method"] = "exact_byte_vector_equality";
+  observation["cached_binary_fingerprint"] = fnv1a256(cached_binary);
+  observation["cached_binary_fingerprint_algorithm"] =
+      "fnv1a256_noncryptographic";
+  observation["cached_binary_fingerprint_proof_scope"] =
+      "diagnostic_only_not_sha256_identity_proof";
+}
+
+std::string launchKernelFromBytes(const std::vector<uint8_t>& binary,
+                                  const std::vector<at::Tensor>& args) {
+  json observation;
+  observation["schema_version"] = "spyre-launch-observation-v1";
+  observation["source"] = "torch_spyre.launch_kernel_from_bytes";
+  observation["launched_binary_size"] = binary.size();
+  observation["launched_binary_fingerprint"] = fnv1a256(binary);
+  observation["launched_binary_fingerprint_algorithm"] = "fnv1a256_noncryptographic";
+  observation["launched_binary_fingerprint_proof_scope"] =
+      "diagnostic_only_not_sha256_identity_proof";
+  observation["tensor_arg_count"] = args.size();
+  observation["launch_observations"] = json::array();
+  for (size_t i = 0; i < args.size(); ++i) {
+    observation["launch_observations"].push_back(
+        tensorLaunchObservation(args[i], i));
+  }
+
   // Compute a hash of the binary for cache lookup.
   // Uses FNV-1a over the raw bytes. Collisions are possible but
   // extremely unlikely in practice (<1 MB init packets, small number
@@ -272,8 +460,11 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
     if (it != g_bytes_artifact_cache.end()) {
       auto stream =
           getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+      observation["bytes_cache_status"] = "bytes_cache_hit";
+      addCachedBinaryObservation(observation, binary, it->second.init_bin);
       stream.executeProgramAsync(it->second, args);
-      return;
+      recordLastLaunchObservation(observation);
+      return observation.dump();
     }
   }
 
@@ -301,8 +492,11 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
     if (it != g_bytes_artifact_cache.end()) {
       auto stream =
           getCurrentStream(c10::Device(c10::DeviceType::PrivateUse1, -1));
+      observation["bytes_cache_status"] = "bytes_cache_hit_after_wait";
+      addCachedBinaryObservation(observation, binary, it->second.init_bin);
       stream.executeProgramAsync(it->second, args);
-      return;
+      recordLastLaunchObservation(observation);
+      return observation.dump();
     }
   }
 
@@ -346,8 +540,17 @@ void launchKernelFromBytes(const std::vector<uint8_t>& binary,
     auto it = g_bytes_artifact_cache.find(key);
     TORCH_CHECK(it != g_bytes_artifact_cache.end(),
                 "Cached artifact not found after insertion");
+    observation["bytes_cache_status"] = "bytes_cache_miss";
+    addCachedBinaryObservation(observation, binary, it->second.init_bin);
     stream.executeProgramAsync(it->second, args);
   }
+  recordLastLaunchObservation(observation);
+  return observation.dump();
+}
+
+std::string getLastLaunchObservation() {
+  std::lock_guard<std::mutex> lock(g_last_launch_observation_mtx);
+  return g_last_launch_observation.dump();
 }
 
 void clearArtifactCache() {

@@ -170,9 +170,10 @@ PYBIND11_MODULE(_C, m) {
           tensor_args.push_back(item.cast<at::Tensor>());
         }
 
-        spyre::launchKernelFromBytes(binary, tensor_args);
+        return spyre::launchKernelFromBytes(binary, tensor_args);
       },
       "Launch a kernel from raw init packet bytes (Triton path)");
+  m.def("get_last_launch_observation", &spyre::getLastLaunchObservation);
   m.def("encode_constant", &spyre::encodeConstant);
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
