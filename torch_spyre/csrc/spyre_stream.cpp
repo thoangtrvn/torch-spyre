@@ -131,11 +131,18 @@ c10::Stream SpyreStream::unwrap() const {
   return stream_;
 }
 
-void SpyreStream::copyProgramAsync(
-    void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
-  // NOTE: the assumption is that the size of the program match the size of
-  // device_address
-  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+void SpyreStream::copyProgramAsync(void* prog_cpu_ptr,
+                                   const flex::CompositeAddress* device_address,
+                                   uint64_t program_bytes) const {
+  // Transfer exactly the program's own byte count. The device allocation may be
+  // rounded up beyond program_bytes; copying total_size() here would read past
+  // the end of the host program buffer, so the explicit count is bound to the
+  // program size and must fit inside the allocation.
+  TORCH_CHECK(program_bytes <= device_address->total_size(),
+              "Program byte count (", program_bytes,
+              ") exceeds device allocation (", device_address->total_size(),
+              ")");
+  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true, program_bytes);
 }
 
 void SpyreStream::copyAsync(const at::Tensor& src,
@@ -210,19 +217,23 @@ void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
 
 void SpyreStream::copyAsyncImpl(void* cpu_ptr,
                                 const flex::CompositeAddress* device_address,
-                                const DataConversionInfo* dci,
-                                bool host2device) const {
+                                const DataConversionInfo* dci, bool host2device,
+                                uint64_t copy_bytes) const {
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
   // Get the flex runtime stream handle
   flex::RuntimeStream* flex_stream = getRuntimeHandle();
 
+  // A non-zero copy_bytes transfers exactly that many bytes; otherwise the full
+  // device allocation is transferred (the tensor-copy default).
+  const uint64_t transfer_bytes =
+      copy_bytes != 0 ? copy_bytes : device_address->total_size();
+
   // Create and launch operation via flex's typed params API (the generic
   // launchOperation(op) overload was removed from flex).
-  auto* params =
-      flex::createDmaParams(cpu_ptr, device_address->total_size(), host2device,
-                            device_address, std::move(dci_ptr));
+  auto* params = flex::createDmaParams(cpu_ptr, transfer_bytes, host2device,
+                                       device_address, std::move(dci_ptr));
   if (host2device) {
     flex_stream->launchOperationH2D(params);
   } else {

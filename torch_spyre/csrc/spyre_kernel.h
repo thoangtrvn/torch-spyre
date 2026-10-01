@@ -55,14 +55,17 @@ std::string get_init_path(const std::string& code_dir);
 
 std::string get_pagi_path(const std::string& code_dir);
 
-KernelArtifacts& getOrLoadArtifacts(const std::string& code_dir,
-                                    const SpyreStream& stream);
+std::shared_ptr<KernelArtifacts> getOrLoadArtifacts(
+    const std::string& code_dir, const SpyreStream& stream);
 void launchKernel(const std::string& code_dir,
                   const std::vector<at::Tensor>& args);
-std::string launchKernelFromBytes(const std::vector<uint8_t>& binary,
-                                  const std::vector<at::Tensor>& args);
+json launchKernelFromBytes(const std::vector<uint8_t>& binary,
+                           const std::vector<at::Tensor>& args,
+                           const std::string& target,
+                           const std::string& generation);
 std::string getLastLaunchObservation();
 
 void clearArtifactCache();
+void shutdownRuntime();
 
 }  // namespace spyre

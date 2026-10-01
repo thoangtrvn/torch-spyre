@@ -43,8 +43,13 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  // Copies exactly ``program_bytes`` from ``prog_cpu_ptr`` into the device
+  // allocation. The byte count is explicit so the DMA never reads past the end
+  // of the host program buffer when the allocation is rounded up beyond the
+  // program size.
   void copyProgramAsync(void* prog_cpu_ptr,
-                        const flex::CompositeAddress* device_address) const;
+                        const flex::CompositeAddress* device_address,
+                        uint64_t program_bytes) const;
   void executeProgramAsync(const KernelArtifacts& arts,
                            const std::vector<at::Tensor>& args) const;
 
@@ -62,9 +67,13 @@ class SpyreStream {
 
   flex::RuntimeStream* getRuntimeHandle() const;
   flex::RuntimeStream* resolveRuntimeHandle() const;
+  // ``copy_bytes == 0`` transfers the full device allocation (the tensor-copy
+  // default); a non-zero value transfers exactly that many bytes (the program
+  // copy, bound to the program's own size rather than the rounded allocation).
   void copyAsyncImpl(void* cpu_ptr,
                      const flex::CompositeAddress* device_address,
-                     const DataConversionInfo* dci, bool host2device) const;
+                     const DataConversionInfo* dci, bool host2device,
+                     uint64_t copy_bytes = 0) const;
 };
 
 /**

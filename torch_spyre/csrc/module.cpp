@@ -20,17 +20,21 @@
 #include <pybind11/native_enum.h>
 #include <pybind11/operators.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
+#include "launch_identity.h"
 #include "logging.h"
 #include "spyre_allocator.h"
 #include "spyre_device_enum.h"
@@ -105,10 +109,7 @@ void startRuntime() {
   std::call_once(flag, _startRuntime);
 }
 
-void freeRuntime() {
-  clearArtifactCache();
-  GlobalRuntime::reset();
-}
+void freeRuntime() { shutdownRuntime(); }
 
 uint32_t encodeConstant(float torch_const, DataFormats df) {
   uint32_t sen_const;
@@ -151,14 +152,241 @@ int device_count() {
 }  // namespace spyre
 
 namespace py = pybind11;
+namespace {
+
+py::object jsonToPyObject(const nlohmann::json& value) {
+  if (value.is_object()) {
+    py::dict result;
+    for (auto it = value.begin(); it != value.end(); ++it) {
+      result[py::str(it.key())] = jsonToPyObject(it.value());
+    }
+    return std::move(result);
+  }
+  if (value.is_array()) {
+    py::list result;
+    for (const auto& item : value) {
+      result.append(jsonToPyObject(item));
+    }
+    return std::move(result);
+  }
+  if (value.is_string()) {
+    return py::str(value.get<std::string>());
+  }
+  if (value.is_boolean()) {
+    return py::bool_(value.get<bool>());
+  }
+  if (value.is_number_unsigned()) {
+    return py::int_(value.get<uint64_t>());
+  }
+  if (value.is_number_integer()) {
+    return py::int_(value.get<int64_t>());
+  }
+  if (value.is_number_float()) {
+    return py::float_(value.get<double>());
+  }
+  if (value.is_null()) {
+    return py::none();
+  }
+  throw std::runtime_error("Unsupported nlohmann::json value type");
+}
+
+class RuntimeLaunchObservation final {
+ public:
+  explicit RuntimeLaunchObservation(nlohmann::json observation)
+      : observation_(std::move(observation)) {}
+
+  py::dict consumeForRuntimeAudit() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (consumed_) {
+      throw std::runtime_error(
+          "RuntimeLaunchObservation has already been consumed by a runtime "
+          "identity audit");
+    }
+    consumed_ = true;
+    return jsonToPyObject(observation_).cast<py::dict>();
+  }
+
+  // Native-only single-use consumption that returns the raw observation JSON for
+  // in-extension validation. Shares the single-use flag with
+  // consumeForRuntimeAudit() so an observation can be consumed exactly once by
+  // either path, never both and never twice.
+  nlohmann::json consumeRawForNativeValidation() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (consumed_) {
+      throw std::runtime_error(
+          "RuntimeLaunchObservation has already been consumed by a runtime "
+          "identity audit");
+    }
+    consumed_ = true;
+    return std::move(observation_);
+  }
+
+ private:
+  std::mutex mutex_;
+  nlohmann::json observation_;
+  bool consumed_ = false;
+};
+
+// Extension-owned verdict of validating a runtime launch observation against
+// trusted expected identity. There is no Python constructor: only the native
+// validator below can hand one to Python, so Python cannot manufacture a
+// verdict that reports origin_verified. Trust is rooted in that construction
+// path (a genuine, pybind-registered observation single-use-consumed in C++),
+// never in a mutable module attribute comparison.
+class RuntimeLaunchIdentityVerdict final {
+ public:
+  RuntimeLaunchIdentityVerdict(bool origin_verified,
+                               std::vector<std::string> mismatches,
+                               nlohmann::json observation)
+      : origin_verified_(origin_verified),
+        mismatches_(std::move(mismatches)),
+        observation_(std::move(observation)) {}
+
+  bool originVerified() const { return origin_verified_; }
+
+  py::list mismatches() const {
+    py::list out;
+    for (const auto& mismatch : mismatches_) {
+      out.append(py::str(mismatch));
+    }
+    return out;
+  }
+
+  py::dict observation() const {
+    return jsonToPyObject(observation_).cast<py::dict>();
+  }
+
+ private:
+  bool origin_verified_;
+  std::vector<std::string> mismatches_;
+  nlohmann::json observation_;
+};
+
+[[noreturn]] py::object rejectRuntimeLaunchPickle() {
+  // Pickling is reconstruction from a byte stream: it would let a forged
+  // observation/verdict be minted offline, outside the native launch path that
+  // is the sole root of trust. copy/deepcopy are intentionally NOT routed here
+  // -- each type routes them to its own compatibility binding below (the
+  // observation consumes itself into a plain dict; the verdict aliases), so a
+  // caller that copies a launch result keeps working. Only reconstruction from
+  // a byte stream is refused.
+  throw py::type_error(
+      "this native runtime object is single-use and cannot be reconstructed or "
+      "pickled; use it in-process");
+}
+
+}  // namespace
+
 PYBIND11_MODULE(_C, m) {
   m.doc() = "Spyre C++ bindings";
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
+  py::class_<RuntimeLaunchObservation, std::shared_ptr<RuntimeLaunchObservation>>(
+      m, "RuntimeLaunchObservation")
+      .def("consume_for_runtime_audit",
+           &RuntimeLaunchObservation::consumeForRuntimeAudit)
+      // copy.copy / copy.deepcopy single-use-CONSUME the opaque observation into
+      // a plain diagnostic dict (the observation's own JSON fields). The Triton
+      // launcher deep-copies the launch result and then indexes it as a mapping
+      // (observation["launched_binary_sha256"] = ...; observation.get(...)); the
+      // native object has no mapping protocol, so returning the native object or
+      // an alias would still break that caller. Returning the consumed dict
+      // preserves it, and any subsequent deepcopy of that dict is an ordinary
+      // dict copy.
+      //
+      // This CANNOT authenticate provenance. The result is a plain mapping, not
+      // the pybind-registered native type, so it can never reach the native
+      // validator; and because the copy consumed the single-use original, any
+      // later native validation of the original fails closed. A genuine verdict
+      // is therefore obtainable only by validating the native original BEFORE it
+      // is copied. consumeForRuntimeAudit() shares the single-use flag with the
+      // native validator's consume, so exactly one of the two can ever run.
+      // Signatures match CPython's calls: __copy__(self); __deepcopy__(self, memo).
+      .def("__copy__",
+           [](RuntimeLaunchObservation& self) {
+             return self.consumeForRuntimeAudit();
+           })
+      .def("__deepcopy__",
+           [](RuntimeLaunchObservation& self, py::object) {
+             return self.consumeForRuntimeAudit();
+           })
+      // Pickling stays rejected, with signatures matching CPython's calls
+      // (__reduce__(self); __reduce_ex__(self, protocol)) so it fails as a clean
+      // TypeError rather than an arity error.
+      .def("__reduce__", [](py::object) { return rejectRuntimeLaunchPickle(); })
+      .def("__reduce_ex__",
+           [](py::object, int) { return rejectRuntimeLaunchPickle(); });
+  py::class_<RuntimeLaunchIdentityVerdict,
+             std::shared_ptr<RuntimeLaunchIdentityVerdict>>(
+      m, "RuntimeLaunchIdentityVerdict")
+      .def_property_readonly("origin_verified",
+                             &RuntimeLaunchIdentityVerdict::originVerified)
+      .def("mismatches", &RuntimeLaunchIdentityVerdict::mismatches)
+      .def("observation", &RuntimeLaunchIdentityVerdict::observation)
+      // copy.copy / copy.deepcopy alias the same extension-owned verdict, with
+      // correct __copy__(self) / __deepcopy__(self, memo) signatures so a caller
+      // that deep-copies a verdict gets the same object rather than a TypeError.
+      // Unlike the observation (whose copy consumes it into a plain dict), the
+      // verdict carries no single-use state, so aliasing is a safe compatibility
+      // choice; it still cannot be Python-manufactured. Pickling stays rejected.
+      .def("__copy__",
+           [](std::shared_ptr<RuntimeLaunchIdentityVerdict> self) {
+             return self;
+           })
+      .def("__deepcopy__",
+           [](std::shared_ptr<RuntimeLaunchIdentityVerdict> self, py::object) {
+             return self;
+           })
+      .def("__reduce__", [](py::object) { return rejectRuntimeLaunchPickle(); })
+      .def("__reduce_ex__",
+           [](py::object, int) { return rejectRuntimeLaunchPickle(); });
+  m.def(
+      "validate_runtime_launch_observation",
+      [](std::shared_ptr<RuntimeLaunchObservation> observation,
+         const std::string& expected_emitted_sha256,
+         const std::string& expected_target,
+         const std::string& expected_generation,
+         const std::string& expected_cache_identity) {
+        // The std::shared_ptr<RuntimeLaunchObservation> parameter is the
+        // unforgeable native gate: pybind casts the argument against the genuine
+        // registered type, so a monkeypatched _C.RuntimeLaunchObservation
+        // attribute or a pure-Python look-alike cannot reach this body. The
+        // object is single-use-consumed natively before validation.
+        //
+        // Fail closed on a null holder. pybind can convert Python None to a null
+        // std::shared_ptr even with .none(false) on some code paths/holder
+        // conversions, and dereferencing it below would call a method on a null
+        // object (the first act of which is a mutex lock) and crash the process.
+        // Reject it explicitly so the boundary raises a catchable Python
+        // exception instead of segfaulting.
+        if (!observation) {
+          throw py::type_error(
+              "validate_runtime_launch_observation requires a native "
+              "RuntimeLaunchObservation produced by launch_kernel_from_bytes, "
+              "not None");
+        }
+        nlohmann::json consumed =
+            observation->consumeRawForNativeValidation();
+        spyre::LaunchIdentityVerdict verdict =
+            spyre::validate_launch_identity_observation(
+                consumed, expected_emitted_sha256, expected_target,
+                expected_generation, expected_cache_identity);
+        return std::make_shared<RuntimeLaunchIdentityVerdict>(
+            verdict.origin_verified, std::move(verdict.mismatches),
+            std::move(consumed));
+      },
+      py::arg("observation").none(false), py::arg("expected_emitted_sha256"),
+      py::arg("expected_target"), py::arg("expected_generation"),
+      py::arg("expected_cache_identity"),
+      "Natively single-use-consume and validate an opaque runtime launch "
+      "observation against trusted expected identity. Returns an extension-owned "
+      "verdict that Python cannot manufacture; origin_verified is true only when "
+      "every identity leg matches.");
   m.def(
       "launch_kernel_from_bytes",
-      [](py::bytes binary_data, py::list args) {
+      [](py::bytes binary_data, py::list args, const std::string& target,
+         const std::string& generation) {
         // Convert py::bytes -> std::vector<uint8_t>
         std::string raw = binary_data;
         std::vector<uint8_t> binary(raw.begin(), raw.end());
@@ -170,9 +398,14 @@ PYBIND11_MODULE(_C, m) {
           tensor_args.push_back(item.cast<at::Tensor>());
         }
 
-        return spyre::launchKernelFromBytes(binary, tensor_args);
+        return std::make_shared<RuntimeLaunchObservation>(
+            spyre::launchKernelFromBytes(binary, tensor_args, target, generation));
       },
-      "Launch a kernel from raw init packet bytes (Triton path)");
+      py::arg("binary"), py::arg("args"),
+      py::arg("target") = std::string(spyre::kDefaultTarget),
+      py::arg("generation") = std::string(spyre::kDefaultGeneration),
+      "Launch a kernel from raw init packet bytes and return its single-use "
+      "native runtime observation.");
   m.def("get_last_launch_observation", &spyre::getLastLaunchObservation);
   m.def("encode_constant", &spyre::encodeConstant);
 
