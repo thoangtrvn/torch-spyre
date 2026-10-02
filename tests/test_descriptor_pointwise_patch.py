@@ -161,6 +161,26 @@ def test_spyre_descriptor_env_disables_block_ptr_only_when_enabled():
     assert result.returncode == 0, result.stderr
 
 
+def test_spyre_authorized_route_enables_descriptor_lowering_without_env_flag():
+    result = _run_script(
+        """
+        import torch
+        from torch_spyre._inductor import config as spyre_config
+        from torch_spyre._inductor.patches import enable_spyre_context
+
+        spyre_config.descriptor_normal_route_operation = 'descriptor_negation'
+        original_use_block_ptr = torch._inductor.config.triton.use_block_ptr
+        with enable_spyre_context([]):
+            assert torch._inductor.config.triton.use_tensor_descriptor is True
+            assert torch._inductor.config.triton.use_block_ptr is False
+        assert torch._inductor.config.triton.use_block_ptr is original_use_block_ptr
+        """,
+        descriptor_pointwise=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 
 def test_spyre_descriptor_context_logs_shadow_alignment_diagnostic():
     result = _run_script(
@@ -238,6 +258,104 @@ def test_spyre_pointwise_identity_capture_does_not_implicitly_upcast_to_fp32():
         assert 'arith.truncf' not in text
         """,
         descriptor_pointwise=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_spyre_pointwise_negation_capture_preserves_descriptor_dataflow():
+    result = _run_script(
+        """
+        import torch
+        from triton.backends.spyre.compiler import SpyreBackend
+
+        captured = []
+
+        class CapturedTTIR(RuntimeError):
+            pass
+
+        def capture_spyre_ir(mod, metadata, options):
+            text = mod.str_nodebug() if hasattr(mod, 'str_nodebug') else str(mod)
+            captured.append((text, options))
+            raise CapturedTTIR('captured')
+
+        SpyreBackend._make_spyre_ir = staticmethod(capture_spyre_ir)
+
+        @torch.compile
+        def negation(x):
+            return -x
+
+        x = torch.empty((512, 128), dtype=torch.float16).to('spyre')
+        try:
+            negation(x)
+        except Exception:
+            if not captured:
+                raise
+
+        text, options = captured[0]
+        assert text.count('tt.make_tensor_descriptor') == 2
+        assert text.count('tt.descriptor_load') == 1
+        assert text.count('tt.descriptor_store') == 1
+        assert text.count('arith.negf') == 1
+        assert 'tt.load' not in text
+        assert 'tt.store' not in text
+        assert '<1x64xf16>' in text
+        assert options.problem_m == 1024
+        assert options.problem_n == 64
+        assert options.problem_k == 0
+        """,
+        descriptor_pointwise=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_spyre_negation_route_injects_canonical_dimensions_from_structure():
+    result = _run_script(
+        """
+        import torch
+        import sentient_codegen.backend.descriptor_unary_route_authority as authority_module
+        from torch_spyre._inductor import config as spyre_config
+        from triton.backends.spyre.compiler import SpyreBackend
+
+        captured = []
+
+        class CapturedTTIR(RuntimeError):
+            pass
+
+        def capture_spyre_ir(mod, metadata, options):
+            captured.append((mod.str_nodebug(), options))
+            raise CapturedTTIR('captured')
+
+        SpyreBackend._make_spyre_ir = staticmethod(capture_spyre_ir)
+        authority_module.resolve_descriptor_unary_normal_route_authority = (
+            lambda operation, fingerprint: object()
+        )
+        spyre_config.descriptor_normal_route_operation = 'descriptor_negation'
+        spyre_config.descriptor_normal_route_rollout = 'canary_512x128_negation'
+        spyre_config.descriptor_normal_route_kill_switch = 'off'
+        spyre_config.descriptor_normal_route_authority_fingerprint = 'sha256:test'
+
+        @torch.compile
+        def negation(x):
+            return -x
+
+        x = torch.empty((512, 128), dtype=torch.float16).to('spyre')
+        try:
+            negation(x)
+        except Exception:
+            if not captured:
+                raise
+
+        text, options = captured[0]
+        assert text.count('tt.make_tensor_descriptor') == 2
+        assert text.count('tt.descriptor_load') == 1
+        assert text.count('tt.descriptor_store') == 1
+        assert text.count('arith.negf') == 1
+        assert (options.problem_m, options.problem_n, options.problem_k) == (512, 128, 1)
+        assert options.descriptor_normal_route_operation == 'descriptor_negation'
+        """,
+        descriptor_pointwise=False,
     )
 
     assert result.returncode == 0, result.stderr

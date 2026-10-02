@@ -186,7 +186,12 @@ def enable_spyre_context(
 
     import torch_spyre._inductor.lowering  # noqa: F401
 
-    _descriptor_pointwise_enabled = _env_flag_enabled(_DESCRIPTOR_POINTWISE_ENV)
+    from torch_spyre._inductor import config as spyre_config
+
+    _descriptor_pointwise_enabled = (
+        _env_flag_enabled(_DESCRIPTOR_POINTWISE_ENV)
+        or spyre_config.descriptor_normal_route_operation != "off"
+    )
 
     if _descriptor_pointwise_enabled:
         _diagnose_descriptor_argument_alignment(example_inputs)
@@ -309,6 +314,15 @@ def enable_spyre_context(
     _orig_tma_compatibility_checker_cls = (
         triton_codegen.TritonKernel.tma_compatibility_checker_cls
     )
+    _orig_triton_relu = triton_codegen.TritonOverrides.relu
+
+    def _spyre_descriptor_relu(value):
+        if spyre_config.descriptor_normal_route_operation == "descriptor_relu":
+            return f"tl.maximum({value}, tl.full([], 0.0, tl.float16), tl.PropagateNan.ALL)"
+        return _orig_triton_relu(value)
+
+    if spyre_config.descriptor_normal_route_operation == "descriptor_relu":
+        triton_codegen.TritonOverrides.relu = staticmethod(_spyre_descriptor_relu)
 
     class SpyreTMACompatibilityChecker(_orig_tma_compatibility_checker_cls):
         """Diagnostic-only TensorDescriptor eligibility for Spyre pointwise capture."""
@@ -435,5 +449,6 @@ def enable_spyre_context(
             triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
                 _orig_tma_compatibility_checker_cls
             )
+            triton_codegen.TritonOverrides.relu = _orig_triton_relu
             fuse_attention._sfdp_init = _orig_sfdp_init
             joint_graph.pass_patterns[:] = origin_pass

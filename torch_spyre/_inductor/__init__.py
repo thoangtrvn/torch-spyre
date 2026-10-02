@@ -210,6 +210,15 @@ def _autoload():
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
         _SPYRE_PROBLEM_KEYS = frozenset({"problem_m", "problem_n", "problem_k"})
+        _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS = frozenset({
+            "_descriptor_normal_route_request_operation",
+            "_descriptor_normal_route_request_rollout",
+            "_descriptor_normal_route_request_kill_switch",
+            "_descriptor_normal_route_request_authority_fingerprint",
+        })
+        _SPYRE_BACKEND_OPTION_KEYS = (
+            _SPYRE_PROBLEM_KEYS | _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS
+        )
 
         _orig_create_compile_meta = CachingAutotuner._create_compile_meta
 
@@ -221,7 +230,7 @@ def _autoload():
             # Without this removal, ASTSource.__init__() would try
             # fn.arg_names.index("problem_m") and raise ValueError because
             # "problem_m" is not a kernel parameter name.
-            for key in _SPYRE_PROBLEM_KEYS:
+            for key in _SPYRE_BACKEND_OPTION_KEYS:
                 compile_meta["constants"].pop(key, None)
             return compile_meta
 
@@ -229,13 +238,51 @@ def _autoload():
 
         def _spyre_create_compile_options(self, cfg, compile_meta):
             options = _orig_create_compile_options(self, cfg, compile_meta)
-            # Inject Spyre-specific keys from cfg.kwargs into the options dict.
-            # The original _create_compile_options only includes standard GPU
-            # options. Spyre's problem_m/n/k need to flow through to
-            # backend.parse_options() → SpyreOptions.
             for key in _SPYRE_PROBLEM_KEYS:
                 if key in cfg.kwargs:
                     options[key] = cfg.kwargs[key]
+
+            route_requested = cfg.kwargs.get(
+                "_descriptor_normal_route_request_operation", "off"
+            ) != "off"
+            if route_requested:
+                from .descriptor_route import descriptor_unary_route_eligibility
+
+                requested_operation = cfg.kwargs[
+                    "_descriptor_normal_route_request_operation"
+                ]
+                route_facts, problems = descriptor_unary_route_eligibility(
+                    requested_operation,
+                    getattr(self.fn, "src", ""),
+                    constexprs=cfg.kwargs,
+                    kernel_signature=compile_meta.get("signature", {}),
+                )
+                if route_facts is None:
+                    raise RuntimeError(
+                        f"{requested_operation} normal route requested, but the generated "
+                        "Triton artifact is not qualified: " + "; ".join(problems)
+                    )
+                (
+                    options["problem_m"],
+                    options["problem_n"],
+                    options["problem_k"],
+                ) = route_facts.problem_dimensions
+                request_to_option = {
+                    "_descriptor_normal_route_request_operation": (
+                        "descriptor_normal_route_operation"
+                    ),
+                    "_descriptor_normal_route_request_rollout": (
+                        "descriptor_normal_route_rollout"
+                    ),
+                    "_descriptor_normal_route_request_kill_switch": (
+                        "descriptor_normal_route_kill_switch"
+                    ),
+                    "_descriptor_normal_route_request_authority_fingerprint": (
+                        "descriptor_normal_route_authority_fingerprint"
+                    ),
+                }
+                for request_key, option_key in request_to_option.items():
+                    options[option_key] = cfg.kwargs[request_key]
             return options
 
         if not getattr(CachingAutotuner, "_spyre_patched", False):

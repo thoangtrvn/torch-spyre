@@ -296,17 +296,52 @@ class SpyreHeuristics(InductorChoices):
         # A monkey-patch on _create_compile_options (in __init__.py _autoload)
         # copies Spyre-recognized keys from cfg.kwargs into the options dict,
         # so backend.parse_options() receives them.
+        config_dict = kernel_kwargs.get("fixed_config", FixedTritonConfig({})).config.copy()
         if problem_dims and tiling:
             m = problem_dims.get("M", 0)
             n = problem_dims.get("N", 0)
             k = problem_dims.get("K", 0)
-            config_dict = kernel_kwargs.get("fixed_config", FixedTritonConfig({})).config.copy()
             if m > 0:
                 config_dict["problem_m"] = m
             if n > 0:
                 config_dict["problem_n"] = n
             if k > 0:
                 config_dict["problem_k"] = k
-            kernel_kwargs["fixed_config"] = FixedTritonConfig(config_dict)
+
+        from . import config as spyre_config
+
+        route_request = {
+            "_descriptor_normal_route_request_operation": (
+                spyre_config.descriptor_normal_route_operation
+            ),
+            "_descriptor_normal_route_request_rollout": (
+                spyre_config.descriptor_normal_route_rollout
+            ),
+            "_descriptor_normal_route_request_kill_switch": (
+                spyre_config.descriptor_normal_route_kill_switch
+            ),
+            "_descriptor_normal_route_request_authority_fingerprint": (
+                spyre_config.descriptor_normal_route_authority_fingerprint
+            ),
+        }
+        if route_request["_descriptor_normal_route_request_operation"] != "off":
+            from torch._inductor.async_compile import get_compile_threads
+            from sentient_codegen.backend.descriptor_unary_route_authority import (
+                resolve_descriptor_unary_normal_route_authority,
+            )
+
+            if get_compile_threads() != 1:
+                raise RuntimeError(
+                    "descriptor normal route requires same-process Inductor "
+                    "compilation with TORCHINDUCTOR_COMPILE_THREADS=1"
+                )
+            resolve_descriptor_unary_normal_route_authority(
+                route_request["_descriptor_normal_route_request_operation"],
+                route_request[
+                    "_descriptor_normal_route_request_authority_fingerprint"
+                ],
+            )
+            config_dict.update(route_request)
+        kernel_kwargs["fixed_config"] = FixedTritonConfig(config_dict)
 
         return kernel_kwargs
