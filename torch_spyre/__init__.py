@@ -220,6 +220,7 @@ def make_spyre_module() -> types.ModuleType:
             "current_stream",
             "default_stream",
             "synchronize",
+            "set_launch_context_provider",
         }:
             impl._lazy_init()
             from torch_spyre.streams import (
@@ -229,6 +230,7 @@ def make_spyre_module() -> types.ModuleType:
                 default_stream,
                 synchronize,
             )
+            from torch_spyre.launch_context import set_launch_context_provider
 
             streams_map = {
                 "Stream": Stream,
@@ -236,6 +238,7 @@ def make_spyre_module() -> types.ModuleType:
                 "current_stream": current_stream,
                 "default_stream": default_stream,
                 "synchronize": synchronize,
+                "set_launch_context_provider": set_launch_context_provider,
             }
             return streams_map[name]
         if codegen_only_available():

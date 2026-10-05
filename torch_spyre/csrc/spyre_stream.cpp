@@ -19,9 +19,12 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -125,6 +128,50 @@ void SpyreStream::synchronize() const {
 
   flex::RuntimeStream* handle = getRuntimeHandle();
   handle->synchronize();
+}
+
+void SpyreStream::synchronize(std::chrono::milliseconds timeout) const {
+  c10::DeviceGuard guard(stream_.device());
+
+  DEBUGINFO("SpyreStream::synchronize(timeout=", timeout.count(),
+            "ms) - stream ", id(), " on device ", device().index());
+
+  if (timeout.count() < 0) {
+    // A negative timeout is a caller bug, not a wait request — refuse rather
+    // than treat it as an immediate timeout.
+    TORCH_CHECK(false, "SpyreStream::synchronize: negative timeout (",
+                timeout.count(), "ms)");
+  }
+
+  flex::RuntimeStream* handle = getRuntimeHandle();
+
+  // Poll query() on a fixed cadence rather than busy-spinning. The total wait
+  // is bounded by timeout + one poll interval.
+  constexpr auto poll_interval = std::chrono::milliseconds(1);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!handle->query()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      // FIFO state, best effort: query() and queuedInFlight() are public on
+      // flex::RuntimeStream; the submitted-but-unfinished in-flight count is
+      // private, so the message reports what the API exposes and says so.
+      const unsigned queued = handle->queuedInFlight();
+      // Both ID namespaces so this error correlates with the device-wide one
+      // (which names flex stream IDs): the pool id is the c10 stream id
+      // (0..kStreamsPerDevice), the flex stream id is the scheduler's
+      // monotonic uint64.
+      TORCH_CHECK(false,
+                  "SpyreStreamSynchronizeTimeout: stream ", id(),
+                  " (flex stream ", handle->streamId(), ") on device ",
+                  device().index(), " did not become idle within ",
+                  timeout.count(), "ms (still busy at the poll deadline). ",
+                  "FIFO state: query()=busy, queued-not-yet-submitted ops = ",
+                  queued, "; submitted-but-in-flight count is not exposed by "
+                  "the stream API. The stream is NOT reset — the operation "
+                  "may still be running; a subsequent unbounded synchronize() "
+                  "or device reset is required to reclaim it.");
+    }
+    std::this_thread::sleep_for(poll_interval);
+  }
 }
 
 c10::Stream SpyreStream::unwrap() const {
@@ -373,8 +420,50 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
   return SpyreStream(c10::Stream(c10::Stream::UNSAFE, device, stream_id));
 }
 
+namespace {
+
+// Bounded wait on one flex handle. Returns true if idle within the timeout,
+// false at the deadline (the caller composes the multi-stream error so the
+// message names every stream that was still busy).
+bool waitForHandle(flex::RuntimeStream* handle,
+                   std::chrono::milliseconds timeout) {
+  constexpr auto poll_interval = std::chrono::milliseconds(1);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (!handle->query()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(poll_interval);
+  }
+  return true;
+}
+
+}  // anonymous namespace
+
+// Shared body of synchronizeDevice / synchronizeDeviceBounded: no timeout ->
+// the original unbounded per-handle wait; with timeout -> bounded poll that
+// names every stream still busy at the deadline in one typed error.
+void synchronizeDeviceImpl(c10::optional<c10::Device> device,
+                           std::optional<std::chrono::milliseconds> timeout);
+
 void synchronizeDevice(c10::optional<c10::Device> device) {
-  auto sync_one_device = [](c10::Device dev) {
+  synchronizeDeviceImpl(std::move(device), std::nullopt);
+}
+
+void synchronizeDeviceBounded(c10::optional<c10::Device> device,
+                              std::chrono::milliseconds timeout) {
+  // A negative timeout is a caller bug, not a wait request — refuse rather
+  // than treat it as an immediate timeout (mirrors the single-stream
+  // overload; validated here, the one entry lacking it).
+  TORCH_CHECK(timeout.count() >= 0,
+              "synchronize_bounded: negative timeout (", timeout.count(),
+              "ms)");
+  synchronizeDeviceImpl(std::move(device), timeout);
+}
+
+void synchronizeDeviceImpl(c10::optional<c10::Device> device,
+                           std::optional<std::chrono::milliseconds> timeout) {
+  auto sync_one_device = [&](c10::Device dev) {
     if (dev.index() == -1) {
       dev = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
     }
@@ -407,8 +496,43 @@ void synchronizeDevice(c10::optional<c10::Device> device) {
 
     auto runtime = GlobalRuntime::get();
     c10::DeviceGuard guard(dev);
+    if (!timeout.has_value()) {
+      for (auto handle : handles_to_sync) {
+        handle->synchronize();
+      }
+      return;
+    }
+
+    // Bounded pass with ONE shared deadline: every stream draws from the
+    // remaining time, so total wall time is bounded by a single timeout (a
+    // per-stream full timeout would multiply by the stream count while the
+    // error claimed one timeout). Check every stream so one exception names
+    // the complete set of stuck streams — a multi-stream hang should be fully
+    // diagnosed from a single error, not discovered one synchronize at a
+    // time. Per-stream FIFO counts are omitted here for brevity; the
+    // single-stream overload reports them.
+    const auto deadline = std::chrono::steady_clock::now() + *timeout;
+    std::vector<flex::StreamId> busy_ids;
     for (auto handle : handles_to_sync) {
-      handle->synchronize();
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0 || !waitForHandle(handle, remaining)) {
+        busy_ids.push_back(handle->streamId());
+      }
+    }
+    if (!busy_ids.empty()) {
+      std::ostringstream joined;
+      for (size_t i = 0; i < busy_ids.size(); ++i) {
+        if (i > 0) joined << ", ";
+        joined << busy_ids[i];
+      }
+      TORCH_CHECK(false,
+                  "SpyreStreamSynchronizeTimeout: device ", device_index,
+                  " did not become idle within ", timeout->count(),
+                  "ms. Flex stream IDs still busy: [", joined.str(),
+                  "]. The streams are NOT reset — the operations may still be "
+                  "running; a subsequent unbounded synchronize() or device "
+                  "reset is required to reclaim them.");
     }
   };
   if (device.has_value()) {

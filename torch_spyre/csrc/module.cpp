@@ -24,6 +24,7 @@
 #include <util/sen_data_convert.h>
 #include <util/sendefs.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>     // std::getenv
 #include <filesystem>  // NOLINT(build/c++17)
@@ -31,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <pybind11/chrono.h>  // chrono type casters for the bounded-sync bindings
 #include <string>
 #include <vector>
 
@@ -537,10 +539,25 @@ PYBIND11_MODULE(_C, m) {
   m.def("synchronize", &spyre::synchronizeDevice,
         py::arg("device") = py::none(), "Synchronize a device or all devices");
 
+  m.def("synchronize_bounded", &spyre::synchronizeDeviceBounded,
+        py::call_guard<py::gil_scoped_release>(),
+        py::arg("device") = py::none(), py::arg("timeout_ms"),
+        "Synchronize a device with a bounded wait; raises a typed timeout "
+        "error naming all stuck streams. The GIL is released for the wait.");
+
   // Expose SpyreStream class to Python
   py::class_<spyre::SpyreStream>(m, "_SpyreStreamBase")
-      .def("synchronize", &spyre::SpyreStream::synchronize,
+      .def("synchronize", py::overload_cast<>(&spyre::SpyreStream::synchronize,
+                                           py::const_),
            "Wait for all operations on this stream to complete")
+      .def("synchronize",
+           py::overload_cast<std::chrono::milliseconds>(
+               &spyre::SpyreStream::synchronize, py::const_),
+           py::call_guard<py::gil_scoped_release>(),
+           py::arg("timeout_ms"),
+           "Wait for all operations on this stream to complete, bounded by "
+           "timeout_ms; raises a typed timeout error on expiry. The GIL is "
+           "released for the wait.")
       .def("query", &spyre::SpyreStream::query,
            "Check if all operations on this stream have completed")
       .def("device", &spyre::SpyreStream::device,

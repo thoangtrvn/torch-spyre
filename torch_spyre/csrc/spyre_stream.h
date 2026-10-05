@@ -19,6 +19,7 @@
 #include <ATen/ATen.h>
 #include <c10/core/Stream.h>
 
+#include <chrono>
 #include <vector>
 
 #include "module.h"
@@ -41,6 +42,11 @@ class SpyreStream {
   // Synchronization
   bool query() const;        // Check if work completed
   void synchronize() const;  // Block until work done
+  // Bounded synchronize: poll query() until idle or ``timeout`` elapses. A
+  // timeout raises a typed SpyreStreamSynchronizeTimeout error naming the
+  // stream, device, and last-observed in-flight/queued operation counts —
+  // a hung kernel becomes a diagnosable error instead of a blocked thread.
+  void synchronize(std::chrono::milliseconds timeout) const;
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
   // Copies exactly ``program_bytes`` from ``prog_cpu_ptr`` into the device
@@ -117,5 +123,12 @@ SpyreStream getCurrentStream(
 SpyreStream setCurrentStream(SpyreStream stream);
 
 void synchronizeDevice(c10::optional<c10::Device> device);
+
+// Bounded device synchronize: every pooled stream must go idle within
+// ``timeout`` or a typed SpyreStreamSynchronizeTimeout error names all stuck
+// flex stream IDs. The streams are not reset — the caller decides whether to
+// wait unbounded or reset the device.
+void synchronizeDeviceBounded(c10::optional<c10::Device> device,
+                              std::chrono::milliseconds timeout);
 
 }  // namespace spyre

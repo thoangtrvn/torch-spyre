@@ -282,3 +282,7 @@ def set_current_stream(*args, **kwargs) -> None:
 
 def synchronize(*args, **kwargs) -> None:
     require_runtime("torch_spyre._C.synchronize")
+
+
+def synchronize_bounded(*args, **kwargs) -> None:
+    require_runtime("torch_spyre._C.synchronize_bounded")

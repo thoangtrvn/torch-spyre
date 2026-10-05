@@ -2,6 +2,7 @@ import torch
 from typing import Optional
 from torch_spyre import _C  # C++ extension module
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.launch_context import describe_recent_launches
 
 # Expose in module
 __all__ = [
@@ -10,7 +11,37 @@ __all__ = [
     "current_stream",
     "default_stream",
     "synchronize",
+    "SpyreStreamSynchronizeTimeout",
 ]
+
+
+class SpyreStreamSynchronizeTimeout(RuntimeError):
+    """A bounded synchronize expired with work still on the stream(s).
+
+    The C++ layer raises this as a RuntimeError whose message begins with
+    the ``SpyreStreamSynchronizeTimeout:`` prefix; the Python wrappers here
+    detect that prefix and re-raise this subclass so callers can catch the
+    typed form. The stream is NOT reset — the operation may still be
+    running; an unbounded synchronize() or device reset reclaims it.
+    """
+
+    _MESSAGE_PREFIX = "SpyreStreamSynchronizeTimeout:"
+
+
+def _as_synchronize_timeout(exc: RuntimeError) -> RuntimeError:
+    """Re-raise plan for a C-layer RuntimeError from a bounded synchronize.
+
+    Timeout errors (recognized by their message prefix) are re-typed as
+    SpyreStreamSynchronizeTimeout with the launch-context appended; any other
+    RuntimeError from the C layer is returned unchanged so it propagates as
+    raised.
+    """
+    if not str(exc).startswith(SpyreStreamSynchronizeTimeout._MESSAGE_PREFIX):
+        return exc
+    context = describe_recent_launches()
+    if context:
+        return SpyreStreamSynchronizeTimeout(f"{exc}\nRecent launches: {context}")
+    return SpyreStreamSynchronizeTimeout(str(exc))
 
 
 class Stream:
@@ -62,9 +93,25 @@ class Stream:
         _C.set_current_stream(self._prev_stream)
         return False
 
-    def synchronize(self):
-        """Wait for all operations on this stream to complete"""
-        self._cdata.synchronize()
+    def synchronize(self, timeout_ms: Optional[int] = None):
+        """Wait for all operations on this stream to complete.
+
+        Args:
+            timeout_ms (int, optional): Bounded wait in milliseconds. When
+                given, a stream that does not go idle within the bound raises
+                a typed SpyreStreamSynchronizeTimeout RuntimeError naming the
+                stream, device, timeout, and last-known FIFO state, plus the
+                compiler-side launch context when a provider is registered.
+                When None (default), waits unbounded — the historical
+                behavior.
+        """
+        if timeout_ms is None:
+            self._cdata.synchronize()
+            return
+        try:
+            self._cdata.synchronize(timeout_ms)
+        except RuntimeError as exc:
+            raise _as_synchronize_timeout(exc) from exc
 
     def query(self) -> bool:
         """Check if all operations on this stream have completed"""
@@ -163,18 +210,28 @@ def default_stream(device: Optional[torch.device] = None) -> Stream:
     return stream_obj
 
 
-def synchronize(device: Optional[torch.device] = None):
+def synchronize(device: Optional[torch.device] = None,
+                timeout_ms: Optional[int] = None):
     """
     Synchronize all streams on a device.
 
     Args:
         device (torch.device, optional): Device to synchronize.
                                         If None, synchronizes all devices.
+        timeout_ms (int, optional): Bounded wait in milliseconds. When given,
+                                    streams that do not go idle within the
+                                    bound raise a typed
+                                    SpyreStreamSynchronizeTimeout RuntimeError
+                                    naming every stuck stream, plus the
+                                    compiler-side launch context when a
+                                    provider is registered. When None
+                                    (default), waits unbounded.
 
     Example:
         >>> stream.synchronize()  # Sync given stream
         >>> torch_spyre.synchronize()  # Sync all devices
         >>> torch_spyre.synchronize('spyre:0')  # Sync device 0
+        >>> torch_spyre.synchronize(timeout_ms=30_000)  # Bounded wait
     """
     if device is not None:
         if isinstance(device, int):
@@ -182,4 +239,10 @@ def synchronize(device: Optional[torch.device] = None):
         elif isinstance(device, str):
             device = torch.device(device)
 
-    _C.synchronize(device)
+    if timeout_ms is None:
+        _C.synchronize(device)
+        return
+    try:
+        _C.synchronize_bounded(device, timeout_ms)
+    except RuntimeError as exc:
+        raise _as_synchronize_timeout(exc) from exc
