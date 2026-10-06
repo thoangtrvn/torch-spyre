@@ -138,6 +138,51 @@ def _build_launch_plan(m: int, n: int, num_cores: int, dtype_bits: int):
         m, n, num_cores=num_cores, dtype_bits=dtype_bits)
 
 
+def _softmax_launch_tensors_by_symbol(scratch, xc, out):
+    """The single named mapping from plan symbol to launch tensor.
+
+    WHY A NAMED MAPPING, NOT TWO PARALLEL LISTS: the launch needs the same
+    three tensors in TWO forms — specs for ``validate_positional_launch``
+    (keyed by symbol id) and a positional list for the C++ call. Maintaining
+    them as independent hand-written artifacts reintroduces the exact
+    permutation class the plan gate exists to close: a refactor that swaps
+    two tensors in the positional list while leaving the specs intact would
+    pass validation and launch the wrong binding. Deriving BOTH forms from
+    ONE mapping makes that permutation structurally impossible — there is
+    no second ordering to get wrong.
+
+    The symbol order (arg0=scratch, arg1=xc, arg2=out) is the plan's own
+    argN segment convention; the C++ list is built in the plan's symbol
+    order, never a hand-maintained one.
+    """
+    return {"arg0": scratch, "arg1": xc, "arg2": out}
+
+
+def _softmax_launch_specs(tensors_by_symbol):
+    """Named launch specs for ``validate_positional_launch`` — module-level
+    and off-box testable, the same relocation rationale as
+    ``_resolve_num_cores``: this module is not importable off-box, so a
+    derivation kept inline in the op is a derivation no test can reach —
+    which is exactly how a drifted spec list would survive review.
+
+    Each extent is the RUNTIME allocation's actual byte size
+    (``numel() * element_size()``), never the plan's requirement echoed
+    back (that would make the extent gate compare a number with itself).
+    The declared roles are the op's by-construction knowledge — it knows
+    which tensor is its workspace, input and output; a generic launcher
+    could only echo the plan's access modes (tautology), which is why role
+    validation lives here.
+    """
+    return {
+        "arg0": (tensors_by_symbol["arg0"].numel()
+                 * tensors_by_symbol["arg0"].element_size(), "workspace"),
+        "arg1": (tensors_by_symbol["arg1"].numel()
+                 * tensors_by_symbol["arg1"].element_size(), "input"),
+        "arg2": (tensors_by_symbol["arg2"].numel()
+                 * tensors_by_symbol["arg2"].element_size(), "output"),
+    }
+
+
 @torch.library.custom_op("spyre::softmax", mutates_args=(), device_types="spyre")
 def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     """softmax over the trailing dimension of a 2-D ``[M, N]`` DL16 activation."""
@@ -185,8 +230,36 @@ def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
                           dtype=x.dtype, device=x.device)
     out = torch.zeros((m, n), dtype=x.dtype, device=x.device)
 
-    # Positional XLAT binding: seg0=scratch, seg1=x, seg2=out. See module docstring.
-    launch_kernel_from_bytes(plan.binary, [scratch, xc, out])
+    # T-LR-2B plan consumption: gate the launch through the plan's own
+    # binding contract BEFORE the C++ call. Both the specs and the C++
+    # positional list are DERIVED from the one named mapping
+    # (``_softmax_launch_tensors_by_symbol``), so there is no second
+    # hand-maintained ordering that a refactor could permute while leaving
+    # the specs intact — the exact defect class the named-spec gate closes.
+    # A refusal propagates: there is no fallback that would make an
+    # unproven binding launchable. The C++ call stays positional by
+    # recorded deferral — flex/C++ enforcement of the plan is a separate
+    # seam (T-LR-3).
+    try:
+        from sentient_codegen.backend.launch_abi import validate_positional_launch
+    except ImportError as e:
+        raise SoftmaxHostError(
+            "sentient_codegen not importable — source env.sh so codegen is on "
+            "PYTHONPATH (required to validate the softmax launch bindings)."
+        ) from e
+    tensors_by_symbol = _softmax_launch_tensors_by_symbol(scratch, xc, out)
+    validate_positional_launch(
+        plan.xlat_plan,
+        plan.binary,
+        _softmax_launch_specs(tensors_by_symbol),
+    )
+    # The C++ list is built in the PLAN's own symbol order, never a
+    # hand-maintained one — the runtime's xlat[i]=tensor_allocs[i] convention
+    # is the plan's argN segment convention.
+    launch_kernel_from_bytes(
+        plan.binary,
+        [tensors_by_symbol[s.symbol_id] for s in plan.xlat_plan.symbols],
+    )
     return out
 
 
