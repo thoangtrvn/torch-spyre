@@ -126,8 +126,9 @@ void synchronizeDevice(c10::optional<c10::Device> device);
 
 // Bounded device synchronize: every pooled stream must go idle within
 // ``timeout`` or a typed SpyreStreamSynchronizeTimeout error names all stuck
-// flex stream IDs. The streams are not reset — the caller decides whether to
-// wait unbounded or reset the device.
+// pool stream IDs (flex streams have no ids of their own). The streams are
+// not reset — the caller decides whether to wait unbounded or reset the
+// device.
 void synchronizeDeviceBounded(c10::optional<c10::Device> device,
                               std::chrono::milliseconds timeout);
 

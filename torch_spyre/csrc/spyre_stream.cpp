@@ -151,24 +151,21 @@ void SpyreStream::synchronize(std::chrono::milliseconds timeout) const {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (!handle->query()) {
     if (std::chrono::steady_clock::now() >= deadline) {
-      // FIFO state, best effort: query() and queuedInFlight() are public on
-      // flex::RuntimeStream; the submitted-but-unfinished in-flight count is
-      // private, so the message reports what the API exposes and says so.
-      const unsigned queued = handle->queuedInFlight();
-      // Both ID namespaces so this error correlates with the device-wide one
-      // (which names flex stream IDs): the pool id is the c10 stream id
-      // (0..kStreamsPerDevice), the flex stream id is the scheduler's
-      // monotonic uint64.
+      // TODO: flex::RuntimeStream exposes no queuedInFlight() or streamId()
+      // (the in-flight count is the private in_flight_ atomic and streams have
+      // no id of their own — see flex/runtime_stream/runtime_stream.hpp).
+      // Re-enable these diagnostics if flex grows public accessors:
+      //   const unsigned queued = handle->queuedInFlight();
+      //   ... " (flex stream ", handle->streamId(), ") on device " ...
       TORCH_CHECK(false,
                   "SpyreStreamSynchronizeTimeout: stream ", id(),
-                  " (flex stream ", handle->streamId(), ") on device ",
+                  " on device ",
                   device().index(), " did not become idle within ",
                   timeout.count(), "ms (still busy at the poll deadline). ",
-                  "FIFO state: query()=busy, queued-not-yet-submitted ops = ",
-                  queued, "; submitted-but-in-flight count is not exposed by "
-                  "the stream API. The stream is NOT reset — the operation "
-                  "may still be running; a subsequent unbounded synchronize() "
-                  "or device reset is required to reclaim it.");
+                  "FIFO state: query()=busy; the in-flight op count is not "
+                  "exposed by the stream API. The stream is NOT reset — the "
+                  "operation may still be running; a subsequent unbounded "
+                  "synchronize() or device reset is required to reclaim it.");
     }
     std::this_thread::sleep_for(poll_interval);
   }
@@ -470,6 +467,10 @@ void synchronizeDeviceImpl(c10::optional<c10::Device> device,
     const auto device_index = dev.index();
 
     std::vector<flex::RuntimeStream*> handles_to_sync;
+    // Parallel to handles_to_sync: the pool (c10) stream id for each handle,
+    // used to name busy streams in the timeout error. flex::RuntimeStream has
+    // no streamId() of its own (see the TODO in the single-stream overload).
+    std::vector<c10::StreamId> pool_ids;
     {
       auto& pool = getStreamPool();
       std::lock_guard<std::mutex> lock(pool.mutex);
@@ -478,6 +479,7 @@ void synchronizeDeviceImpl(c10::optional<c10::Device> device,
       auto default_it = pool.stream_handle_map.find(0);
       if (default_it != pool.stream_handle_map.end()) {
         handles_to_sync.push_back(default_it->second);
+        pool_ids.push_back(default_it->first);
       }
 
       auto collect = [&](auto& stream_map) {
@@ -487,6 +489,7 @@ void synchronizeDeviceImpl(c10::optional<c10::Device> device,
           auto h = pool.stream_handle_map.find(sid);
           if (h != pool.stream_handle_map.end()) {
             handles_to_sync.push_back(h->second);
+            pool_ids.push_back(h->first);
           }
         }
       };
@@ -509,15 +512,15 @@ void synchronizeDeviceImpl(c10::optional<c10::Device> device,
     // error claimed one timeout). Check every stream so one exception names
     // the complete set of stuck streams — a multi-stream hang should be fully
     // diagnosed from a single error, not discovered one synchronize at a
-    // time. Per-stream FIFO counts are omitted here for brevity; the
-    // single-stream overload reports them.
+    // time.
     const auto deadline = std::chrono::steady_clock::now() + *timeout;
-    std::vector<flex::StreamId> busy_ids;
-    for (auto handle : handles_to_sync) {
+    std::vector<c10::StreamId> busy_ids;
+    for (size_t i = 0; i < handles_to_sync.size(); ++i) {
       const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
           deadline - std::chrono::steady_clock::now());
-      if (remaining.count() <= 0 || !waitForHandle(handle, remaining)) {
-        busy_ids.push_back(handle->streamId());
+      if (remaining.count() <= 0 ||
+          !waitForHandle(handles_to_sync[i], remaining)) {
+        busy_ids.push_back(pool_ids[i]);
       }
     }
     if (!busy_ids.empty()) {
@@ -529,7 +532,7 @@ void synchronizeDeviceImpl(c10::optional<c10::Device> device,
       TORCH_CHECK(false,
                   "SpyreStreamSynchronizeTimeout: device ", device_index,
                   " did not become idle within ", timeout->count(),
-                  "ms. Flex stream IDs still busy: [", joined.str(),
+                  "ms. Pool stream IDs still busy: [", joined.str(),
                   "]. The streams are NOT reset — the operations may still be "
                   "running; a subsequent unbounded synchronize() or device "
                   "reset is required to reclaim them.");

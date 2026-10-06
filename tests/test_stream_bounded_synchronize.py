@@ -34,8 +34,10 @@ class _FakeCStream:
     """SpyreStream._cdata stand-in recording synchronize calls.
 
     The timeout message reproduces the real C++ error shape including the
-    FIFO-state suffix, so a C++ change dropping the FIFO sentence or the
-    not-reset clause breaks these tests rather than passing silently.
+    FIFO-state sentence and the not-reset clause, so a C++ change dropping
+    either breaks these tests rather than passing silently. (flex streams
+    expose no id or in-flight count, so the message carries pool ids and
+    query() state only.)
     """
 
     def __init__(self, hang: bool = False):
@@ -46,11 +48,11 @@ class _FakeCStream:
         self.calls.append(timeout_ms)
         if timeout_ms is not None and self.hang:
             raise RuntimeError(
-                "SpyreStreamSynchronizeTimeout: stream 0 (flex stream 7) on "
+                "SpyreStreamSynchronizeTimeout: stream 0 on "
                 "device 0 did not become idle within 10ms (still busy at the "
                 "poll deadline). "
-                "FIFO state: query()=busy, queued-not-yet-submitted ops = 2; "
-                "submitted-but-in-flight count is not exposed by the stream "
+                "FIFO state: query()=busy; the in-flight op count is not "
+                "exposed by the stream "
                 "API. The stream is NOT reset — the operation may still be "
                 "running; a subsequent unbounded synchronize() or device "
                 "reset is required to reclaim it."
