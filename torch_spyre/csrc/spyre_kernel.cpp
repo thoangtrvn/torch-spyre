@@ -611,6 +611,29 @@ json launchKernelFromBytes(const std::vector<uint8_t>& binary,
   TORCH_CHECK(binary.size() >= 64, "Init packet too small: ", binary.size(),
               " bytes (minimum 64 = header + SPR flit)");
 
+  // Refuse the two-layer kernel container at the device boundary. A container
+  // starts with the ASCII magic "SPYR" (first byte 'S', 0x53) where a raw
+  // launchable init packet starts with the QGInit magic byte 0xDD, so the
+  // discrimination is unambiguous. This boundary consumes RAW device payloads
+  // only: the runtime unwrapper that extracts the Layer-2 payload (and reserves
+  // the container's declared off-chip footprint) is not implemented yet and
+  // lands atomically with the first consumer (kernel-container-format.md,
+  // "Refusal surface"). The size checks above are NOT a reliable backstop —
+  // whether a container passes %32 and >=64 depends on its total length mod 32
+  // (a real wrapped matmul is caught by %32; other shapes are not). The
+  // refusal is on the magic, not the size: without it, any container whose
+  // length happens to be 32-aligned would be copied to the device verbatim,
+  // launching 40 bytes of header as if it were a QGInit packet — silent
+  // device corruption with zero diagnostic.
+  TORCH_CHECK(binary.size() < 4 || binary[0] != 'S' || binary[1] != 'P' ||
+                  binary[2] != 'Y' || binary[3] != 'R',
+              "Refusing byte launch: binary starts with the kernel container "
+              "magic 'SPYR'. This boundary takes RAW init packets (starting "
+              "with the QGInit magic byte 0xDD), not two-layer containers. "
+              "Extract the payload with kernel_container.extract_payload() "
+              "before launching; the runtime unwrapper that does this "
+              "automatically is not implemented yet.");
+
   // Load artifacts — no global map lock held during device allocation/copy. The
   // artifact is owned by a shared_ptr so a cache hit can hold it alive across its
   // asynchronous enqueue, and so teardown's shared/exclusive gate governs its
