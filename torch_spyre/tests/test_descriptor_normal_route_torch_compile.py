@@ -202,7 +202,7 @@ def _relu_normal_route_authority():
         input_nan_count=0,
         expected_nan_count=0,
         observed_nan_count=0,
-        nan_policy="finite_inputs_only_per_nnan_contract",
+        input_corpus="finite_dl16_exact_with_signed_zeros",
         proves_hardware_execution=True,
         proves_hardware_correctness=True,
         production_authority=False,
