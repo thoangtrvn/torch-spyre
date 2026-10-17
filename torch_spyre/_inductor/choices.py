@@ -310,6 +310,19 @@ class SpyreHeuristics(InductorChoices):
 
         from . import config as spyre_config
 
+        # T-SR-39: SENCORES core-budget bridge. The single validated
+        # config read (config.sencores) flows to SpyreOptions.num_cores
+        # through the SAME serialized FixedTritonConfig channel as
+        # problem_m/n/k — kernel kwargs are function arguments, so
+        # async_compile worker processes see the scheduling process's
+        # value. An env-read default_factory in the fork's SpyreOptions
+        # would NOT survive reliably across those workers (the
+        # _spyre_problem_dims_store defect class) and is the forbidden
+        # pattern. Unconditional: explicit provenance on every compile,
+        # and the default (32) matches the fork field default so the
+        # options cache key is unchanged when SENCORES is unset.
+        config_dict["num_cores"] = spyre_config.sencores
+
         route_request = {
             "_descriptor_normal_route_request_operation": (
                 spyre_config.descriptor_normal_route_operation

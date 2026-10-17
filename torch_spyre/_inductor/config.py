@@ -17,7 +17,13 @@ import sys
 
 from torch.utils._config_module import install_config_module
 
-sencores: int = int(os.getenv("SENCORES", "32"))
+from torch_spyre.core_budget import validated_sencores
+
+# T-SR-39: single SENCORES read, validated loud ([1, 32]) — a malformed
+# env value refuses at import instead of poisoning every downstream
+# core-count decision. The value flows to SpyreOptions.num_cores via
+# SpyreHeuristics.triton_kernel_kwargs (the problem_m/n/k channel).
+sencores: int = validated_sencores(os.getenv("SENCORES", "32"))
 
 # The bounded descriptor-negation route is deliberately process-local and
 # default-off. A trusted caller registers typed authority in sentient_codegen

@@ -232,7 +232,7 @@ def build_embedding_launches(
     element_bits: int,
     flat_idx: list[int],
     target: str = "rcudd1a",
-    max_cores: int = 32,
+    max_cores: int | None = None,
 ) -> tuple[list[tuple[tuple[int, int], bytes]], int]:
     """Plan + build per-launch embedding binaries for a flat list of token indices.
 
@@ -242,6 +242,11 @@ def build_embedding_launches(
         binary writes regardless of how many real tokens are in the final launch.
         The caller must allocate a tokens_per_launch-sized buffer for each launch
         and copy only the real rows (buf[:end-start]) into the output tensor.
+
+    max_cores defaults to the validated SENCORES core budget
+    (torch_spyre._inductor.config.sencores, T-SR-39) instead of a
+    hardcoded 32 — an explicit value still wins for callers that size
+    their own launches.
 
     Each binary is built for exactly tokens_per_launch output slots; passing a
     shorter slice (as the old API did for the final partial launch) causes the
@@ -265,6 +270,14 @@ def build_embedding_launches(
 
     if not flat_idx:
         return [], 0
+
+    # T-SR-39: default the core budget to the validated SENCORES read
+    # (lazy import — the ops layer must not pull the Inductor package
+    # at module import time).
+    if max_cores is None:
+        from torch_spyre._inductor import config as spyre_config
+
+        max_cores = spyre_config.sencores
 
     # Bounds check: indices must be in [0, vocab).
     for idx in flat_idx:

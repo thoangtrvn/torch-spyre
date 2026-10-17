@@ -209,7 +209,16 @@ def _autoload():
         # options instead.
         from torch._inductor.runtime.triton_heuristics import CachingAutotuner
 
-        _SPYRE_PROBLEM_KEYS = frozenset({"problem_m", "problem_n", "problem_k"})
+        # Scalar Spyre backend options transported from cfg.kwargs to
+        # backend.parse_options(): the problem dimensions AND the
+        # SENCORES core budget (T-SR-39 — num_cores rides the same
+        # channel: choices.py embeds it in FixedTritonConfig, it is
+        # stripped from compile_meta["constants"] here, and copied into
+        # the options dict below so SpyreOptions.num_cores receives the
+        # scheduling process's validated config.sencores value).
+        _SPYRE_PROBLEM_KEYS = frozenset({
+            "problem_m", "problem_n", "problem_k", "num_cores",
+        })
         _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS = frozenset({
             "_descriptor_normal_route_request_operation",
             "_descriptor_normal_route_request_rollout",

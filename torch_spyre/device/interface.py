@@ -46,10 +46,12 @@ def _detect_device_properties() -> SpyreDeviceProperties:
     """
     import os
 
-    try:
-        num_cores = int(os.environ.get("SENCORES", "32"))
-    except ValueError:
-        num_cores = 32
+    from torch_spyre.core_budget import validated_sencores
+
+    # T-SR-39: loud validation — a garbage SENCORES env value previously
+    # fell back SILENTLY to 32 here, reporting a core budget nobody
+    # requested. Refuse at the read instead.
+    num_cores = validated_sencores(os.environ.get("SENCORES", "32"))
 
     return SpyreDeviceProperties(
         type="spyre",
