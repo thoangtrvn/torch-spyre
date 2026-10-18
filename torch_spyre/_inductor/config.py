@@ -25,6 +25,17 @@ from torch_spyre.core_budget import validated_sencores
 # SpyreHeuristics.triton_kernel_kwargs (the problem_m/n/k channel).
 sencores: int = validated_sencores(os.getenv("SENCORES", "32"))
 
+# T-SR-40: torch-level opt-in for the fork's TTIR parse backend
+# (ttir_parse_backend). None = fork default ("legacy") — nothing is
+# injected into the compile channel, so the options cache key and every
+# existing compile are untouched. "structured" is the flip soak's knob:
+# choices.py pairs it with require_stage0_admission=True (the T-SR-38
+# fence — the trapped combination is inexpressible from this channel)
+# and both ride the FixedTritonConfig transport into the fork's
+# parse_options. Unknown spellings refuse loud at the injection point
+# (same refusal class as the fork's parse_options misspelling guard).
+ttir_parse_backend: str | None = None
+
 # The bounded descriptor-negation route is deliberately process-local and
 # default-off. A trusted caller registers typed authority in sentient_codegen
 # and sets only its returned fingerprint here; the mutable authority object is

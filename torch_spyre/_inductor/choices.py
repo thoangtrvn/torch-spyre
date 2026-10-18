@@ -323,6 +323,25 @@ class SpyreHeuristics(InductorChoices):
         # options cache key is unchanged when SENCORES is unset.
         config_dict["num_cores"] = spyre_config.sencores
 
+        # T-SR-40: torch-level ttir_parse_backend channel. None (default)
+        # injects nothing — the fork's own default ("legacy") stands and
+        # the options cache key is unchanged. "structured" is auto-paired
+        # with require_stage0_admission=True: the T-SR-38 fence makes
+        # structured-without-admission the convicted non-authority-shell
+        # trap, so this channel cannot express it (the fork's
+        # parse_options refusal remains the backstop for direct callers).
+        parse_backend = spyre_config.ttir_parse_backend
+        if parse_backend is not None:
+            if parse_backend not in ("legacy", "structured"):
+                raise ValueError(
+                    "torch_spyre._inductor.config.ttir_parse_backend must be "
+                    f"'legacy', 'structured', or None (fork default), got "
+                    f"{parse_backend!r}"
+                )
+            config_dict["ttir_parse_backend"] = parse_backend
+            if parse_backend == "structured":
+                config_dict["require_stage0_admission"] = True
+
         route_request = {
             "_descriptor_normal_route_request_operation": (
                 spyre_config.descriptor_normal_route_operation

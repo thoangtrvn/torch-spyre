@@ -219,6 +219,13 @@ def _autoload():
         _SPYRE_PROBLEM_KEYS = frozenset({
             "problem_m", "problem_n", "problem_k", "num_cores",
         })
+        # T-SR-40: parse-route knobs ride the same transport. They are
+        # fork SpyreOptions fields under their own names (unlike the
+        # descriptor route_request keys, which are renamed on copy), so
+        # they join the direct-copy set and the constants-strip union.
+        _SPYRE_PARSE_ROUTE_KEYS = frozenset({
+            "ttir_parse_backend", "require_stage0_admission",
+        })
         _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS = frozenset({
             "_descriptor_normal_route_request_operation",
             "_descriptor_normal_route_request_rollout",
@@ -226,7 +233,9 @@ def _autoload():
             "_descriptor_normal_route_request_authority_fingerprint",
         })
         _SPYRE_BACKEND_OPTION_KEYS = (
-            _SPYRE_PROBLEM_KEYS | _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS
+            _SPYRE_PROBLEM_KEYS
+            | _SPYRE_PARSE_ROUTE_KEYS
+            | _SPYRE_DESCRIPTOR_ROUTE_REQUEST_KEYS
         )
 
         _orig_create_compile_meta = CachingAutotuner._create_compile_meta
@@ -247,7 +256,7 @@ def _autoload():
 
         def _spyre_create_compile_options(self, cfg, compile_meta):
             options = _orig_create_compile_options(self, cfg, compile_meta)
-            for key in _SPYRE_PROBLEM_KEYS:
+            for key in _SPYRE_PROBLEM_KEYS | _SPYRE_PARSE_ROUTE_KEYS:
                 if key in cfg.kwargs:
                     options[key] = cfg.kwargs[key]
 
