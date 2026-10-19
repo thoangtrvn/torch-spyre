@@ -526,10 +526,17 @@ def lower_spyre_from_d2d(src, dst):
 
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
-    fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
-
     def inner_fn(index):
-        return fn(input.make_loader()(index))
+        # The deleted SDSC kernel ops exposed an identity `overwrite`
+        # marker (PointwiseOp("overwrite", [input]) in spyre_kernel.py,
+        # removed in the TritonScheduling swap of 02a8c8b); the Triton
+        # kernel overrides have no such method, so the previous
+        # ops_wrapper("overwrite") call here raised AttributeError and
+        # killed every overwrite_f consumer under the compiled path
+        # (torch.cat, constant_pad_nd — T-SR-59). The
+        # Scatter/MutationLayout pair below already expresses the
+        # mutation; the wrapper was a pass-through.
+        return input.make_loader()(index)
 
     def output_indexer(index):
         out_index = [*index]
