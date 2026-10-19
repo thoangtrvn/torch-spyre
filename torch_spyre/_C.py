@@ -37,6 +37,7 @@ __all__: list[str] = [
     "current_device",
     "device_count",
     "empty_with_layout",
+    "encode_constant",
     "get_device_dtype",
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
@@ -56,6 +57,7 @@ if _backend is not None:
     get_spyre_tensor_layout = _backend.get_spyre_tensor_layout
     set_spyre_tensor_layout = _backend.set_spyre_tensor_layout
     copy_tensor = _backend.copy_tensor
+    encode_constant = _backend.encode_constant
     device_count = _backend.device_count
     current_device = _backend.current_device
     set_device = _backend.set_device
@@ -252,8 +254,11 @@ def to_with_layout(*args, **kwargs):
     require_runtime("torch_spyre._C.to_with_layout")
 
 
-def encode_constant(*args, **kwargs) -> int:
-    require_runtime("torch_spyre._C.encode_constant")
+if _backend is None:
+
+    def encode_constant(*args, **kwargs) -> int:
+        # no _codegen_backend extension: nothing can encode constants
+        require_runtime("torch_spyre._C.encode_constant")
 
 
 def get_downcast_warning() -> bool:

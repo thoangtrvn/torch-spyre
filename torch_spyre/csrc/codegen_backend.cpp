@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -577,6 +578,60 @@ void copy_tensor(const at::Tensor& src, const at::Tensor& dst, bool non_blocking
               "Spyre codegen copy_tensor expects one Spyre tensor");
 }
 
+// Bit-level float->uint32 (deeptools BinaryConvert<uint32_t>).
+static inline uint32_t float_to_bits(float f) {
+  uint32_t bits;
+  std::memcpy(&bits, &f, 4);
+  return bits;
+}
+
+// Ported verbatim from deeptools/util/sen_data_convert.cpp
+// (FloatToFp16BinInternal): sentient fp16 (DL16, 1-6-9) encoding. This
+// feeds encode_constant(), which lands in generated device binaries —
+// getting it wrong silently corrupts constants.
+static inline uint16_t float_to_fp16_bin(float f) {
+  const uint32_t f32 = float_to_bits(f);
+  const int32_t exponent = ((f32 >> 23) & 0xFF) - 127;
+  uint32_t fraction = f32 & 0x7FFFFF;
+  // fp32: 1 (sign) + 8 (exp) + 23 (fra) -> sentient fp16: 1 + 6 + 9
+
+  uint32_t rounding = 0;
+  if (((fraction >> (23 - 9 - 1)) & 1) && ((fraction >> (23 - 9)) != 0x1FF)) {
+    rounding = 1;
+  }
+  fraction = (fraction >> (23 - 9)) + rounding;
+  uint32_t f16;
+  if (exponent > 31) {
+    f16 = (f32 >> 16) | 0x7FFF;  // INF with sign bit
+
+    // Typical DL use-case is mask operation where saturating does not
+    // impact accuracy and avoids potential NaN values during computation
+    if (f < 0) {
+      // for large negative values, cap saturation at 0xEFFF
+      f16 = f16 & 0xEFFF;
+    } else {
+      // for large positive values, cap saturation at 0x6FFF
+      f16 = f16 & 0x6FFF;
+    }
+  } else if (exponent < -30) {
+    f16 = (f32 >> 16) & 0x8000;  // Zero with sign bit
+  } else {
+    f16 = ((f32 >> 16) & 0x8000) |
+          static_cast<uint32_t>(exponent + 31) << 9u | fraction;
+  }
+  return static_cast<uint16_t>(f16);
+}
+
+// Mirrors spyre::encodeConstant in csrc/module.cpp (the full runtime
+// build's torch_spyre._C.encode_constant).
+uint32_t encode_constant(float torch_const, DataFormats df) {
+  if (df == DataFormats::IEEE_FP32) {
+    return float_to_bits(torch_const);
+  }
+  return float_to_fp16_bin(torch_const);
+}
+
+
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("empty.memory_format", TORCH_FN(spyre_codegen_empty));
   m.impl("empty_strided", TORCH_FN(spyre_codegen_empty_strided));
@@ -673,4 +728,6 @@ PYBIND11_MODULE(_codegen_backend, m) {
   m.def("set_spyre_tensor_layout", &spyre::codegen::set_spyre_tensor_layout);
   m.def("copy_tensor", &spyre::codegen::copy_tensor, py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
+  m.def("encode_constant", &spyre::codegen::encode_constant,
+        py::arg("value"), py::arg("dtype"));
 }
