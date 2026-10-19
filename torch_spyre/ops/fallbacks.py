@@ -46,6 +46,7 @@
 
 import functools
 import os
+import threading
 import warnings
 
 import torch
@@ -74,11 +75,56 @@ _warn_skips = (
 
 
 def warn_fallback(op, fallback_device="cpu"):
-    warnings.warn(
-        f"{op} is falling back to {fallback_device}",
-        category=FallbackWarning,
-        skip_file_prefixes=_warn_skips,
-    )
+    try:
+        warnings.warn(
+            f"{op} is falling back to {fallback_device}",
+            category=FallbackWarning,
+            skip_file_prefixes=_warn_skips,
+        )
+    except TypeError:
+        # torch >= 2.13 no longer patches warnings.warn to accept
+        # skip_file_prefixes. Fall back to a plain warning: same message,
+        # same category, same once-filter — only the attribution skip is
+        # lost. Without this, every fallback dispatch raises TypeError
+        # under torch 2.13 (all of tests/test_fallbacks.py errors out).
+        warnings.warn(
+            f"{op} is falling back to {fallback_device}",
+            category=FallbackWarning,
+        )
+
+
+# Counted fallback ledger (T-CV-8): every dispatch that reaches a
+# registered fallback kernel is counted by op, BEFORE warn_fallback —
+# the warnings layer is "once"-filtered and must never gate counting.
+# Known gap: aten.normal_.default is registered in ops/eager.py (in-place
+# op, outside register_fallback) and does not call warn_fallback, so its
+# dispatches are NOT counted here.
+_fallback_ledger: dict[str, int] = {}
+_fallback_ledger_lock = threading.Lock()
+
+
+def _record_fallback_dispatch(op) -> None:
+    """Count one fallback dispatch for ``op`` (internal, thread-safe)."""
+    key = str(op)
+    with _fallback_ledger_lock:
+        _fallback_ledger[key] = _fallback_ledger.get(key, 0) + 1
+
+
+def get_fallback_ledger() -> dict[str, int]:
+    """Snapshot copy of the counted fallback ledger.
+
+    Maps ``str(op)`` (e.g. ``"aten::sin.default"``) to the number of
+    dispatches that reached that op's registered fallback kernel in this
+    process. Counts reflect invocations, not emitted FallbackWarnings.
+    """
+    with _fallback_ledger_lock:
+        return dict(_fallback_ledger)
+
+
+def reset_fallback_ledger() -> None:
+    """Clear the counted fallback ledger."""
+    with _fallback_ledger_lock:
+        _fallback_ledger.clear()
 
 
 def _get_op_overloads(
@@ -216,6 +262,7 @@ def register_fallback(ops, device="cpu"):
 
             @functools.wraps(fn)
             def _wrapped(*args, **kwargs):
+                _record_fallback_dispatch(op)
                 warn_fallback(op, fallback_device)
                 return _fallback(fn, *args, **kwargs)
 
