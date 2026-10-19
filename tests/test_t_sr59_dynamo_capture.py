@@ -135,8 +135,16 @@ def test_spyre_to_dtype_arg_captures_without_graph_break():
 
 
 @_codegen_needed
-def test_torch_zeros_on_spyre_device_captures_without_graph_break():
-    """A device factory inside the graph must not hit the pybind layout ctor."""
+def test_torch_empty_on_spyre_device_captures_without_graph_break():
+    """A torch.empty inside the graph must not hit the pybind layout ctor.
+
+    Uses torch.empty DIRECTLY: torch.zeros reaches the C++ fill_ path and
+    never calls the patched Python-level torch.empty, so a zeros-bodied
+    test is green even on the unfixed parent — empty is the red-on-parent
+    body that actually exercises spyre_empty under tracing. Acceptance is
+    by counters, not exception text: no graph breaks and unique_graphs
+    == 1 (the backend returned; see the note in the script below).
+    """
     result = _run_script(
         """
         import torch
@@ -145,14 +153,23 @@ def test_torch_zeros_on_spyre_device_captures_without_graph_break():
         torch_spyre._autoload()
 
         def fn(x):
-            return x + torch.zeros(1, x.shape[1], 32, device=x.device)
+            return x + torch.empty(1, x.shape[1], 32, device=x.device)
 
         x = torch.randn(1, 8, 32).to("spyre")
         cfn = torch.compile(fn, dynamic=False)
         try:
             cfn(x)
-        except Exception as exc:
-            assert "codegen-only" in str(exc), type(exc).__name__
+        except Exception:
+            # Execution-time failure is classified by the counters below,
+            # not by the exception text: this body's kernel currently dies
+            # at the triton-spyre driver launcher with a segment-mismatch
+            # ValueError (a driver/codegen defect, another lane) rather
+            # than the codegen-only launch refusal — either way it is
+            # AFTER compile. unique_graphs increments only when the
+            # backend returns, so unique_graphs == 1 proves compile
+            # succeeded; a graph break or a compile-time death leaves
+            # it at 0 with non-empty graph_break / a re-raised error.
+            pass
 
         import torch._dynamo.utils as dynamo_utils
 
@@ -309,23 +326,24 @@ def test_static_cache_capture_and_execution_counts_on_cpu():
 
 @_codegen_needed
 @_transformers_needed
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "T-SR-59 follow-up: full spyre-path codegen of the stock decoder is "
-        "blocked by op coverage, not by the cache seam — prefill dies in "
-        "UnsupportedPointwiseOpError ('pointwise_unsupported' has no SFP "
-        "binary) and decode in KeyError 'YBLOCK' (triton heuristics). "
-        "Capture itself is clean: 0 graph breaks, 2 unique graphs."
-    ),
-)
 def test_stock_decoder_static_cache_spyre_capture():
     """Full acceptance on the registered spyre stack (codegen-only, offline).
 
-    Capture + compile-count assertions: 0 graph breaks, 2 unique graphs,
-    2 backend compilations (recompile-per-token or silent eager fallback
-    cannot pass). Compiled-execution counts are structurally zero offline
-    (codegen-only cannot launch); the executing leg is the CPU test above.
+    Capture asserts run FIRST and are inspectable while the backend
+    raises: 0 graph breaks, no failure outside the known op-coverage
+    blocker classes, no silent eager fallback. A capture regression
+    (e.g. a graph break reintroduced into the monkey patches) FAILS this
+    test even while the op-coverage blockers still fire — it cannot hide
+    behind the blocker xfail.
+
+    The subprocess classifies outcomes and exits:
+      0  full acceptance (all calls launch-refused; unique_graphs is then
+         observable and asserted == 2 with exactly 2 backend compiles)
+      3  capture clean, but spyre op-coverage blockers still live
+         (prefill UnsupportedPointwiseOpError / decode KeyError 'YBLOCK')
+      1  capture regression or unexpected failure class
+    Exit 3 maps to pytest.xfail; exit 0 FAILS the test with instructions
+    to promote it (blockers lifted); anything else FAILS with stderr.
     """
     pytest.importorskip("transformers")
     result = _run_script(
@@ -339,12 +357,12 @@ def test_stock_decoder_static_cache_spyre_capture():
         import torch._dynamo.utils as dynamo_utils
         import torch._inductor.compile_fx as cfx
 
-        compiles = 0
+        reentries = 0
         _orig = cfx.compile_fx
 
         def _counting(gm, example_inputs, *args, **kwargs):
-            global compiles
-            compiles += 1
+            global reentries
+            reentries += 1
             return _orig(gm, example_inputs, *args, **kwargs)
 
         cfx.compile_fx = _counting
@@ -353,6 +371,12 @@ def test_stock_decoder_static_cache_spyre_capture():
         from transformers.models.llama.modeling_llama import (
             LlamaConfig,
             LlamaDecoderLayer,
+        )
+
+        # Op-coverage blockers (spyre codegen, NOT the cache seam):
+        BLOCKERS = (
+            "UnsupportedPointwiseOpError",  # prefill: SFP pointwise
+            "KeyError: 'YBLOCK'",           # decode: triton heuristics
         )
 
         dynamo_utils.counters.clear()
@@ -445,17 +469,59 @@ def test_stock_decoder_static_cache_spyre_capture():
                 mask.to(device),
             )
 
+        outcomes = []
         for args in [prefill(128)] + [decode(s, 128) for s in range(12)]:
             try:
                 fn(*args, cache)
+                outcomes.append("ok")
             except Exception as exc:
-                assert "codegen-only" in str(exc), f"{type(exc).__name__}: {exc}"
+                text = f"{type(exc).__name__}: {exc}"
+                if "codegen-only" in text:
+                    outcomes.append("refused")
+                elif any(sig in text for sig in BLOCKERS):
+                    outcomes.append("blocker")
+                else:
+                    outcomes.append(
+                        "FAILED " + text.splitlines()[0][:200]
+                    )
 
+        # ── Capture asserts FIRST (inspectable while compile fails) ──
         graph_breaks = dict(dynamo_utils.counters["graph_break"])
         assert not graph_breaks, graph_breaks
-        stats = dict(dynamo_utils.counters["stats"])
-        assert stats.get("unique_graphs", 0) == 2, stats
-        assert compiles == 2, compiles
+        failed = [o for o in outcomes if o.startswith("FAILED")]
+        assert not failed, failed
+        # No silent eager fallback: every call compiled (re-entry) or
+        # reached the codegen-only launch refusal.
+        assert reentries + outcomes.count("refused") >= len(outcomes), (
+            reentries,
+            outcomes,
+        )
+
+        if outcomes.count("refused") == len(outcomes):
+            # Full acceptance: backend returned for every call, so
+            # unique_graphs is observable — exactly prefill + decode,
+            # compiled once each.
+            stats = dict(dynamo_utils.counters["stats"])
+            assert stats.get("unique_graphs", 0) == 2, stats
+            assert reentries == 2, reentries
+            raise SystemExit(0)
+        raise SystemExit(3)
         """
     )
-    assert result.returncode == 0, result.stderr
+    if result.returncode == 0:
+        pytest.fail(
+            "full spyre-path acceptance passed — the op-coverage "
+            "blockers are lifted; promote the unique_graphs/reentry "
+            "assertions to unconditional and drop the exit-3 branch"
+        )
+    if result.returncode == 3:
+        pytest.xfail(
+            "spyre op-coverage blockers (prefill: 'pointwise_unsupported' "
+            "has no SFP binary; decode: KeyError 'YBLOCK') — the capture "
+            "asserts (no graph breaks, no out-of-class failures, no eager "
+            "fallback) already passed before this xfail"
+        )
+    pytest.fail(
+        f"capture regression or unexpected failure (exit "
+        f"{result.returncode}): {result.stderr}"
+    )
