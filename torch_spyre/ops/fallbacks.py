@@ -72,21 +72,38 @@ _warn_skips = (
     os.path.dirname(torch.__file__),
     torch._inductor.runtime.cache_dir_utils.cache_dir(),
 )
+# None = not yet probed; set by warn_fallback on first dispatch.
+_skip_prefixes_supported: bool | None = None
 
 
 def warn_fallback(op, fallback_device="cpu"):
-    try:
+    # Feature probe cached on first dispatch: torch >= 2.13 no longer
+    # patches warnings.warn to accept skip_file_prefixes, and probing
+    # per call would put a try/except on every fallback dispatch.
+    global _skip_prefixes_supported
+    if _skip_prefixes_supported is None:
+        try:
+            warnings.warn(
+                f"{op} is falling back to {fallback_device}",
+                category=FallbackWarning,
+                skip_file_prefixes=_warn_skips,
+            )
+            _skip_prefixes_supported = True
+            return
+        except TypeError:
+            _skip_prefixes_supported = False
+            # Fall through to the plain warning: same message, same
+            # category, same once-filter — only the attribution skip is
+            # lost. Without this, every fallback dispatch raises
+            # TypeError under torch 2.13 (all of tests/test_fallbacks.py
+            # errors out).
+    if _skip_prefixes_supported:
         warnings.warn(
             f"{op} is falling back to {fallback_device}",
             category=FallbackWarning,
             skip_file_prefixes=_warn_skips,
         )
-    except TypeError:
-        # torch >= 2.13 no longer patches warnings.warn to accept
-        # skip_file_prefixes. Fall back to a plain warning: same message,
-        # same category, same once-filter — only the attribution skip is
-        # lost. Without this, every fallback dispatch raises TypeError
-        # under torch 2.13 (all of tests/test_fallbacks.py errors out).
+    else:
         warnings.warn(
             f"{op} is falling back to {fallback_device}",
             category=FallbackWarning,
@@ -113,9 +130,10 @@ def _record_fallback_dispatch(op) -> None:
 def get_fallback_ledger() -> dict[str, int]:
     """Snapshot copy of the counted fallback ledger.
 
-    Maps ``str(op)`` (e.g. ``"aten::sin.default"``) to the number of
-    dispatches that reached that op's registered fallback kernel in this
-    process. Counts reflect invocations, not emitted FallbackWarnings.
+    Maps ``str(op)`` (e.g. ``"aten.sin.default"``, ``"aten.sin.out"``) to
+    the number of dispatches that reached that op's registered fallback
+    kernel in this process. Counts reflect invocations, not emitted
+    FallbackWarnings.
     """
     with _fallback_ledger_lock:
         return dict(_fallback_ledger)
