@@ -26,14 +26,13 @@ deliverable — these tests ARE the timestamped measurement, kept green):
     options value "legacy", same hash, one triton cache entry).
   - sencores_flip (SENCORES 8 -> 4): RECOMPILES. Same mechanism —
     SpyreOptions.num_cores (T-SR-39) is in backend_options.hash().
-  - effort_flip (SENTIENT_AUTOTUNE_EFFORT unset -> "full"):
-    STALE-SERVES — the flip phase replays the warm kernel; the backend
-    compile never runs. The env var is read inside codegen
-    (autotuner/effort.py), rides no SpyreOptions field, and the triton
-    cache env_vars component hashes only TRITON_*. Fixing this needs a
-    fork-side change (options field or env_vars extension) — filed as
-    the follow-up row; this test documents the CURRENT defect and is
-    DELIBERATELY red when someone fixes it, prompting the update.
+  - effort_flip (SENTIENT_AUTOTUNE_EFFORT unset -> "full"): RECOMPILES
+    (re-keyed by T-SR-43, 2026-10-18). Formerly the measured T-SR-41
+    defect: the env var is read inside codegen (autotuner/effort.py),
+    rides no SpyreOptions field, and the triton cache env_vars component
+    hashed only the C++ CACHE_INVALIDATING_ENV_VARS set — the flip
+    stale-served the warm kernel. The fork now merges SENTIENT_* env
+    vars (minus an observation-only neutral set) into get_cache_key.
 
 Each test runs the warm phase WITHOUT capture (no-op launch seam so the
 compile succeeds and the caches store real entries), then the flip
@@ -121,28 +120,24 @@ def test_semantically_identical_config_flip_stale_serves(cache_root):
     assert "SpyreRuntimeUnavailableError" in str(b.get("outcome")), b
 
 
-def test_sentient_effort_flip_is_currently_stale_served(cache_root):
-    """DOCUMENTED DEFECT (T-SR-41 measurement, 2026-10-18): flipping
-    SENTIENT_AUTOTUNE_EFFORT across a warm cache serves the STALE
-    kernel — the backend compile never runs. The env var rides no
-    SpyreOptions field and the triton cache env_vars component hashes
-    only TRITON_*. When the re-key lands (fork-side options field or
-    env_vars extension), this test goes RED on purpose — flip the
-    assertion to captured=1 then."""
+def test_sentient_effort_flip_rekeys(cache_root):
+    """RE-KEYED (T-SR-43, 2026-10-18): flipping SENTIENT_AUTOTUNE_EFFORT
+    across a warm cache now RECOMPILES — the backend compile runs
+    (captured=1). Formerly the measured T-SR-41 defect: the env var rides
+    no SpyreOptions field and the fork triton cache key hashed only the
+    C++ CACHE_INVALIDATING_ENV_VARS set, so the flip stale-served. Fixed
+    fork-side: triton/runtime/cache.py merges SENTIENT_* env vars (minus
+    the observation-only neutral set) into get_cache_key, and the
+    autotuner's check_disk_cache key does the same."""
     probe = _probe()
     warm, flip = probe.AXES["effort_flip"]
     a = probe._run_inner(cache_root, "effort_flip", "warm", capture=False, **warm)
     assert a.get("captured") == "0" and a.get("outcome") == "ok", a
     b = probe._run_inner(cache_root, "effort_flip", "flip", capture=True, **flip)
-    assert b.get("captured") == "0", (
-        "SENTIENT_AUTOTUNE_EFFORT flip now RECOMPILES — the re-key "
-        f"landed; update this test and the TIER_13 row: {b}"
+    assert b.get("captured") == "1", (
+        "SENTIENT_AUTOTUNE_EFFORT flip STALE-SERVED (backend compile "
+        f"never ran) — the T-SR-43 fork re-key regressed: {b}"
     )
-    # Prove execution reached the launch seam (genuine cache-layer serve,
-    # not a pre-compile failure mislabeled as stale — R1 MINOR 1).
-    # Box-independent (R2 MINOR 1 refuted): the subprocess env pins
-    # TORCH_SPYRE_CODEGEN_ONLY=1, and require_runtime raises
-    # SpyreRuntimeUnavailableError on that env var ALONE
-    # (_runtime.py:54-60, _CODEGEN_ONLY_ENV) — whether or not the full
-    # runtime .so is installed on the box.
-    assert "SpyreRuntimeUnavailableError" in str(b.get("outcome")), b
+    # captured=1 means the capture hook ran inside the backend compile —
+    # the recompile itself is the proof the flip reached compilation (no
+    # launch-seam reachability check applies on the recompile path).
