@@ -243,12 +243,14 @@ SpyreTensorImpl::shallow_copy_and_detach_core(
     bool allow_tensor_metadata_change) const {
   if (key_set_.has(c10::DispatchKey::Python) &&
       !c10::impl::tls_is_dispatch_key_excluded(c10::DispatchKey::Python)) {
+#ifndef TORCH_SPYRE_COMPILE_ONLY
     auto r = (*c10::impl::getGlobalPyInterpreter())->detach(this);
     if (r) {
       r->set_version_counter(version_counter);
       r->set_allow_tensor_metadata_change(allow_tensor_metadata_change);
       return r;
     }
+#endif
   }
   auto impl = c10::make_intrusive<SpyreTensorImpl>(storage_, key_set_,
                                                    data_type_, spyre_layout);

@@ -16,6 +16,7 @@ import os
 import threading
 import types
 import importlib
+from pathlib import Path
 
 import torch
 
@@ -52,6 +53,19 @@ class _SpyreImpl:
         self._lazy_init()
         return super().__getattribute__(name)
 
+    @staticmethod
+    def _load_runtime_stubs():
+        """Compile-only builds ship a _runtime_stubs.dylib defining the
+        unresolved flex/senlib/sendnn/boost symbols so _C.so can load
+        without the real runtime libraries (macOS, no hardware). Its
+        presence is the build-mode marker; regular builds have no such
+        file and this is a no-op."""
+        import ctypes
+
+        stub = Path(__file__).parent / "_runtime_stubs.dylib"
+        if stub.exists():
+            ctypes.CDLL(str(stub), mode=ctypes.RTLD_GLOBAL)
+
     def _lazy_init(self):
         if self._initialized:
             return
@@ -65,6 +79,7 @@ class _SpyreImpl:
             # The C++ startRuntime() is std::call_once, so eager device ops trigger
             # it independently of this Python path; this remains for callers that
             # want explicit runtime init.
+            self._load_runtime_stubs()
             self._C = importlib.import_module("torch_spyre._C")
             from torch_spyre import logging_config
 
@@ -74,7 +89,13 @@ class _SpyreImpl:
             if pending is not None:
                 self._C.set_device(pending)
             # this will create the allocator
-            self._C.start_runtime()
+            if self.device_count() > 0:
+                self._C.start_runtime()
+            else:
+                # compile-only builds (no runtime libs / no devices): skip
+                # runtime init — _C is importable and kernel generation
+                # (inductor/triton-spyre/codegen) never calls into it.
+                pass
             self._initialized = True
 
     def _is_in_bad_fork(self) -> bool:
@@ -169,6 +190,13 @@ class _SpyreImpl:
     def _mark_after_fork(self):
         self._initialized = True
         self._in_bad_fork = True
+
+
+# Compile-only builds (see setup.py, TORCH_SPYRE_COMPILE_ONLY=1) need the
+# runtime stub dylib in the process before ANY extension (_C or _hooks)
+# is dlopened. _hooks is imported by _autoload() ahead of _lazy_init(),
+# so preload at package import. No-op for regular builds.
+_SpyreImpl._load_runtime_stubs()
 
 
 def make_spyre_module() -> types.ModuleType:
