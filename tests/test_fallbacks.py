@@ -150,23 +150,26 @@ class TestFallbackLedger(TestCase):
     must track invocations, not emitted warnings. These tests pin that
     distinction plus reset and thread-safety.
 
-    Spyre tensors are built with ``torch.empty(..., device="spyre")``
-    (allocation is simulated under the codegen-only build) rather than
-    ``.to("spyre")`` (a data copy, which the codegen-only build refuses).
-    The fallback kernels themselves run on CPU and round-trip through
-    the simulated allocator, so these tests do not need the hardware
-    runtime.
+    The ledger counts every dispatch BEFORE the fallback's CPU round-trip,
+    so counting is observable even where the round-trip itself is refused:
+    under the codegen-only build the spyre<->cpu data copy raises
+    "Spyre codegen copy_ expects a Spyre destination tensor" (all
+    pre-existing TestFallbacks cases error locally for that same
+    reason). ``_dispatch`` tolerates exactly that refusal — under a full
+    runtime build the dispatch completes and the same count assertions
+    hold.
     """
 
-    LEDGER_OP = "aten::sin.default"
+    LEDGER_OP = "aten.sin.default"
     THREADS = 4
     INVOCATIONS_PER_THREAD = 25
+    CODEGEN_ONLY_COPY_REFUSAL = "Spyre codegen copy_"
 
     def setUp(self):
         torch.random.manual_seed(42)
-        # "error" makes the once-filter drop every warning: if counting
-        # were gated on warn_fallback, all ledger tests below would see 0.
-        warnings.simplefilter("error", FallbackWarning)
+        # "ignore" drops every warning: if counting were gated on
+        # warn_fallback, all ledger tests below would see 0.
+        warnings.simplefilter("ignore", FallbackWarning)
         reset_fallback_ledger()
 
     def tearDown(self):
@@ -176,15 +179,25 @@ class TestFallbackLedger(TestCase):
     def _spyre_input(self):
         return torch.empty((64,), dtype=torch.float16, device="spyre")
 
+    def _dispatch(self, fn, *args, **kwargs):
+        """Run one fallback dispatch; tolerate only the codegen-only
+        copy refusal (the ledger count precedes it either way)."""
+        try:
+            return fn(*args, **kwargs)
+        except RuntimeError as e:
+            if self.CODEGEN_ONLY_COPY_REFUSAL not in str(e):
+                raise
+            return None
+
     def test_ledger_counts_per_invocation_not_per_warning(self):
         x = self._spyre_input()
         for _ in range(5):
-            torch.sin(x)
+            self._dispatch(torch.sin, x)
         self.assertEqual(get_fallback_ledger().get(self.LEDGER_OP), 5)
 
     def test_ledger_reset(self):
         x = self._spyre_input()
-        torch.sin(x)
+        self._dispatch(torch.sin, x)
         self.assertEqual(get_fallback_ledger().get(self.LEDGER_OP), 1)
         reset_fallback_ledger()
         self.assertEqual(get_fallback_ledger(), {})
@@ -192,12 +205,15 @@ class TestFallbackLedger(TestCase):
     def test_ledger_out_variant_counted_once(self):
         x = self._spyre_input()
         buf = torch.empty_like(x)
-        torch.sin(x, out=buf)
-        self.assertEqual(get_fallback_ledger().get(self.LEDGER_OP), 1)
+        self._dispatch(torch.sin, x, out=buf)
+        # out= dispatches the .out overload: one invocation, one count,
+        # under that overload's own key — never double-counted.
+        self.assertEqual(get_fallback_ledger().get("aten.sin.out"), 1)
+        self.assertIsNone(get_fallback_ledger().get(self.LEDGER_OP))
 
     def test_ledger_snapshot_is_a_copy(self):
         x = self._spyre_input()
-        torch.sin(x)
+        self._dispatch(torch.sin, x)
         snapshot = get_fallback_ledger()
         snapshot[self.LEDGER_OP] = 999
         self.assertEqual(get_fallback_ledger().get(self.LEDGER_OP), 1)
@@ -206,7 +222,7 @@ class TestFallbackLedger(TestCase):
         def worker():
             x = self._spyre_input()
             for _ in range(self.INVOCATIONS_PER_THREAD):
-                torch.sin(x)
+                self._dispatch(torch.sin, x)
 
         threads = [threading.Thread(target=worker) for _ in range(self.THREADS)]
         for t in threads:
