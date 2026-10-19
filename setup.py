@@ -88,7 +88,22 @@ INCLUDE_DIRS = [
     # "tracy/public"
 ]
 LIBRARY_DIRS = []
-LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+
+# Kernel-generation-only build (e.g. macOS, no Spyre hardware or flex/sendnn
+# runtimes available): compile against the flex/sendnn *headers* but skip
+# linking the runtime shared libraries. The C++ extension bundles are linked
+# with undefined symbols allowed (macOS: -undefined dynamic_lookup; Linux:
+# GNU ld permits undefined symbols in shared objects by default), so the
+# extension loads as long as no runtime code path (allocator, streams,
+# start_runtime, kernel launch) is executed. Kernel generation —
+# torch.compile through the inductor/triton-spyre/codegen path — never calls
+# into flex/sendnn. Set TORCH_SPYRE_COMPILE_ONLY=1 to enable.
+COMPILE_ONLY_BUILD = os.environ.get("TORCH_SPYRE_COMPILE_ONLY", "0") == "1"
+
+if COMPILE_ONLY_BUILD:
+    LIBRARIES = []
+else:
+    LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 
 if not CODEGEN_ONLY:
     INCLUDE_DIRS += [maybe_download_nlohmann_json()]
