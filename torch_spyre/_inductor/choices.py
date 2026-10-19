@@ -21,6 +21,8 @@ from torch._inductor.codegen.triton import FixedTritonConfig
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 from torch._inductor.virtualized import V
 
+from torch_spyre._C import get_elem_in_stick
+
 
 class SpyreHeuristics(InductorChoices):
     @staticmethod
@@ -70,6 +72,39 @@ class SpyreHeuristics(InductorChoices):
         except (TypeError, ValueError, AttributeError):
             pass
         return x_val, None
+
+    @staticmethod
+    def _kernel_dtype(features):
+        """Resolve the dtype of the (unfused) kernel's buffers.
+
+        Spyre fusion is disabled (can_fuse/can_fuse_vertical/can_fuse_horizontal
+        all return False), so a Spyre kernel has exactly one buffer dtype; read
+        it back from each scheduler node's underlying IR buffer (same
+        node.node recovery as _recover_pointwise_shape). Refuses — never
+        silently defaults — when no dtype resolves or a node disagrees: the
+        elements-per-stick derived from it sizes every block, so a wrong
+        guess mistiles the whole kernel.
+        """
+        dtype = None
+        for node in features.scheduler_nodes():
+            buf = getattr(node, "node", None)
+            get_dtype = getattr(buf, "get_dtype", None)
+            node_dtype = get_dtype() if get_dtype is not None else None
+            if node_dtype is None:
+                continue
+            if dtype is None:
+                dtype = node_dtype
+            elif node_dtype != dtype:
+                raise NotImplementedError(
+                    "SpyreHeuristics cannot size a mixed-dtype kernel "
+                    f"({dtype} vs {node_dtype}) — elements-per-stick is ambiguous"
+                )
+        if dtype is None:
+            raise NotImplementedError(
+                "SpyreHeuristics could not resolve a dtype from the kernel's "
+                "scheduler nodes — elements-per-stick is undefined"
+            )
+        return dtype
 
     @staticmethod
     def reduction_split_factor(
@@ -146,8 +181,12 @@ class SpyreHeuristics(InductorChoices):
                      and features.contains_op("dot"))
         is_reduction = features.is_reduction()
 
-        # Stick-aligned block sizes: 64 elements = 1 stick (128 bytes / 2 bytes)
-        elements_per_stick = 64
+        # Stick-aligned block sizes. Elements per stick is dtype-dependent
+        # (one stick is a fixed 128 bytes: 64 elements at 16-bit, 128 at
+        # 8-bit, 32 at 32-bit — torch_spyre._C.get_elem_in_stick). Derive it
+        # from the kernel's dtype instead of hardcoding the 16-bit value,
+        # which silently mistiled every non-16-bit kernel.
+        elements_per_stick = get_elem_in_stick(self._kernel_dtype(features))
 
         # Extract tiling dict for problem dimensions and block sizes.
         # groups = kernel_args = [tiling_dict] where tiling keys are:
