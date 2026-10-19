@@ -80,7 +80,14 @@ cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
 extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
 LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
 
-COMPILE_AIUPTI = os.environ.get("USE_SPYRE_PROFILER", "1") == "1"
+# Kernel-generation-only build (e.g. macOS, no Spyre hardware or flex/sendnn
+# runtimes available): compile against the runtime headers but skip linking the
+# runtime shared libraries. Set TORCH_SPYRE_COMPILE_ONLY=1 to enable.
+COMPILE_ONLY_BUILD = os.environ.get("TORCH_SPYRE_COMPILE_ONLY", "0") == "1"
+
+COMPILE_AIUPTI = (
+    os.environ.get("USE_SPYRE_PROFILER", "0" if COMPILE_ONLY_BUILD else "1") == "1"
+)
 
 if "RUNTIME_INSTALL_DIR" in os.environ:
     # take lower precedence than CMAKE_LIBRARY_PATH and CMAKE_INCLUDE_PATH
@@ -105,7 +112,8 @@ if "RUNTIME_INSTALL_DIR" in os.environ:
 # without support for Multi-Spyre. This is for developers only.
 # If set to '0' then Multi-Spyre support is disabled.
 # Otherwise (default) Multi-Spyre support is enabled.
-use_spyre_ccl = os.environ.get("USE_SPYRE_CCL", "1") != "0"
+use_spyre_ccl_default = "0" if COMPILE_ONLY_BUILD else "1"
+use_spyre_ccl = os.environ.get("USE_SPYRE_CCL", use_spyre_ccl_default) != "0"
 
 if not use_spyre_ccl:
     print("=" * 80)
@@ -121,12 +129,14 @@ else:
         SPYRE_COMMS_INCLUDE_DIR = SPYRE_COMMS_DIR / "include"
         if not SPYRE_COMMS_INCLUDE_DIR.exists():
             raise RuntimeError(
-                f"SPYRE_COMMS_INSTALL_DIR include directory does not exist: {SPYRE_COMMS_INCLUDE_DIR}"
+                "SPYRE_COMMS_INSTALL_DIR include directory does not exist: "
+                f"{SPYRE_COMMS_INCLUDE_DIR}"
             )
         SPYRE_COMMS_LIB_DIR = SPYRE_COMMS_DIR / "lib"
         if not SPYRE_COMMS_LIB_DIR.exists():
             raise RuntimeError(
-                f"SPYRE_COMMS_INSTALL_DIR lib directory does not exist: {SPYRE_COMMS_LIB_DIR}"
+                "SPYRE_COMMS_INSTALL_DIR lib directory does not exist: "
+                f"{SPYRE_COMMS_LIB_DIR}"
             )
         INCLUDE_DIRS += [
             SPYRE_COMMS_INCLUDE_DIR,
@@ -139,8 +149,10 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-LIBRARIES = ["flex"]
-
+if COMPILE_ONLY_BUILD:
+    LIBRARIES = []
+else:
+    LIBRARIES = ["flex"]
 
 if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
     import torch
@@ -154,9 +166,10 @@ if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
         LIBRARY_DIRS += [LIBAIUPTI_DIR / "lib"]
         INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
 
-    LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
+    if not COMPILE_ONLY_BUILD:
+        LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
 
-if use_spyre_ccl:
+if use_spyre_ccl and not COMPILE_ONLY_BUILD:
     LIBRARIES.append("spyre_comms")
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
