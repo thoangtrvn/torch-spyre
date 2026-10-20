@@ -39,6 +39,19 @@ def _patch_tensor_for_spyre():
     orig_to = torch.Tensor.to
     orig_empty = torch.empty
     orig_empty_strided = torch.empty_strided
+    try:
+        # The fallthroughs in spyre_to / spyre_empty / spyre_empty_strided
+        # call the original pybind builtins as plain callables; Dynamo
+        # cannot inline them and graph-breaks. Mark them callable-in-graph
+        # so the fallthroughs trace as graph nodes (T-SR-59: stock HF
+        # decoder factories and .to(dtype) calls must capture).
+        from torch import _dynamo as _torch_dynamo
+
+        _torch_dynamo.allow_in_graph(orig_to)
+        _torch_dynamo.allow_in_graph(orig_empty)
+        _torch_dynamo.allow_in_graph(orig_empty_strided)
+    except Exception:
+        pass
 
     def spyre_aware_repr(self):
         dev = getattr(self, "device", None)
@@ -72,13 +85,30 @@ def _patch_tensor_for_spyre():
             return None
 
     def spyre_to(self, *args, device_layout=None, **kwargs):
+        if torch.compiler.is_compiling() and device_layout is None:
+            # Dynamo-transparent: the spyre-layout copy is an eager
+            # codegen-only concern; under tracing, delegate to the original
+            # allow_in_graph'ed builtin so the graph gets a native aten::to
+            # node instead of graph-breaking on the pybind
+            # SpyreTensorLayout constructor (T-SR-59: StaticCache's
+            # cumulative_length.to(device) must capture).
+            return orig_to(self, *args, **kwargs)
         requested_device = kwargs.get("device")
         if requested_device is None and args:
             requested_device = args[0]
         if codegen_only_available() and requested_device is not None:
-            try:
-                requested_device = torch.device(requested_device)
-            except (TypeError, RuntimeError):
+            # Only str/int/torch.device are torch.device() constructors; a
+            # positional dtype or Tensor argument (e.g. x.to(torch.float32))
+            # must never reach torch.device(); in eager the raised TypeError
+            # is caught below, but under Dynamo inlining the wrapped
+            # InternalTorchDynamoError escapes the except clause and kills
+            # graph capture (T-SR-59).
+            if isinstance(requested_device, (str, int, torch.device)):
+                try:
+                    requested_device = torch.device(requested_device)
+                except (TypeError, RuntimeError):
+                    requested_device = None
+            else:
                 requested_device = None
         else:
             requested_device = None
@@ -142,6 +172,11 @@ def _patch_tensor_for_spyre():
     def _codegen_requested_spyre_device(device):
         if not codegen_only_available() or device is None:
             return None
+        # Same Dynamo-inlining hazard as spyre_to: a dtype/Tensor argument
+        # must not reach torch.device(); the eager TypeError is caught here
+        # but becomes an uncaught InternalTorchDynamoError under tracing.
+        if not isinstance(device, (str, int, torch.device)):
+            return None
         try:
             requested_device = torch.device(device)
         except (TypeError, RuntimeError):
@@ -192,6 +227,23 @@ def _patch_tensor_for_spyre():
         memory_format=torch.contiguous_format,
     ):
         requested_device = _codegen_requested_spyre_device(device)
+        if torch.compiler.is_compiling():
+            # Dynamo-transparent: the spyre-layout allocation is an eager
+            # codegen-only concern; under tracing, delegate to the original
+            # builtin (allow_in_graph'ed at patch time) so the graph gets a
+            # native aten::empty node on the requested device instead of
+            # graph-breaking on the pybind SpyreTensorLayout constructor
+            # (T-SR-59: StaticCache's torch.zeros must capture).
+            return orig_empty(
+                *args,
+                out=out,
+                dtype=dtype,
+                layout=layout,
+                device=device,
+                requires_grad=requires_grad,
+                pin_memory=pin_memory,
+                memory_format=memory_format,
+            )
         if device_layout is None and requested_device is not None:
             size = _normalize_empty_size(args)
             device_layout = SpyreTensorLayout(list(size), dtype or torch.get_default_dtype())
@@ -242,7 +294,9 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
     ):
         requested_device = _codegen_requested_spyre_device(device)
-        if requested_device is None:
+        if requested_device is None or torch.compiler.is_compiling():
+            # Dynamo-transparent (see spyre_empty): delegate to the original
+            # allow_in_graph'ed builtin under tracing.
             return orig_empty_strided(
                 size,
                 stride,
