@@ -128,6 +128,12 @@ def _run_inner(cache_root: str, axis: str, phase: str, *, sencores: str | None,
         os.makedirs(env[var], exist_ok=True)
     env.pop("SENCORES", None)
     env.pop("SENTIENT_AUTOTUNE_EFFORT", None)
+    env.pop("SENTIENT_POINTWISE_L3_FORM", None)
+    # T-SR-52: the pointwise L3-form knob was renamed SPYRE_ ->
+    # SENTIENT_POINTWISE_L3_FORM so the fork-side cache-key sweep rekeys
+    # on it; the retired SPYRE_ name is inert at the knob (never read) so
+    # it needs no pop — only the live SENTIENT_ name above can
+    # contaminate a phase.
     env.pop("SPYRE_INJECT_BINARY", None)
     env.pop("SPYRE_INJECT_BINARY_PATH", None)
     env.pop("SPYRE_INJECT_BINARY_ACK", None)
