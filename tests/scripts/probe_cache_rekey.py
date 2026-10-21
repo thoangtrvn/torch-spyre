@@ -105,9 +105,31 @@ else:
 """
 
 
+def _pinned_pythonpath() -> str:
+    """PYTHONPATH pinned to the package roots the PARENT actually imports.
+
+    T-SR-52 r1-docs fold: _run_inner used to pass the inherited
+    PYTHONPATH through verbatim, so a polluted parent environment (or a
+    missing entry) silently changed which triton/torch_spyre/
+    sentient_codegen the subprocess compiled with. Deriving the pin from
+    the parent's own imports makes the subprocess use exactly the stacks
+    the probe run was started against — and a parent that cannot import
+    them fails loud here, at the seam, instead of inside the child with
+    an ambiguous ModuleNotFoundError.
+    """
+    roots = []
+    for name in ("torch_spyre", "triton", "sentient_codegen"):
+        mod = sys.modules.get(name)
+        if mod is None:
+            mod = __import__(name)
+        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(mod.__file__))))
+    return os.pathsep.join(roots)
+
+
 def _run_inner(cache_root: str, axis: str, phase: str, *, sencores: str | None,
                effort: str | None, knob: str | None, capture: bool) -> dict:
     env = os.environ.copy()
+    env["PYTHONPATH"] = _pinned_pythonpath()
     env["TORCH_SPYRE_CODEGEN_ONLY"] = "1"
     env.pop("TORCH_DEVICE_BACKEND_AUTOLOAD", None)
     env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
