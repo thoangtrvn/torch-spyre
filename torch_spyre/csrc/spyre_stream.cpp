@@ -203,12 +203,20 @@ void SpyreStream::copyAsync(const at::Tensor& src,
     DataConversionInfo dci =
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
+    // A DCI that describes a dense same-format copy is a no-op conversion.
+    // Dropping it skips flex's host-side staging (deeptools::ConvertData runs
+    // a per-element strided loop even for identical formats) and, on H2D,
+    // keeps a pinned source buffer attached -- attachStagedSource discards it
+    // when a conversion stages into a fresh pageable buffer.
+    const DataConversionInfo* dci_arg =
+        dci_is_identity_copy(dci) ? nullptr : &dci;
+
     std::shared_ptr<void> host_lifetime;
     if (device2host) {
       host_lifetime = std::make_shared<at::Tensor>(*cpu_tensor);
     }
     copyAsyncImpl(cpu_ptr, host_capacity, get_composite_address(*dev_tensor),
-                  &dci, host2device, std::move(host_lifetime));
+                  dci_arg, host2device, std::move(host_lifetime));
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
