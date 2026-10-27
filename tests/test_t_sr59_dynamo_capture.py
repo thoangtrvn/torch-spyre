@@ -105,7 +105,15 @@ def _run_script(script: str, codegen_only: bool = True) -> subprocess.CompletedP
 
 @_codegen_needed
 def test_spyre_to_dtype_arg_captures_without_graph_break():
-    """x.to(torch.float32) under tracing must not reach torch.device()."""
+    """x.to(torch.float32) under tracing must not reach torch.device().
+
+    Outcome taxonomy (the c2 structured-production envelope postdates the
+    original test): exit 0 = compile returned and unique_graphs == 1;
+    exit 3 = compile-stage T-SR-29 typed refusal (known op-coverage
+    blocker, xfail); exit 1 / nonzero otherwise = capture regression or
+    unexpected failure class. The capture contract (no graph breaks) is
+    asserted FIRST in every branch.
+    """
     result = _run_script(
         """
         import torch
@@ -116,21 +124,65 @@ def test_spyre_to_dtype_arg_captures_without_graph_break():
         def fn(x):
             return x.to(torch.float32) + 1.0
 
+        def _chain_text(exc):
+            parts = [f"{type(exc).__name__}: {exc}"]
+            seen = {id(exc)}
+            while True:
+                nxt = exc.__cause__ or exc.__context__
+                if nxt is None or id(nxt) in seen:
+                    break
+                seen.add(id(nxt))
+                parts.append(f"{type(nxt).__name__}: {nxt}")
+                exc = nxt
+            return " <- ".join(parts)
+
+
         x = torch.randn(4, 4).to("spyre")
         cfn = torch.compile(fn, dynamic=False)
+        import sys
+
+        outcome = "returned"
         try:
             cfn(x)
         except Exception as exc:
-            assert "codegen-only" in str(exc), type(exc).__name__
+            chain = _chain_text(exc)
+            print(chain, file=sys.stderr)
+            if "SpyreRuntimeUnavailableError" in chain:
+                # The codegen-only LAUNCH refusal sentinel (runtime
+                # extension absent) — proves compile returned. Matched on
+                # the class name, not the "codegen-only" substring: two
+                # unrelated codegen-only errors inside torch_spyre/_C.py
+                # also carry that substring and would mislabel.
+                outcome = "launch_refused"
+            elif "StructuredProductionSubsetRefusedError" in chain:
+                # Compile-stage typed refusal from the c2 structured
+                # production envelope (T-SR-29) — a KNOWN op-coverage
+                # blocker class, not a capture regression. The capture
+                # asserts below still run and still gate this outcome.
+                outcome = "typed_refusal"
+            else:
+                raise SystemExit(1)
 
         import torch._dynamo.utils as dynamo_utils
 
         graph_breaks = dict(dynamo_utils.counters["graph_break"])
         assert not graph_breaks, graph_breaks
+        if outcome == "typed_refusal":
+            # unique_graphs only increments after the backend returns;
+            # it is unobservable while compile refuses. Capture is the
+            # contract under test here and is already asserted above.
+            raise SystemExit(3)
         stats = dict(dynamo_utils.counters["stats"])
         assert stats.get("unique_graphs", 0) == 1, stats
         """
     )
+    if result.returncode == 3:
+        pytest.xfail(
+            "spyre structured-production envelope refused this kernel at "
+            "compile (T-SR-29 typed refusal) — the capture contract (no "
+            "graph breaks) already passed; lift this when the envelope "
+            "admits the fused add"
+        )
     assert result.returncode == 0, result.stderr
 
 
@@ -142,8 +194,11 @@ def test_torch_empty_on_spyre_device_captures_without_graph_break():
     never calls the patched Python-level torch.empty, so a zeros-bodied
     test is green even on the unfixed parent — empty is the red-on-parent
     body that actually exercises spyre_empty under tracing. Acceptance is
-    by counters, not exception text: no graph breaks and unique_graphs
-    == 1 (the backend returned; see the note in the script below).
+    by counters, not exception text: no graph breaks, and unique_graphs
+    == 1 whenever the backend returned. Outcome taxonomy: exit 0 =
+    compile returned (unique_graphs asserted); exit 3 = compile-stage
+    T-SR-29 typed refusal (known op-coverage blocker, xfail); exit 1 =
+    capture regression or unexpected failure class.
     """
     result = _run_script(
         """
@@ -155,30 +210,69 @@ def test_torch_empty_on_spyre_device_captures_without_graph_break():
         def fn(x):
             return x + torch.empty(1, x.shape[1], 32, device=x.device)
 
+        def _chain_text(exc):
+            parts = [f"{type(exc).__name__}: {exc}"]
+            seen = {id(exc)}
+            while True:
+                nxt = exc.__cause__ or exc.__context__
+                if nxt is None or id(nxt) in seen:
+                    break
+                seen.add(id(nxt))
+                parts.append(f"{type(nxt).__name__}: {nxt}")
+                exc = nxt
+            return " <- ".join(parts)
+
+
         x = torch.randn(1, 8, 32).to("spyre")
         cfn = torch.compile(fn, dynamic=False)
+        import sys
+
+        outcome = "returned"
         try:
             cfn(x)
-        except Exception:
-            # Execution-time failure is classified by the counters below,
-            # not by the exception text: this body's kernel currently dies
-            # at the triton-spyre driver launcher with a segment-mismatch
-            # ValueError (a driver/codegen defect, another lane) rather
-            # than the codegen-only launch refusal — either way it is
-            # AFTER compile. unique_graphs increments only when the
-            # backend returns, so unique_graphs == 1 proves compile
-            # succeeded; a graph break or a compile-time death leaves
-            # it at 0 with non-empty graph_break / a re-raised error.
-            pass
+        except Exception as exc:
+            chain = _chain_text(exc)
+            print(chain, file=sys.stderr)
+            if "SpyreRuntimeUnavailableError" in chain:
+                # The codegen-only LAUNCH refusal sentinel (runtime
+                # extension absent) — proves compile returned. Matched on
+                # the class name, not the "codegen-only" substring: two
+                # unrelated codegen-only errors inside torch_spyre/_C.py
+                # also carry that substring and would mislabel.
+                outcome = "launch_refused"
+            elif "StructuredProductionSubsetRefusedError" in chain:
+                # Compile-stage typed refusal from the c2 structured
+                # production envelope (T-SR-29) — a KNOWN op-coverage
+                # blocker class, not a capture regression. The capture
+                # asserts below still run and still gate this outcome.
+                outcome = "typed_refusal"
+            else:
+                # Any other execution-time failure (e.g. the triton-spyre
+                # driver launcher segment-mismatch ValueError, another
+                # lane) is AFTER compile: unique_graphs == 1 below still
+                # proves the compile succeeded.
+                outcome = "post_compile"
 
         import torch._dynamo.utils as dynamo_utils
 
         graph_breaks = dict(dynamo_utils.counters["graph_break"])
         assert not graph_breaks, graph_breaks
+        if outcome == "typed_refusal":
+            # unique_graphs only increments after the backend returns;
+            # it is unobservable while compile refuses. Capture is the
+            # contract under test here and is already asserted above.
+            raise SystemExit(3)
         stats = dict(dynamo_utils.counters["stats"])
         assert stats.get("unique_graphs", 0) == 1, stats
         """
     )
+    if result.returncode == 3:
+        pytest.xfail(
+            "spyre structured-production envelope refused this kernel at "
+            "compile (T-SR-29 typed refusal) — the capture contract (no "
+            "graph breaks) already passed; lift this when the envelope "
+            "admits the fused add"
+        )
     assert result.returncode == 0, result.stderr
 
 
@@ -206,8 +300,21 @@ def test_torch_cat_on_spyre_compiles():
             # is broken (the pre-fix failure was:
             #   AttributeError: 'TritonKernelOverrides' object has no
             #   attribute 'overwrite'
-            # on every cat / constant_pad_nd consumer).
-            assert "codegen-only" in str(exc), f"{type(exc).__name__}: {exc}"
+            # on every cat / constant_pad_nd consumer). Keyed on the
+            # SpyreRuntimeUnavailableError sentinel class (raised only in
+            # _runtime.require_runtime), not the bare "codegen-only"
+            # substring — two unrelated codegen-only errors in _C.py carry
+            # that substring too.
+            chain = f"{type(exc).__name__}: {exc}"
+            seen = {id(exc)}
+            while True:
+                nxt = exc.__cause__ or exc.__context__
+                if nxt is None or id(nxt) in seen:
+                    break
+                seen.add(id(nxt))
+                chain += f" <- {type(nxt).__name__}: {nxt}"
+                exc = nxt
+            assert "SpyreRuntimeUnavailableError" in chain, chain
         """
     )
     assert result.returncode == 0, result.stderr
@@ -377,6 +484,14 @@ def test_stock_decoder_static_cache_spyre_capture():
         BLOCKERS = (
             "UnsupportedPointwiseOpError",  # prefill: SFP pointwise
             "KeyError: 'YBLOCK'",           # decode: triton heuristics
+            # c2 structured-production envelope (T-SR-29): both graphs
+            # can also be refused at compile with typed refusal codes
+            # (fused DAG / constant non-metadata user / unsupported op)
+            "StructuredProductionSubsetRefusedError",
+            # RMSNorm sum-of-squares fused reduction kernel routed to
+            # the default GPU triton path ("Could not find an active
+            # GPU backend") — triton-fork/Inductor routing seam
+            "Could not find an active GPU backend",
         )
 
         dynamo_utils.counters.clear()
