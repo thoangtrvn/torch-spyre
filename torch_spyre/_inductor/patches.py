@@ -316,6 +316,28 @@ def enable_spyre_context(
     )
     _orig_triton_relu = triton_codegen.TritonOverrides.relu
 
+    # Loop-carried reduction accumulators must be fp32 even though
+    # ``triton.codegen_upcast_to_fp32`` is disabled for pointwise compute (DL16
+    # emission pins that path). With the config flag off, torch's
+    # ``upcast_acc_dtype`` returns fp16 for fp16 inputs, so a looped matmul
+    # (K > 64, i.e. an actual reduction loop over K) materializes its
+    # accumulator with ``tl.full(..., tl.float16)`` while ``tl.dot`` promotes
+    # to fp32 — the loop-carried type assert in triton-spyre's ast_to_ttir
+    # then refuses every shape. Override only the accumulator-dtype seam
+    # (torch/_inductor/codegen/triton.py::upcast_acc_dtype); pointwise compute
+    # types still flow through upcast_compute_type and stay 16-bit. Guarded so
+    # torch versions without this helper are left untouched.
+    _orig_upcast_acc_dtype = getattr(triton_codegen, "upcast_acc_dtype", None)
+
+    def _spyre_upcast_acc_dtype(dtype: torch.dtype) -> torch.dtype:
+        if dtype in (torch.float16, torch.bfloat16):
+            return torch.float32
+        assert _orig_upcast_acc_dtype is not None
+        return _orig_upcast_acc_dtype(dtype)
+
+    if _orig_upcast_acc_dtype is not None:
+        triton_codegen.upcast_acc_dtype = _spyre_upcast_acc_dtype
+
     def _spyre_descriptor_relu(value):
         if spyre_config.descriptor_normal_route_operation == "descriptor_relu":
             return f"tl.maximum({value}, tl.full([], 0.0, tl.float16), tl.PropagateNan.ALL)"
@@ -449,6 +471,8 @@ def enable_spyre_context(
             triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
                 _orig_tma_compatibility_checker_cls
             )
+            if _orig_upcast_acc_dtype is not None:
+                triton_codegen.upcast_acc_dtype = _orig_upcast_acc_dtype
             triton_codegen.TritonOverrides.relu = _orig_triton_relu
             fuse_attention._sfdp_init = _orig_sfdp_init
             joint_graph.pass_patterns[:] = origin_pass
