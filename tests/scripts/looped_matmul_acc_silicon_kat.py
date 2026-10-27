@@ -35,6 +35,17 @@ PRE-REGISTRATION (committed before any hardware launch; the criteria below
 are FROZEN — no post-hoc adjudication. A mismatch is a finding, not an
 embarrassment to be patched into green):
 
+  ADDENDUM 2026-10-27 (harness hardening post-commit 8c51d42; NO scoring
+  criterion constant moved): (1) score() now fails non-finite outputs
+  explicitly (r1 M0 — a naive `err > bound` laundered NaN to PASS; the
+  frozen criterion "EVERY element must satisfy |got-ref| <= bound" always
+  implied this; the repair enforces it and adds R-SCORE-NAN red-first);
+  (2) the NO-SUBNORMAL-BAND and R-SCORE-HONEST registrations were
+  rewritten to state their true scope (reference-lattice-only band
+  argument; same-model circularity disclosed) per the r1 derivation
+  review. The frozen bound constants, shapes, distributions and seeds
+  are unchanged.
+
   ROUTE — ``torch.compile(lambda a, b: a @ b, dynamic=False)`` on fp16
   spyre tensors. Route authenticity is ASSERTED, not assumed: the emitted
   Inductor output code must carry the fp32 loop-carried accumulator
@@ -75,11 +86,22 @@ embarrassment to be patched into green):
                            ulp ladder + cancellation while every partial
                            sum stays in the fp16 normal band.
 
-  NO-SUBNORMAL-BAND (recorded, not assumed): products of 1/8-multiples are
-  multiples of 2^-6, so every nonzero product, partial sum, reference and
-  (DL16-grid) output is >= 2^-6 — far above the fp16 min normal 2^-14 and
-  the DL16 min normal 2^-30. The fp16-subnormal-halved-readback and
-  dl16-ffff silicon-NaN laws cannot fire in this KAT.
+  NO-SUBNORMAL-BAND (recorded, not assumed — and scoped to what it proves):
+  products of 1/8-multiples are multiples of 2^-6, so every nonzero
+  product, EXACT partial sum and reference is >= 2^-6 — far above the
+  fp16 min normal 2^-14 and the DL16 min normal 2^-30 (witnessed per
+  seed by test_no_subnormal_band_holds). SCOPE LIMIT (r1 m2, recorded):
+  this lattice argument covers the REFERENCE side only. The DEVICE
+  accumulator leaves the 2^-6 lattice after its first DL16 grid round
+  (DL16 spacing in binade e is 2^(e-9)), so a strongly cancelling
+  column can carry a sub-2^-14 residual — inside the fp16 subnormal
+  readback band, where DL16->fp16 readback is NOT exact (at binade -16
+  and below, DL16 spacing is finer than the fp16 subnormal quantum
+  2^-24).
+  The conclusion survives by a DIFFERENT argument: for a cancelling
+  column the bound is 2^-10 * (sum|s_k| + sum|p_k|), which at these
+  magnitudes is orders above any subnormal-readback error; the
+  subnormal readback defect class is dominated, not excluded.
 
   MATCH DEFINITION (per shape x distribution; EVERY output element must
   satisfy it for PASS — backward-error form vs the float64 reference):
@@ -146,12 +168,19 @@ embarrassment to be patched into green):
       every row dies at triton-spyre's loop-carried type assert. This is
       the defect the patch fixed, reproduced from current source.
     R-SCORE-HONEST — the DL16 closed form itself PASSES the criterion
-      (no-false-positive check for the instrument: its error is a subset
-      of the budgeted mechanisms by construction).
+      (same-model circularity, disclosed: surrogate, bound and rounder
+      share one mechanism model, so this validates arithmetic dominance
+      and scorer plumbing — GROSS SENSITIVITY ONLY, not mechanism
+      coverage; its honest-variant value is witnessing the offline
+      margin, recorded as a number in every run log).
     R-SCORE-TRUNCATED — a surrogate that accumulates only the first K//2
       products FAILS the criterion (dropped-magnitude class).
     R-SCORE-PERMUTED — a surrogate scored against k-tile-swapped operands
       FAILS the criterion (mis-addressing class).
+    R-SCORE-NAN — a single NaN element in an otherwise-honest output
+      FAILS the criterion and is counted non-finite (r1 M0: a naive
+      `err > bound` gate launders NaN to PASS; silicon-NaN is a known
+      law family, dl16-ffff PE FMINMAX).
 
 ISOLATION LAW: every row's COMPILE runs in its OWN subprocess with a
 fresh Python (the Triton in-memory cache survives torch._dynamo.reset();
@@ -364,7 +393,13 @@ def score(got, ref, bound):
 
     got64 = got.detach().to("cpu").double()
     err = (got64 - ref).abs()
-    fails = err > bound
+    # NaN laundering guard (r1 M0): NaN comparisons are False, so
+    # `err > bound` alone PASSES a NaN element. The criterion says EVERY
+    # element must satisfy |got - ref| <= bound — a non-finite got cannot
+    # satisfy it. Silicon-NaN is a known law family here (dl16-ffff PE
+    # FMINMAX), so this is a reachable false-green, not a hypothetical.
+    nonfinite = ~torch.isfinite(got64)
+    fails = ~(err <= bound) | nonfinite
     # Headroom err/bound (PASS iff <= 1); guard the divide where bound == 0
     # (an all-zero column: err is 0 there too, so it never fails).
     slack = torch.where(
@@ -373,6 +408,7 @@ def score(got, ref, bound):
     return {
         "n_elements": int(err.numel()),
         "n_fail": int(fails.sum().item()),
+        "n_nonfinite": int(nonfinite.sum().item()),
         "max_abs_err": float(err.max().item()),
         "max_slack": float(slack.max().item()),
         "pass": bool(not fails.any().item()),
@@ -587,8 +623,10 @@ def red_first_self_checks():
             ledger = dl16_sequential_closed_form(a, b)
             tag = f"{row_key}/{dist_key}"
 
-            # R-SCORE-HONEST: the DL16 closed form passes (its error is a
-            # subset of the budgeted mechanisms: per-step rounds only).
+            # R-SCORE-HONEST: the DL16 closed form passes (same-model
+            # circularity, disclosed in the registration — arithmetic
+            # dominance and scorer plumbing only; the margin it exhibits
+            # is recorded as a number in the run log).
             honest = score(ledger, ref, bound)
             results.append((f"{tag}:honest-closed-form-passes", honest["pass"]))
 
@@ -617,6 +655,18 @@ def red_first_self_checks():
             a_swapped[:, _ELEMS_PER_STICK:2 * _ELEMS_PER_STICK] = a[:, :_ELEMS_PER_STICK]
             permuted = score(dl16_sequential_closed_form(a_swapped, b), ref, bound)
             results.append((f"{tag}:k-tile-permuted-fails", not permuted["pass"]))
+
+            # R-SCORE-NAN: a single NaN element in the device output must
+            # FAIL the criterion (r1 M0 red-first: NaN comparisons are
+            # False, so a naive `err > bound` gate laundered NaN to PASS;
+            # silicon-NaN is a known law family, dl16-ffff PE FMINMAX).
+            nan_seed = ledger.clone()
+            nan_seed.view(-1)[nan_seed.numel() // 2] = float("nan")
+            nan_verdict = score(nan_seed, ref, bound)
+            results.append((f"{tag}:nan-element-fails", not nan_verdict["pass"]))
+            results.append(
+                (f"{tag}:nan-counted-nonfinite", nan_verdict["n_nonfinite"] == 1)
+            )
     return results
 
 

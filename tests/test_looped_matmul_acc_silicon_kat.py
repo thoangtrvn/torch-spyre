@@ -109,9 +109,10 @@ def test_red_first_scorer_checks(kat):
     checks = kat.red_first_self_checks()
     failed = [name for name, ok in checks if not ok]
     assert not failed, f"red-first self-checks failed: {failed}"
-    # Census: 3 rows x 2 distributions x 4 checks (honest, honest with
-    # product pre-round, truncated-K, k-tile-permuted).
-    assert len(checks) == 24
+    # Census: 3 rows x 2 distributions x 6 checks (honest, honest with
+    # product pre-round, truncated-K, k-tile-permuted, NaN-fails,
+    # NaN-counted-nonfinite).
+    assert len(checks) == 36
 
 
 def test_no_subnormal_band_holds(kat):
@@ -135,9 +136,67 @@ def test_no_subnormal_band_holds(kat):
             assert nonzero_ref.max().item() < 65504.0, "fp16 overflow band"
 
 
+# --- 2b. NaN laundering guard (r1 M0) ------------------------------------------
+def test_scorer_fails_nan_and_inf_outputs(kat):
+    """A non-finite device element can never satisfy |got-ref| <= bound.
+
+    The pre-repair defect: `fails = err > bound` evaluates NaN > bound as
+    False, so a NaN element scored PASS. Silicon-NaN is a known law family
+    (dl16-ffff PE FMINMAX) — this is the reachable false-green the r1
+    reviewer demonstrated. Red-first pinned here, independent of the
+    self-check census.
+    """
+    import torch
+
+    m, k, n = kat.row_shape("LM1")
+    _, h = kat.DISTRIBUTIONS[0]
+    seed = kat.seed_for("LM1", m, k, n, h)
+    a, b = kat.build_inputs(m, k, n, h, seed)
+    ref, bound = kat.reference_and_bound(a, b)
+    got = kat.dl16_sequential_closed_form(a, b)
+
+    # Sanity: the honest output passes and is finite.
+    honest = kat.score(got, ref, bound)
+    assert honest["pass"] and honest["n_nonfinite"] == 0
+
+    # One NaN element -> FAIL, counted non-finite.
+    nan_out = got.clone()
+    nan_out.view(-1)[nan_out.numel() // 2] = float("nan")
+    verdict = kat.score(nan_out, ref, bound)
+    assert not verdict["pass"], "NaN element laundered to PASS"
+    assert verdict["n_fail"] >= 1
+    assert verdict["n_nonfinite"] == 1
+
+    # One inf element -> FAIL (was already caught by err > bound; pinned
+    # so the non-finite accounting covers both spellings).
+    inf_out = got.clone()
+    inf_out.view(-1)[inf_out.numel() // 3] = float("inf")
+    verdict_inf = kat.score(inf_out, ref, bound)
+    assert not verdict_inf["pass"]
+    assert verdict_inf["n_nonfinite"] == 1
+
+    # NaN in a zero-bound column (worst case: err is NaN, bound is 0):
+    # the slack guard must not crash and the element must still FAIL.
+    zero_col = got.clone()
+    zero_col.view(-1)[0] = float("nan")
+    ref0 = ref.clone()
+    bound0 = bound.clone()
+    bound0.view(-1)[0] = 0.0
+    verdict_zb = kat.score(zero_col, ref0, bound0)
+    assert not verdict_zb["pass"]
+
+
 # --- 3. DL16 round equivalence with the codegen reference ----------------------
 def test_round_to_dl16_matches_codegen_reference(kat):
-    pytest.importorskip("sentient_codegen", reason="codegen stack not on path")
+    # Blast radius of the skip, stated (r1 m6): the DL16 equivalence pin
+    # is LEDGER-ONLY — round_to_dl16 feeds the closed-form ledger and the
+    # red-first surrogates, never the gated criterion — so a silent skip
+    # biases the ledger, not a verdict. Loud here so the skip is a
+    # visible environment fact, not a quiet hole.
+    pytest.importorskip(
+        "sentient_codegen",
+        reason="codegen stack not on path (ledger-only blast radius)",
+    )
     import numpy as np
     from sentient_codegen.emulator.dl16_round import round_to_dl16 as reference
 
