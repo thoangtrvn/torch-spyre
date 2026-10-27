@@ -240,6 +240,32 @@ def enable_spyre_context(
     from torch._inductor.fx_passes import fuse_attention
 
     origin_pass = list(joint_graph.pass_patterns)
+
+    # Module-attribute monkeypatches are installed below before the nested
+    # context managers are entered. If any of those __enter__ calls raise,
+    # the generator never reaches the try/finally around yield, so every
+    # install records an undo action here; the outer finally unwinds them
+    # on every exit path. The joint_graph pass-pattern restore is registered
+    # the same way (the pop below mutates the shared list in place).
+    _patch_undos: list[Callable[[], None]] = []
+
+    def _install_module_attribute(module, name, value):
+        original = getattr(module, name)
+        _patch_undos.append(
+            lambda module=module, name=name, original=original: setattr(
+                module, name, original
+            )
+        )
+        setattr(module, name, value)
+
+    def _undo_installed_patches():
+        while _patch_undos:
+            _patch_undos.pop()()
+
+    _patch_undos.append(
+        lambda: joint_graph.pass_patterns.__setitem__(slice(None), origin_pass)
+    )
+
     _orig_sfdp_init = fuse_attention._sfdp_init
 
     def _spyre_skip_sfdp_init(input_device=None):
@@ -248,7 +274,7 @@ def enable_spyre_context(
             return None
         return _orig_sfdp_init(input_device)
 
-    fuse_attention._sfdp_init = _spyre_skip_sfdp_init
+    _install_module_attribute(fuse_attention, "_sfdp_init", _spyre_skip_sfdp_init)
     # disable mul_softmax_pattern and div_softmax_pattern for now
     joint_graph.pass_patterns.pop()
 
@@ -302,11 +328,11 @@ def enable_spyre_context(
             return torch._inductor.config.assume_aligned_inputs
         return _orig_should_assume_input_aligned(example_input)
 
-    mm_common.use_native_matmul = _spyre_aware_use_native_matmul
-    mm.use_native_matmul = _spyre_aware_use_native_matmul
-    bmm.use_native_matmul = _spyre_aware_use_native_matmul
-    inductor_utils.should_assume_input_aligned = _spyre_aware_should_assume_input_aligned
-    inductor_graph.should_assume_input_aligned = _spyre_aware_should_assume_input_aligned
+    _install_module_attribute(mm_common, "use_native_matmul", _spyre_aware_use_native_matmul)
+    _install_module_attribute(mm, "use_native_matmul", _spyre_aware_use_native_matmul)
+    _install_module_attribute(bmm, "use_native_matmul", _spyre_aware_use_native_matmul)
+    _install_module_attribute(inductor_utils, "should_assume_input_aligned", _spyre_aware_should_assume_input_aligned)
+    _install_module_attribute(inductor_graph, "should_assume_input_aligned", _spyre_aware_should_assume_input_aligned)
 
     import torch._inductor.codegen.triton as triton_codegen
     from torch._inductor.codegen.triton import is_unaligned_buffer_name
@@ -336,7 +362,9 @@ def enable_spyre_context(
         return _orig_upcast_acc_dtype(dtype)
 
     if _orig_upcast_acc_dtype is not None:
-        triton_codegen.upcast_acc_dtype = _spyre_upcast_acc_dtype
+        _install_module_attribute(
+            triton_codegen, "upcast_acc_dtype", _spyre_upcast_acc_dtype
+        )
 
     def _spyre_descriptor_relu(value):
         if spyre_config.descriptor_normal_route_operation == "descriptor_relu":
@@ -344,7 +372,9 @@ def enable_spyre_context(
         return _orig_triton_relu(value)
 
     if spyre_config.descriptor_normal_route_operation == "descriptor_relu":
-        triton_codegen.TritonOverrides.relu = staticmethod(_spyre_descriptor_relu)
+        _install_module_attribute(
+            triton_codegen.TritonOverrides, "relu", staticmethod(_spyre_descriptor_relu)
+        )
 
     class SpyreTMACompatibilityChecker(_orig_tma_compatibility_checker_cls):
         """Diagnostic-only TensorDescriptor eligibility for Spyre pointwise capture."""
@@ -437,8 +467,10 @@ def enable_spyre_context(
                 return True
             return super().can_lift()
 
-    triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
-        SpyreTMACompatibilityChecker
+    _install_module_attribute(
+        triton_codegen.TritonKernel,
+        "tma_compatibility_checker_cls",
+        SpyreTMACompatibilityChecker,
     )
 
     # Verify patches applied correctly
@@ -446,33 +478,28 @@ def enable_spyre_context(
     _log.debug("mm_common.use_native_matmul = %s", mm_common.use_native_matmul)
     _log.debug("bmm.use_native_matmul = %s", bmm.use_native_matmul)
 
-    with (
-        spyre_data_types(),
-        enable_spyre_lowerings(triton_path=True),
-        enable_spyre_decompositions(decomps=decomps, triton_path=True) as spyre_context_decompositions,
-        V.set_real_inputs(example_inputs),
-        torch._inductor.config.patch(new_config),
-    ):
-        _log.debug("lowering[aten.mm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.mm.default))
-        _log.debug("lowering[aten.addmm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.addmm.default))
-        _log.debug("decomp[aten.mm.default] = %s", decomps.get(torch.ops.aten.mm.default))
-        _log.debug("decomp[aten.addmm.default] = %s", decomps.get(torch.ops.aten.addmm.default))
-        _log.debug("decomp[aten.linear.default] = %s", decomps.get(torch.ops.aten.linear.default))
-        _log.debug("config.triton.native_matmul = %s", torch._inductor.config.triton.native_matmul)
+    # The outer finally is the single restore point for every installed
+    # module-attribute patch: it covers body exceptions (via the inner
+    # finally), and — load-bearing — exceptions raised by the nested
+    # __enter__ calls themselves, which never reach the inner finally.
+    try:
+        with (
+            spyre_data_types(),
+            enable_spyre_lowerings(triton_path=True),
+            enable_spyre_decompositions(decomps=decomps, triton_path=True) as spyre_context_decompositions,
+            V.set_real_inputs(example_inputs),
+            torch._inductor.config.patch(new_config),
+        ):
+            _log.debug("lowering[aten.mm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.mm.default))
+            _log.debug("lowering[aten.addmm.default] = %s", torch._inductor.lowering.lowerings.get(torch.ops.aten.addmm.default))
+            _log.debug("decomp[aten.mm.default] = %s", decomps.get(torch.ops.aten.mm.default))
+            _log.debug("decomp[aten.addmm.default] = %s", decomps.get(torch.ops.aten.addmm.default))
+            _log.debug("decomp[aten.linear.default] = %s", decomps.get(torch.ops.aten.linear.default))
+            _log.debug("config.triton.native_matmul = %s", torch._inductor.config.triton.native_matmul)
 
-        try:
-            yield spyre_context_decompositions
-        finally:
-            mm_common.use_native_matmul = _orig_use_native_matmul
-            mm.use_native_matmul = _orig_use_native_matmul
-            bmm.use_native_matmul = _orig_use_native_matmul
-            inductor_utils.should_assume_input_aligned = _orig_should_assume_input_aligned
-            inductor_graph.should_assume_input_aligned = _orig_should_assume_input_aligned
-            triton_codegen.TritonKernel.tma_compatibility_checker_cls = (
-                _orig_tma_compatibility_checker_cls
-            )
-            if _orig_upcast_acc_dtype is not None:
-                triton_codegen.upcast_acc_dtype = _orig_upcast_acc_dtype
-            triton_codegen.TritonOverrides.relu = _orig_triton_relu
-            fuse_attention._sfdp_init = _orig_sfdp_init
-            joint_graph.pass_patterns[:] = origin_pass
+            try:
+                yield spyre_context_decompositions
+            finally:
+                joint_graph.pass_patterns[:] = origin_pass
+    finally:
+        _undo_installed_patches()

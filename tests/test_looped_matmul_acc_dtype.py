@@ -24,9 +24,21 @@ accumulators upcast to fp32 while pointwise compute types stay 16-bit.
 """
 
 import os
+import re
 import subprocess
 import sys
 import textwrap
+
+# Accumulator-initialization lines in Inductor output code, e.g.
+# ``_tmp6 = tl.full([YBLOCK, XBLOCK], 0, tl.float32)``. Match the emitted
+# dtype directly rather than an exact substring, so torch formatting or
+# block-naming drift does not break the pin.
+_FP32_ACC_INIT_RE = re.compile(
+    r"= tl\.full\(\[[^\]]*\], [^,]+, tl\.float32\)"
+)
+_FP16_ACC_INIT_RE = re.compile(
+    r"= tl\.full\(\[[^\]]*\], [^,]+, tl\.float16\)"
+)
 
 
 def _run_script(script: str, extra_env: dict[str, str] | None = None):
@@ -111,6 +123,74 @@ def test_spyre_context_accumulator_override_nests_correctly():
     assert result.returncode == 0, result.stderr
 
 
+def test_spyre_context_restores_patches_when_nested_context_entry_fails():
+    """No monkeypatch leaks when a nested context manager's __enter__ raises.
+
+    The module-attribute patches are installed before the nested context
+    managers are entered; an exception from one of those __enter__ calls
+    must still restore every installed symbol (accumulator override,
+    use_native_matmul, alignment helpers, SFDP init, TMA checker class,
+    relu) and the popped joint_graph pass pattern.
+    """
+    result = _run_script(
+        """
+        import torch
+        import torch._inductor.codegen.triton as triton_codegen
+        import torch._inductor.kernel.mm_common as mm_common
+        import torch._inductor.kernel.mm as mm
+        import torch._inductor.kernel.bmm as bmm
+        import torch._inductor.graph as inductor_graph
+        import torch._inductor.utils as inductor_utils
+        import torch._inductor.fx_passes.joint_graph as joint_graph
+        import torch._inductor.fx_passes.fuse_attention as fuse_attention
+        import torch_spyre._inductor.decompositions as spyre_decompositions
+        from torch_spyre._inductor.patches import enable_spyre_context
+
+        originals = {
+            "upcast_acc_dtype": triton_codegen.upcast_acc_dtype,
+            "mm_common": mm_common.use_native_matmul,
+            "mm": mm.use_native_matmul,
+            "bmm": bmm.use_native_matmul,
+            "utils_align": inductor_utils.should_assume_input_aligned,
+            "graph_align": inductor_graph.should_assume_input_aligned,
+            "sfdp_init": fuse_attention._sfdp_init,
+            "tma_cls": triton_codegen.TritonKernel.tma_compatibility_checker_cls,
+            "relu": triton_codegen.TritonOverrides.relu,
+        }
+        pass_pattern_count = len(joint_graph.pass_patterns)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("enter failed")
+
+        _real_enter_decomps = spyre_decompositions.enable_spyre_decompositions
+        spyre_decompositions.enable_spyre_decompositions = _boom
+        try:
+            try:
+                with enable_spyre_context([]):
+                    raise AssertionError("unreachable")
+            except RuntimeError:
+                pass
+        finally:
+            spyre_decompositions.enable_spyre_decompositions = _real_enter_decomps
+
+        assert triton_codegen.upcast_acc_dtype is originals["upcast_acc_dtype"]
+        assert mm_common.use_native_matmul is originals["mm_common"]
+        assert mm.use_native_matmul is originals["mm"]
+        assert bmm.use_native_matmul is originals["bmm"]
+        assert inductor_utils.should_assume_input_aligned is originals["utils_align"]
+        assert inductor_graph.should_assume_input_aligned is originals["graph_align"]
+        assert fuse_attention._sfdp_init is originals["sfdp_init"]
+        assert (
+            triton_codegen.TritonKernel.tma_compatibility_checker_cls
+            is originals["tma_cls"]
+        )
+        assert triton_codegen.TritonOverrides.relu is originals["relu"]
+        assert len(joint_graph.pass_patterns) == pass_pattern_count
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_looped_matmul_k512_accumulator_is_fp32():
     """End-to-end codegen-only check of the emitted Triton kernel.
 
@@ -149,8 +229,12 @@ def test_looped_matmul_k512_accumulator_is_fp32():
         "loop-carried fp16->fp32 accumulator regression reproduced:\n"
         + combined[-4000:]
     )
-    assert "= tl.full([YBLOCK, XBLOCK], 0, tl.float32)" in combined, (
+    assert _FP32_ACC_INIT_RE.search(combined), (
         "looped-matmul accumulator was not materialized in fp32:\n"
+        + combined[-4000:]
+    )
+    assert not _FP16_ACC_INIT_RE.search(combined), (
+        "looped-matmul accumulator was materialized in fp16:\n"
         + combined[-4000:]
     )
 
@@ -192,11 +276,11 @@ def test_looped_sum_and_max_accumulators_stay_fp32():
         "loop-carried fp16->fp32 accumulator regression reproduced:\n"
         + combined[-4000:]
     )
-    assert "= tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)" in combined, (
-        "SUM reduction accumulator was not materialized in fp32:\n"
+    assert _FP32_ACC_INIT_RE.search(combined), (
+        "SUM/MAX reduction accumulators were not materialized in fp32:\n"
         + combined[-4000:]
     )
-    assert '= tl.full([XBLOCK, R0_BLOCK], float("-inf"), tl.float32)' in combined, (
-        "MAX reduction accumulator was not materialized in fp32:\n"
+    assert not _FP16_ACC_INIT_RE.search(combined), (
+        "a reduction accumulator was materialized in fp16:\n"
         + combined[-4000:]
     )
