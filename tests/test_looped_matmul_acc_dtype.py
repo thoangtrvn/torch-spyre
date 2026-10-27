@@ -153,3 +153,50 @@ def test_looped_matmul_k512_accumulator_is_fp32():
         "looped-matmul accumulator was not materialized in fp32:\n"
         + combined[-4000:]
     )
+
+
+def test_looped_sum_and_max_accumulators_stay_fp32():
+    """Reduction-flavor canary: sum/min/max keep fp32 accumulators.
+
+    On the spyre route, sum/min/max reach fp32 reduction accumulators
+    through input promotion upstream of ``upcast_acc_dtype`` (their loads
+    are cast to fp32 before the reduction loop), so they do not exercise
+    the accumulator-dtype override the way the matmul dot path does. Pin
+    their fp32 accumulator emission anyway: if a torch change or a future
+    narrowing of the spyre context ever lets an fp16 loop-carried
+    accumulator through on any reduction flavor, this catches it.
+    """
+    result = _run_script(
+        """
+        import torch
+        import torch_spyre
+        torch_spyre._autoload()
+
+        def fn_sum(a):
+            return a.sum(dim=0)
+
+        def fn_max(a):
+            return a.max(dim=0).values
+
+        a = torch.randn(512, 128, dtype=torch.float16).to("spyre")
+        for fn in (fn_sum, fn_max):
+            try:
+                torch.compile(fn, dynamic=False)(a)
+            except Exception:
+                pass
+        """,
+        extra_env={"TORCH_LOGS": "output_code"},
+    )
+    combined = result.stdout + result.stderr
+    assert "Loop-carried variable" not in combined, (
+        "loop-carried fp16->fp32 accumulator regression reproduced:\n"
+        + combined[-4000:]
+    )
+    assert "= tl.full([XBLOCK, R0_BLOCK], 0, tl.float32)" in combined, (
+        "SUM reduction accumulator was not materialized in fp32:\n"
+        + combined[-4000:]
+    )
+    assert '= tl.full([XBLOCK, R0_BLOCK], float("-inf"), tl.float32)' in combined, (
+        "MAX reduction accumulator was not materialized in fp32:\n"
+        + combined[-4000:]
+    )
