@@ -161,7 +161,6 @@ def test_spyre_to_dtype_arg_captures_without_graph_break():
                 # asserts below still run and still gate this outcome.
                 outcome = "typed_refusal"
             else:
-                print(chain)
                 raise SystemExit(1)
 
         import torch._dynamo.utils as dynamo_utils
@@ -301,8 +300,21 @@ def test_torch_cat_on_spyre_compiles():
             # is broken (the pre-fix failure was:
             #   AttributeError: 'TritonKernelOverrides' object has no
             #   attribute 'overwrite'
-            # on every cat / constant_pad_nd consumer).
-            assert "codegen-only" in str(exc), f"{type(exc).__name__}: {exc}"
+            # on every cat / constant_pad_nd consumer). Keyed on the
+            # SpyreRuntimeUnavailableError sentinel class (raised only in
+            # _runtime.require_runtime), not the bare "codegen-only"
+            # substring — two unrelated codegen-only errors in _C.py carry
+            # that substring too.
+            chain = f"{type(exc).__name__}: {exc}"
+            seen = {id(exc)}
+            while True:
+                nxt = exc.__cause__ or exc.__context__
+                if nxt is None or id(nxt) in seen:
+                    break
+                seen.add(id(nxt))
+                chain += f" <- {type(nxt).__name__}: {nxt}"
+                exc = nxt
+            assert "SpyreRuntimeUnavailableError" in chain, chain
         """
     )
     assert result.returncode == 0, result.stderr
