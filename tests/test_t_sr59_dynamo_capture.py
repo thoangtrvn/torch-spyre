@@ -139,12 +139,20 @@ def test_spyre_to_dtype_arg_captures_without_graph_break():
 
         x = torch.randn(4, 4).to("spyre")
         cfn = torch.compile(fn, dynamic=False)
+        import sys
+
         outcome = "returned"
         try:
             cfn(x)
         except Exception as exc:
             chain = _chain_text(exc)
-            if "codegen-only" in str(exc):
+            print(chain, file=sys.stderr)
+            if "SpyreRuntimeUnavailableError" in chain:
+                # The codegen-only LAUNCH refusal sentinel (runtime
+                # extension absent) — proves compile returned. Matched on
+                # the class name, not the "codegen-only" substring: two
+                # unrelated codegen-only errors inside torch_spyre/_C.py
+                # also carry that substring and would mislabel.
                 outcome = "launch_refused"
             elif "StructuredProductionSubsetRefusedError" in chain:
                 # Compile-stage typed refusal from the c2 structured
@@ -218,12 +226,20 @@ def test_torch_empty_on_spyre_device_captures_without_graph_break():
 
         x = torch.randn(1, 8, 32).to("spyre")
         cfn = torch.compile(fn, dynamic=False)
+        import sys
+
         outcome = "returned"
         try:
             cfn(x)
         except Exception as exc:
             chain = _chain_text(exc)
-            if "codegen-only" in str(exc):
+            print(chain, file=sys.stderr)
+            if "SpyreRuntimeUnavailableError" in chain:
+                # The codegen-only LAUNCH refusal sentinel (runtime
+                # extension absent) — proves compile returned. Matched on
+                # the class name, not the "codegen-only" substring: two
+                # unrelated codegen-only errors inside torch_spyre/_C.py
+                # also carry that substring and would mislabel.
                 outcome = "launch_refused"
             elif "StructuredProductionSubsetRefusedError" in chain:
                 # Compile-stage typed refusal from the c2 structured
@@ -237,7 +253,6 @@ def test_torch_empty_on_spyre_device_captures_without_graph_break():
                 # lane) is AFTER compile: unique_graphs == 1 below still
                 # proves the compile succeeded.
                 outcome = "post_compile"
-                print(chain)
 
         import torch._dynamo.utils as dynamo_utils
 
