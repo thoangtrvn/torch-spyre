@@ -58,11 +58,20 @@ degenerate windows, non-contiguous layouts) raises
 ``errors.Unsupported`` — no CPU fallback, no extern kernel, no silent
 contiguity assumption.
 
-These tests are offline (CPU tensors + tracing). The end-to-end TTIR
-routing receipt is captured separately; the known boundary is that
-batch>1 offline TTIR capture dies at an Inductor KeyError (ZBLOCK) in
-triton-spyre (third-party, repair lane in flight), so any capture
-receipt below this file is batch-1 only.
+These tests are offline (CPU tensors + tracing) and DIRECT-decomposition:
+they prove the gate and the rewrite, NOT end-to-end routing. The
+end-to-end TTIR routing receipt (the rewritten graph classifying as
+matmul through the native-matmul route under torch.compile) is OWED,
+not captured: no torch 2.11 environment exists on this machine (only
+2.13.0), and on 2.13 every production-path probe fails INCLUDING the
+known-good 1x1-alias control (XLAT segment mismatch) — confounded
+failure modes that cannot be attributed to this lane. Additionally, on
+2.13 aten.im2col itself decomposes into an in-graph advanced-indexing
+device gather (the exact shape the fallback ledger vetoes); if that
+reproduces on 2.11, the host-im2col premise needs design-level
+re-derivation (escalated separately by the lead). The known offline
+boundary also stands: batch>1 TTIR capture dies at an Inductor KeyError
+(ZBLOCK) in triton-spyre (third-party, repair lane in flight).
 """
 
 import pytest

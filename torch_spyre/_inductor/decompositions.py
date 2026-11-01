@@ -1209,6 +1209,13 @@ def _conv2d_im2col_core(
             raise Unsupported(
                 f"conv2d im2col: bias has length {bias.numel()}, "
                 f"expected {out_channels} (one per output channel)")
+        if not bias.is_contiguous():
+            raise Unsupported(
+                f"conv2d im2col: bias is non-contiguous (strides "
+                f"{tuple(bias.stride())} for shape "
+                f"{tuple(bias.shape)}) — matching the input/weight "
+                f"contiguity contract; the decomposition never "
+                f"silently .contiguous()-copies")
 
     # The envelope boundary: fail-loud BEFORE any tensor is built.
     # Delegated to the codegen-side predicate (single source of truth,
@@ -1216,6 +1223,7 @@ def _conv2d_im2col_core(
     # unreachable authority refuses loud, never silently skips.
     try:
         from sentient_codegen.scheduler.conv_predicate import (
+            UnsupportedConvIm2colError,
             assert_conv_im2col_envelope,
         )
     except ImportError as exc:
@@ -1226,11 +1234,15 @@ def _conv2d_im2col_core(
             f"skipped, so the route refuses (source env.sh so codegen "
             f"is on the path)") from exc
     try:
+        # dtype IDENTITY, not element width: 16 bits cannot distinguish
+        # 1p0's DL16 (torch.float16) from 1p5's bf16, and the predicate
+        # is the authority that refuses the latter NAMED.
         assert_conv_im2col_envelope(
             in_channels=in_channels, kh=kh, kw=kw,
-            out_channels=out_channels,
-            dtype_bits=input.element_size() * 8)
-    except Exception as exc:
+            out_channels=out_channels, dtype=input.dtype)
+    # Typed catch ONLY: a bug inside the predicate must surface as
+    # itself, never masquerade as an envelope refusal.
+    except UnsupportedConvIm2colError as exc:
         raise Unsupported(f"conv2d im2col envelope: {exc}") from exc
 
     # The gated rewrite. im2col's column ordering (channel-major, then
