@@ -903,7 +903,18 @@ def _conv2d_one_by_one_core(
     no CPU fallback, no extern kernel, no silent contiguity assumption):
     strided/padded/dilated/grouped/transposed 1x1, any kernel > 1,
     conv1d/conv3d inputs (``aten.convolution`` is the funnel for all
-    three), sub-stick channel extents, and non-contiguous input/weight.
+    three), sub-stick channel extents, mismatched dtypes between
+    input/weight/bias, non-1D or wrong-length bias, and non-contiguous
+    input/weight.
+
+    ATen parameter-list shorthand: a traced RAW op call
+    (``torch.ops.aten.conv2d(x, w, None, [1], [0], [1], 1)``) delivers
+    the stride/padding/dilation lists exactly as written, so a len-1
+    list can reach this decomposition un-normalized (eager ``F.conv2d``
+    normalizes via CompositeImplicitAutograd, the traced path does
+    not). Len-1 lists are canonicalized to the spatial rank (2) BEFORE
+    the equality gate so the ATen shorthand does not false-refuse;
+    any other wrong length refuses loud naming the observed value.
 
     Layout contract (NCHW):
       - Stick alignment: the channel extent C must be a multiple of the
@@ -930,24 +941,43 @@ def _conv2d_one_by_one_core(
         raise Unsupported(
             f"conv2d 1x1 alias: grouped convolution (groups={groups}) — "
             f"only groups=1 aliases to matmul")
-    _stride = [int(s) for s in stride]
-    _padding = [int(p) for p in padding]
-    _dilation = [int(d) for d in dilation]
-    _output_padding = [int(p) for p in output_padding]
-    if _stride != [1, 1] or _padding != [0, 0] or _dilation != [1, 1]:
-        raise Unsupported(
-            f"conv2d 1x1 alias: stride={_stride}, padding={_padding}, "
-            f"dilation={_dilation} — only stride=1/padding=0/dilation=1 "
-            f"aliases to matmul")
-    if any(p != 0 for p in _output_padding):
-        raise Unsupported(
-            f"conv2d 1x1 alias: output_padding={_output_padding} is only "
-            f"meaningful for transposed convolution, which is refused")
+    # Rank check BEFORE the parameter gates: a conv1d/conv3d-shaped input
+    # must be told it is the wrong rank, not get a stride refusal naming a
+    # rank-3 list it legitimately carries.
     if input.dim() != 4 or weight.dim() != 4:
         raise Unsupported(
             f"conv2d 1x1 alias: only 4D NCHW convolution aliases to "
             f"matmul, got input.dim()={input.dim()}, "
             f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+    # Canonicalize the ATen len-1 shorthand ([1]/[0]/[1] == [1, 1]/[0, 0]/
+    # [1, 1] at spatial rank 2) BEFORE the equality gate. Any other wrong
+    # length refuses loud rather than reaching the gate with a shape it
+    # cannot honestly compare.
+    def _spatial_list(values, name):
+        _values = [int(v) for v in values]
+        if len(_values) == 1:
+            _values = _values * 2
+        if len(_values) != 2:
+            raise Unsupported(
+                f"conv2d 1x1 alias: {name}={list(values)} has length "
+                f"{len(list(values))} — a 4D convolution takes exactly 2 "
+                f"values per parameter (the ATen len-1 shorthand is "
+                f"canonicalized; conv1d/conv3d are refused)")
+        return _values
+
+    _stride = _spatial_list(stride, "stride")
+    _padding = _spatial_list(padding, "padding")
+    _dilation = _spatial_list(dilation, "dilation")
+    _output_padding = _spatial_list(output_padding, "output_padding")
+    if _stride != [1, 1] or _padding != [0, 0] or _dilation != [1, 1]:
+        raise Unsupported(
+            f"conv2d 1x1 alias: stride={_stride}, padding={_padding}, "
+            f"dilation={_dilation} — only stride=(1, 1)/padding=(0, 0)/"
+            f"dilation=(1, 1) aliases to matmul")
+    if any(p != 0 for p in _output_padding):
+        raise Unsupported(
+            f"conv2d 1x1 alias: output_padding={_output_padding} is only "
+            f"meaningful for transposed convolution, which is refused")
     out_channels, in_channels, kh, kw = weight.shape
     if kh != 1 or kw != 1:
         raise Unsupported(
@@ -976,6 +1006,30 @@ def _conv2d_one_by_one_core(
             f"conv2d 1x1 alias: weight is not dense-contiguous OIHW "
             f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
             f"— non-contiguous layouts are refused, never silently copied")
+    # Dtype uniformity: plain tensor ops would silently PROMOTE a mixed
+    # dtype (e.g. an f64 bias over fp32 tensors) where the conv2d
+    # reference refuses — the alias must match the reference, refuse
+    # loud naming both dtypes.
+    if weight.dtype != input.dtype:
+        raise Unsupported(
+            f"conv2d 1x1 alias: weight dtype {weight.dtype} != input "
+            f"dtype {input.dtype} — mixed dtypes are refused, never "
+            f"silently promoted")
+    if bias is not None:
+        if bias.dim() != 1:
+            raise Unsupported(
+                f"conv2d 1x1 alias: bias must be 1-dimensional of length "
+                f"{out_channels}, got shape {tuple(bias.shape)} — matching "
+                f"the conv2d reference, which refuses non-1D bias")
+        if bias.dtype != input.dtype:
+            raise Unsupported(
+                f"conv2d 1x1 alias: bias dtype {bias.dtype} != input "
+                f"dtype {input.dtype} — mixed dtypes are refused, never "
+                f"silently promoted")
+        if bias.numel() != out_channels:
+            raise Unsupported(
+                f"conv2d 1x1 alias: bias has length {bias.numel()}, "
+                f"expected {out_channels} (one per output channel)")
 
     # The gated rewrite. The 2D weight sits on the LEFT of the batched
     # matmul (matmul((O, C), (N, C, P)) broadcasts the weight over the
