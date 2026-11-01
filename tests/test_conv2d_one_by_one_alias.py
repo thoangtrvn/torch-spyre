@@ -21,7 +21,7 @@ datapath; every conv must bottom out in the (silicon-witnessed) matmul
 route. This decomposition rewrites the gated form at the PyTorch level
 so Inductor never emits a conv extern kernel for it:
 
-    out = x.view(N, C, H*W) @ w.view(O, C).t()   # (N, O, H*W)
+    out = w.view(O, C) @ x.view(N, C, H*W)       # (N, O, H*W)
     out = out.view(N, O, H, W)
     out = out + bias.view(1, O, 1, 1)            # SEPARATE pointwise add
 
@@ -111,6 +111,39 @@ class TestOneByOneHappyPath:
             x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
         assert out.shape == (3, 128, 4, 6)
 
+    def test_len1_aten_parameter_lists_accepted(self):
+        # A traced RAW op call (torch.ops.aten.conv2d(...)) delivers the
+        # parameters exactly as written — len-1 lists like [1]/[0]/[1]
+        # reach the decomposition un-normalized. Eager F.conv2d normalizes
+        # via CompositeImplicitAutograd, but the traced path must not
+        # false-refuse on the ATen shorthand: [1] == [1, 1] at rank 2.
+        x, weight = _aligned_inputs()
+        out = conv2d_decomp(x, weight, None, [1], [0], [1], False, [0], 1)
+        ref = F.conv2d(x, weight, None)
+        torch.testing.assert_close(out, ref)
+
+    def test_traced_raw_aten_conv2d_len1_lists_rewrite_to_matmul(self):
+        # The delivery path for the len-1 lists above, verified end to
+        # end: make_fx on a function calling the RAW aten op (not the
+        # Python F.conv2d wrapper) under enable_spyre_decompositions must
+        # rewrite to matmul with no conv node surviving.
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch_spyre._inductor.decompositions import (
+            enable_spyre_decompositions,
+        )
+
+        def fn(x, w):
+            return torch.ops.aten.conv2d(x, w, None, [1], [0], [1], 1)
+
+        x, weight = _aligned_inputs()
+        table = {}
+        with enable_spyre_decompositions(table):
+            gm = make_fx(fn, decomposition_table=table)(x, weight)
+        graph_ops = [str(node.target) for node in gm.graph.nodes]
+        assert not any("conv" in op for op in graph_ops), graph_ops
+        assert any("matmul" in op or "mm" in op for op in graph_ops), (
+            graph_ops)
+
 
 class TestGateRefusesLoud:
     """Every un-gated variant raises errors.Unsupported — the alias must
@@ -148,6 +181,12 @@ class TestGateRefusesLoud:
         assert "transposed" in msg
 
     def test_k3_kernel_refused(self):
+        # Post im2col-v0: a 3x3 kernel routes through the im2col core,
+        # and at C=64 (fp32, K=576 -> ks=18) it refuses on the conv
+        # ENVELOPE (ks >= 9 needs chunked-K, not landed) — still
+        # refuse-loud, now named at the envelope boundary instead of
+        # the 1x1 alias's kernel guard. In-envelope 3x3 shapes are
+        # covered in test_conv2d_im2col.py.
         x, _ = _aligned_inputs()
         weight = torch.randn(64, 64, 3, 3)
         with pytest.raises(Exception, match="does not support"):
@@ -199,6 +238,84 @@ class TestGateRefusesLoud:
         with pytest.raises(Exception, match="does not support"):
             conv2d_decomp(
                 x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+
+    def test_conv3d_refusal_names_rank_not_stride(self):
+        # A 5D (conv3d-shaped) input carrying len-3 parameter lists must
+        # get the RANK refusal ("only 4D NCHW"), not a stride refusal
+        # naming [1, 1, 1] — the rank check runs before the parameter
+        # equality gate so conv1d/conv3d callers are told what is
+        # actually wrong.
+        x = torch.randn(2, 64, 4, 4, 4)
+        weight = torch.randn(64, 64, 1, 1, 1)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1] * 3, [0] * 3, [1] * 3, False,
+                [0] * 3, 1)
+        assert "4D NCHW" in str(excinfo.value)
+        assert "stride" not in str(excinfo.value)
+
+    def test_wrong_length_parameter_list_refused(self):
+        # A len-3 list against a 4D input is malformed for conv2d (the
+        # ATen shorthand covers only len-1); it must refuse loud naming
+        # the observed length, never index-error.
+        x, weight = _aligned_inputs()
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1, 1], [0, 0], [1, 1], False,
+                [0, 0], 1)
+        assert "stride" in str(excinfo.value)
+        assert "length" in str(excinfo.value)
+
+    def test_bias_dtype_mismatch_refused(self):
+        # fp32 input/weight with an f64 bias silently promotes under
+        # plain tensor ops (the reference conv2d refuses it); the alias
+        # must refuse loud naming both dtypes instead.
+        x, weight = _aligned_inputs()
+        bias = torch.randn(weight.shape[0], dtype=torch.float64)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "bias" in msg and "dtype" in msg
+        assert "float32" in msg and "float64" in msg
+
+    def test_weight_dtype_mismatch_refused(self):
+        # Mixed input/weight dtypes currently die as a bare RuntimeError
+        # inside the matmul; the gate must refuse typed, naming both.
+        x, _ = _aligned_inputs(dtype=torch.float32)
+        weight = torch.randn(64, 64, 1, 1, dtype=torch.float16)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "dtype" in msg
+        assert "float32" in msg and "float16" in msg
+
+    def test_non_1d_bias_refused(self):
+        # A 2D bias of matching numel ((O, 1)) is leniently accepted by
+        # the .view() but refused by the conv2d reference ("Expected bias
+        # to be 1-dimensional"); the alias must match the reference —
+        # refuse, naming the observed shape.
+        x, weight = _aligned_inputs()
+        bias = torch.randn(weight.shape[0], 1)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "1-dimensional" in str(excinfo.value)
+        assert str(tuple(bias.shape)) in str(excinfo.value)
+
+    def test_wrong_length_bias_refused(self):
+        # A 1D bias of the wrong length currently dies as a bare
+        # RuntimeError inside .view(); it must refuse typed, naming the
+        # observed and expected lengths.
+        x, weight = _aligned_inputs(o=64)
+        bias = torch.randn(65)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "bias" in msg
+        assert "65" in msg and "64" in msg
 
 
 class TestRegistryWiring:
