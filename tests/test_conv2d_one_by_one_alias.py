@@ -291,6 +291,24 @@ class TestGateRefusesLoud:
         assert "dtype" in msg
         assert "float32" in msg and "float16" in msg
 
+    def test_bfloat16_refused_as_1p5_format(self):
+        # Dtype IDENTITY, not just uniformity: a bfloat16 1x1 conv is
+        # internally uniform so the equality gates pass, and torch_spyre
+        # maps bf16 to DataFormats.BFLOAT16 (torch_spyre/_C.py:113) —
+        # the 1p5 format. On a 1p0 target that is the BF16-bits-read-as-
+        # DL16 silent-wrong class, so the alias must refuse bfloat16
+        # NAMED, following the softmax seam precedent
+        # (torch_spyre/ops/softmax.py: "bfloat16 is 1p5"). Nothing
+        # downstream independently refuses bf16 — the mapping is the
+        # exposure — so the gate at this layer is load-bearing.
+        x, weight = _aligned_inputs(dtype=torch.bfloat16)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "bfloat16" in msg
+        assert "1p5" in msg
+
     def test_non_1d_bias_refused(self):
         # A 2D bias of matching numel ((O, 1)) is leniently accepted by
         # the .view() but refused by the conv2d reference ("Expected bias
