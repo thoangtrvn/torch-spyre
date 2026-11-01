@@ -332,6 +332,90 @@ class TestGateRefusesLoud:
         self._refuse(x=x, weight=weight)
 
 
+class TestFoldConventionParity:
+    """The T-CN-1 gauntlet-r1 fold conventions (ATen len-1 list
+    canonicalization, rank-first refusals, dtype/bias gates) apply to
+    the im2col core too — same funnel, same contract."""
+
+    def test_conv3d_refusal_names_rank_not_stride(self):
+        # A 5D input must be told it is the wrong rank, not get a
+        # stride refusal naming the rank-3 list it legitimately carries
+        # (the fold's rank-first rule).
+        _require_codegen()
+        x = torch.randn(2, 8, 4, 4, 4)
+        weight = torch.randn(64, 8, 3, 3, 3)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1] * 3, [0] * 3, [1] * 3, False,
+                [0] * 3, 1)
+        assert "4D NCHW" in str(excinfo.value)
+
+    def test_traced_raw_aten_len1_shorthand_admits(self):
+        # A traced RAW op call delivers the parameter lists un-normalized
+        # (eager F.conv2d normalizes via CompositeImplicitAutograd): the
+        # ATen len-1 shorthand ([1]/[0]/[1]) must canonicalize to the
+        # spatial rank and admit, not false-refuse.
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        out = torch.ops.aten.conv2d.default(
+            x, weight, None, [1], [0], [1], 1)
+        ref = F.conv2d(x, weight, None)
+        torch.testing.assert_close(out, ref)
+
+    def test_wrong_list_length_refuses_named(self):
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1] * 3, [0] * 3, [1] * 3, False,
+                [0] * 3, 1)
+        # Rank-first: the 4D input with rank-3 lists names the rank.
+        assert "4D NCHW" in str(excinfo.value)
+        x5 = torch.randn(2, 8, 4, 4)
+        w5 = torch.randn(64, 8, 3, 3)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x5, w5, None, [1, 1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "length" in str(excinfo.value)
+
+    def test_mixed_weight_dtype_refuses_naming_both(self):
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        w64 = weight.double()
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, w64, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "dtype" in msg
+        assert "Double" in msg and "Float" in msg
+
+    def test_mixed_bias_dtype_refuses_naming_both(self):
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        bias = torch.randn(weight.shape[0], dtype=torch.float64)
+        with pytest.raises(Exception, match="does not support"):
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+
+    def test_non_1d_bias_refuses_named(self):
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        bias = torch.randn(weight.shape[0], 1)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "1-dimensional" in str(excinfo.value)
+
+    def test_wrong_length_bias_refuses_named(self):
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        bias = torch.randn(weight.shape[0] + 1)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "length" in str(excinfo.value)
+
+
 class TestTraceReceipt:
     def test_make_fx_rewrites_conv2d_to_im2col_and_matmul(self):
         # The registration arm's whole point: under
