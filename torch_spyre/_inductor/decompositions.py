@@ -871,6 +871,169 @@ def pad_decomp(
     return output
 
 
+def _conv2d_one_by_one_core(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """Alias a gated 1x1 convolution to a matmul (+ separate bias add).
+
+    The hardware has no convolution datapath; a 1x1/s1/p0/d1/groups=1
+    convolution is a pure per-spatial-position channel mix — exactly a
+    matmul over the channel dimension — so it rewrites to ops the
+    silicon-witnessed native-matmul route already handles (the aten.mm
+    exclusion below -> triton.native_matmul -> tt.dot):
+
+        out = weight.view(O, C) @ input.view(N, C, H*W)   # (N,O,H*W)
+        out = out.view(N, O, H, W)
+        out = out + bias.view(1, O, 1, 1)   # SEPARATE pointwise add
+
+    The bias stays a separate pointwise add by design: the matmul_bias
+    composite admission is witnessed only at the census geometry
+    (M=32/K=64/N=64), and widening that witness is a deliberate,
+    hardware-probed decision — not something this alias makes silently.
+
+    Everything outside the gate raises ``Unsupported`` (refuse-loud —
+    no CPU fallback, no extern kernel, no silent contiguity assumption):
+    strided/padded/dilated/grouped/transposed 1x1, any kernel > 1,
+    conv1d/conv3d inputs (``aten.convolution`` is the funnel for all
+    three), sub-stick channel extents, and non-contiguous input/weight.
+
+    Layout contract (NCHW):
+      - Stick alignment: the channel extent C must be a multiple of the
+        stick size in elements (128B / element_size — 64 elements at
+        DL16, 32 at fp32); a sub-stick C would put the matmul's K
+        dimension off stick boundaries.
+      - Contiguity disposition: dense NCHW/OIHW tensors fresh from
+        allocation are contiguous (the reachable case, pinned by test);
+        a non-contiguous input (slice/permute) is REFUSED with the
+        observed strides named — ``.contiguous()`` is never called
+        silently because it would both pay a hidden copy and hide the
+        layout from the compiler.
+
+    ``aten.convolution`` and ``aten.conv2d`` both route here: the
+    compile path funnels conv2d -> convolution, while eager dispatch and
+    pre-decomposition traces can present either overload.
+    """
+    if transposed:
+        raise Unsupported(
+            f"conv2d 1x1 alias: transposed convolution (transposed="
+            f"{transposed}) — only the 1x1/stride-1/no-padding/no-dilation/"
+            f"groups-1 form aliases to matmul")
+    if groups != 1:
+        raise Unsupported(
+            f"conv2d 1x1 alias: grouped convolution (groups={groups}) — "
+            f"only groups=1 aliases to matmul")
+    _stride = [int(s) for s in stride]
+    _padding = [int(p) for p in padding]
+    _dilation = [int(d) for d in dilation]
+    _output_padding = [int(p) for p in output_padding]
+    if _stride != [1, 1] or _padding != [0, 0] or _dilation != [1, 1]:
+        raise Unsupported(
+            f"conv2d 1x1 alias: stride={_stride}, padding={_padding}, "
+            f"dilation={_dilation} — only stride=1/padding=0/dilation=1 "
+            f"aliases to matmul")
+    if any(p != 0 for p in _output_padding):
+        raise Unsupported(
+            f"conv2d 1x1 alias: output_padding={_output_padding} is only "
+            f"meaningful for transposed convolution, which is refused")
+    if input.dim() != 4 or weight.dim() != 4:
+        raise Unsupported(
+            f"conv2d 1x1 alias: only 4D NCHW convolution aliases to "
+            f"matmul, got input.dim()={input.dim()}, "
+            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+    out_channels, in_channels, kh, kw = weight.shape
+    if kh != 1 or kw != 1:
+        raise Unsupported(
+            f"conv2d 1x1 alias: kernel ({kh}, {kw}) — only 1x1 aliases to "
+            f"matmul (general convolution needs host im2col, not this "
+            f"decomposition)")
+    n, c_in, h, w = input.shape
+    if c_in != in_channels:
+        raise Unsupported(
+            f"conv2d 1x1 alias: input channels {c_in} != weight input "
+            f"channels {in_channels}")
+    elems_per_stick = 128 // input.element_size()
+    if in_channels % elems_per_stick != 0:
+        raise Unsupported(
+            f"conv2d 1x1 alias: channel extent C={in_channels} is not "
+            f"stick-aligned ({elems_per_stick} elements per "
+            f"{input.dtype} stick) — the matmul K dimension would sit off "
+            f"stick boundaries")
+    if not input.is_contiguous():
+        raise Unsupported(
+            f"conv2d 1x1 alias: input is not dense-contiguous NCHW "
+            f"(stride={tuple(input.stride())}, shape={tuple(input.shape)}) "
+            f"— non-contiguous layouts are refused, never silently copied")
+    if not weight.is_contiguous():
+        raise Unsupported(
+            f"conv2d 1x1 alias: weight is not dense-contiguous OIHW "
+            f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
+            f"— non-contiguous layouts are refused, never silently copied")
+
+    # The gated rewrite. The 2D weight sits on the LEFT of the batched
+    # matmul (matmul((O, C), (N, C, P)) broadcasts the weight over the
+    # batch — the same stride-0-batch bmm class as the witnessed linear
+    # path's (B, S, d) @ (d, d)). .view() (not .reshape()) so any layout
+    # surprise raises instead of silently copying; the contiguity gates
+    # above are what make the views legal.
+    spatial = h * w
+    out = weight.view(out_channels, in_channels) @ input.view(
+        n, in_channels, spatial)
+    out = out.view(n, out_channels, h, w)
+    if bias is not None:
+        # Separate pointwise add (default D-disposition) — never fold
+        # into a matmul_bias composite here.
+        out = out + bias.view(1, out_channels, 1, 1)
+    return out
+
+
+@register_spyre_decomposition([torch.ops.aten.convolution.default])
+def conv2d_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: Sequence[int] = (1, 1),
+    padding: Sequence[int] = (0, 0),
+    dilation: Sequence[int] = (1, 1),
+    transposed: bool = False,
+    output_padding: Sequence[int] = (0, 0),
+    groups: int = 1,
+) -> torch.Tensor:
+    """``aten.convolution``-signature wrapper (the compile-path funnel
+    for conv1d/conv2d/conv3d): all nine arguments positional. See
+    ``_conv2d_one_by_one_core`` for the gated 1x1 -> matmul alias and
+    its refuse-loud layout contract."""
+    return _conv2d_one_by_one_core(
+        input, weight, bias, stride, padding, dilation, transposed,
+        output_padding, groups)
+
+
+@register_spyre_decomposition([torch.ops.aten.conv2d.default])
+def conv2d_alias_decomp(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    stride: Sequence[int] = (1, 1),
+    padding: Sequence[int] = (0, 0),
+    dilation: Sequence[int] = (1, 1),
+    groups: int = 1,
+) -> torch.Tensor:
+    """``aten.conv2d``-signature wrapper (no transposed/output_padding
+    — a different positional order than ``aten.convolution``, hence a
+    separate entry point): eager dispatch and pre-decomposition traces
+    can present this overload directly. Same gated core."""
+    return _conv2d_one_by_one_core(
+        input, weight, bias, stride, padding, dilation, False, (0, 0),
+        groups)
+
+
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
 def bitwise_not(input: torch.Tensor) -> torch.Tensor:
     if input.dtype is torch.bool:

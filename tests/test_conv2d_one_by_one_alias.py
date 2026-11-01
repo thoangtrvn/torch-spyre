@@ -53,6 +53,7 @@ import torch
 import torch.nn.functional as F
 
 from torch_spyre._inductor.decompositions import (
+    conv2d_alias_decomp,
     conv2d_decomp,
     spyre_decompositions,
 )
@@ -89,8 +90,19 @@ class TestOneByOneHappyPath:
         # transposed/output_padding); both overloads must reach the same
         # gated rewrite.
         x, weight = _aligned_inputs()
-        out = conv2d_decomp(x, weight, None, [1, 1], [0, 0], [1, 1], 1)
+        out = conv2d_alias_decomp(x, weight, None, [1, 1], [0, 0], [1, 1], 1)
         ref = F.conv2d(x, weight, None)
+        torch.testing.assert_close(out, ref)
+
+    def test_matches_reference_at_non_coincident_spatial(self):
+        # Guard the coincidence trap: at h=w=8, C=64 the spatial extent
+        # equals the channel extent (P == C == 64) and a wrong operand
+        # order can still type-check. This shape keeps them distinct.
+        x, weight = _aligned_inputs(n=2, c=64, h=4, w=6, o=96)
+        bias = torch.randn(96)
+        out = conv2d_decomp(
+            x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        ref = F.conv2d(x, weight, bias)
         torch.testing.assert_close(out, ref)
 
     def test_output_shape_is_nchw(self):
@@ -174,7 +186,7 @@ class TestGateRefusesLoud:
 
     def test_non_contiguous_input_refused_with_strides_named(self):
         x, weight = _aligned_inputs()
-        x = x.transpose(1, 2)  # NHWC-strided input — a reachable case
+        x = x.permute(0, 1, 3, 2)  # shape-preserving (h==w), non-contiguous
         with pytest.raises(Exception, match="does not support") as excinfo:
             conv2d_decomp(
                 x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
@@ -200,7 +212,7 @@ class TestRegistryWiring:
         )
         assert (
             spyre_decompositions[torch.ops.aten.conv2d.default]
-            is conv2d_decomp
+            is conv2d_alias_decomp
         )
 
     def test_make_fx_rewrites_conv2d_to_matmul(self):
@@ -208,7 +220,7 @@ class TestRegistryWiring:
         # spyre_decompositions)` targets exactly this: under
         # enable_spyre_decompositions a traced conv2d is replaced by the
         # matmul (+ optional add) chain, with NO conv node surviving.
-        from torch._decomp import make_fx
+        from torch.fx.experimental.proxy_tensor import make_fx
         from torch_spyre._inductor.decompositions import (
             enable_spyre_decompositions,
         )
@@ -231,7 +243,7 @@ class TestRegistryWiring:
         # The refusal must fire INSIDE the trace too (a strided 1x1 conv
         # under torch.compile fails loud at decomposition time, not as a
         # silent extern kernel downstream).
-        from torch._decomp import make_fx
+        from torch.fx.experimental.proxy_tensor import make_fx
         from torch_spyre._inductor.decompositions import (
             enable_spyre_decompositions,
         )
