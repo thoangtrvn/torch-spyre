@@ -55,6 +55,8 @@ import tempfile
 import textwrap
 
 import pytest
+import sympy
+import torch
 
 
 def _run_script(script: str) -> subprocess.CompletedProcess:
@@ -205,12 +207,147 @@ def test_zblock_gate_lives_in_the_matmul_branch():
     The end-to-end tests above are the behavioral pin; this keeps the
     z-gate spelled at the matmul fixed_config site (not moved, not
     unconditional).
+
+    Window-termination asserts (r2 P2-2): the split on the literal
+    ``"elif is_reduction:"`` label must actually terminate the matmul
+    window — if that label is ever renamed, the naive split would return
+    the ENTIRE rest of the function as the "matmul block", silently
+    widening the window so a guard moved out of the matmul branch (into
+    the reduction or pointwise branch) would stop being caught. Asserts:
+    (a) the terminator label exists after the matmul branch opens,
+    (b) the extracted window contains no further branch boundary, so the
+    window provably ended at the FIRST ``elif`` — a renamed terminator
+    fails (a) loudly instead of widening silently.
     """
     import inspect
 
     from torch_spyre._inductor import choices
 
     src = inspect.getsource(choices)
-    matmul_block = src.split("if is_matmul:", 1)[1].split("elif is_reduction:", 1)[0]
+    before, rest = src.split("if is_matmul:", 1)
+    assert "elif is_reduction:" in rest, (
+        "matmul-branch terminator label 'elif is_reduction:' not found "
+        "after 'if is_matmul:' — the source pin's window split is stale; "
+        "re-pin the window against the current branch labels")
+    matmul_block = rest.split("elif is_reduction:", 1)[0]
+    assert "elif" not in matmul_block, (
+        "the extracted matmul window spans another branch boundary — "
+        "the split no longer isolates the matmul branch; re-pin it")
     assert '"z" in tiling' in matmul_block
     assert '"ZBLOCK"] = 1' in matmul_block
+
+
+# ---------------------------------------------------------------------------
+# Behavioral leak pin (r2 P2-1): a z-carrying NON-matmul tiling must not
+# get ZBLOCK — in-process, no compile stack needed.
+# ---------------------------------------------------------------------------
+
+
+class _StubBuffer:
+    @staticmethod
+    def get_dtype():
+        return torch.float16
+
+    @staticmethod
+    def get_size():
+        return [96, 64]
+
+
+class _StubNode:
+    node = _StubBuffer()
+
+
+class _StubFeatures:
+    """Minimum feature surface ``triton_kernel_kwargs`` reads.
+
+    is_reduction()=True with contains_op("dot") falsy routes to the
+    REDUCTION branch (a z-carrying non-matmul); the dot subclass routes
+    to the matmul branch with the SAME tiling dict — the control leg.
+    """
+
+    def is_reduction(self):
+        return True
+
+    def contains_op(self, name):
+        return None
+
+    def scheduler_nodes(self):
+        return [_StubNode()]
+
+    def reduction_numel_hints(self):
+        return [4096]
+
+    def numel_hints(self):
+        return [96 * 64]
+
+    def is_template(self):
+        return False
+
+    def is_cooperative_reduction(self):
+        return False
+
+    def get_reduction_hint(self):
+        return None
+
+    reduction_numel = sympy.Integer(4096)
+
+
+class _DotFeatures(_StubFeatures):
+    def contains_op(self, name):
+        return name == "dot"
+
+
+def _fixed_config_keys(features, tiling):
+    """Call triton_kernel_kwargs in-process; return the fixed_config dict.
+
+    Requires stubbing ``V.graph`` (NullHandler outside a compile) with a
+    sizevars namespace whose resolvers handle plain ints — the same
+    read-only surface a real compile provides. The class swap is
+    restored in ``finally`` so the patch never leaks across tests.
+    """
+    from types import SimpleNamespace
+
+    from torch._inductor import virtualized
+    from torch_spyre._inductor.choices import SpyreHeuristics
+
+    class _VProxy(virtualized._V):
+        @property
+        def graph(self):
+            return SimpleNamespace(sizevars=SimpleNamespace(
+                statically_known_int=lambda v: int(v),
+                statically_known_leq=lambda a, b: int(a) <= int(b)))
+
+    original_cls = virtualized.V.__class__
+    virtualized.V.__class__ = _VProxy
+    try:
+        kernel_kwargs = {}
+        SpyreHeuristics().triton_kernel_kwargs(
+            None, features(), [tiling], kernel_kwargs)
+    finally:
+        virtualized.V.__class__ = original_cls
+    fixed_config = kernel_kwargs["fixed_config"]
+    cfg = getattr(fixed_config, "config", fixed_config)
+    return dict(cfg) if hasattr(cfg, "keys") else dict(vars(cfg))
+
+
+def test_z_carrying_non_matmul_tiling_gets_no_zblock():
+    """The leak mutation, behaviorally: reduction + "z" tiling, no ZBLOCK.
+
+    The subprocess tests pin the two REAL schedules (3-range matmul,
+    2-range matmul); this pins the CLASS the textual source pin can only
+    cover by window spelling — a z key in a NON-matmul tiling dict. The
+    reduction branch never reads tiling["z"], so its fixed_config is
+    {XBLOCK, R0_BLOCK, num_cores}: injecting ZBLOCK there would be the
+    #193 class (a key the kernel signature does not declare ->
+    ``ValueError: 'ZBLOCK' is not in list``). The dot control leg proves
+    the SAME tiling dict DOES get ZBLOCK=1 when the kernel is a matmul,
+    so this is a true both-directions behavioral pin on one tiling.
+    """
+    tiling = {"z": 2, "x": 1024, "r0_": 4096}
+    reduction_cfg = _fixed_config_keys(_StubFeatures, tiling)
+    assert "ZBLOCK" not in reduction_cfg, reduction_cfg
+    assert "XBLOCK" in reduction_cfg and "R0_BLOCK" in reduction_cfg, (
+        reduction_cfg)
+    matmul_cfg = _fixed_config_keys(_DotFeatures,
+                                    {**tiling, "y": 96})
+    assert matmul_cfg.get("ZBLOCK") == 1, matmul_cfg

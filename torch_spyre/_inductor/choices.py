@@ -263,6 +263,18 @@ class SpyreHeuristics(InductorChoices):
             # shape) — so this key is a signature-shape obligation, not a
             # tiling decision.
             if "z" in tiling:
+                # PREDICTION-DRIFT NOTE (the #193 class): this gate is keyed on
+                # the TILING DICT carrying "z", not on an Inductor decision
+                # function (the R0_BLOCK gate below uses should_use_persistent_
+                # reduction, which cannot drift from the codegen). If a 3-range
+                # matmul ever surfaces whose tiling dict LACKS "z" (an Inductor
+                # schedule change re-rooting the batch range, or a new prefixed
+                # range family), the ZBLOCK key silently goes missing again and
+                # the compile dies at ast_to_ttir with the ZBLOCK-unbound
+                # AttributeError. Check on any such failure: print the tiling
+                # dict keys here and compare against the range-tree prefixes in
+                # torch/_inductor/codegen/triton.py's iteration_ranges (the
+                # same comparison the fixed_config key-set must match).
                 block_config["ZBLOCK"] = 1
             kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
 
