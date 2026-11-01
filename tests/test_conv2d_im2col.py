@@ -148,7 +148,11 @@ class TestIm2colHappyPath:
         out = conv2d_decomp(
             x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
         ref = F.conv2d(x, weight, bias)
-        torch.testing.assert_close(out, ref)
+        # Bitwise, not close: the zero-pad columns are structural
+        # zeros, so the mm is the same sum in the same order — the
+        # gauntlet probes confirmed bit-equality and the pin should
+        # state exactly that (torch.equal, never assert_close).
+        assert torch.equal(out, ref)
 
     def test_dl16_dtype_routes_with_dl16_stick_width(self):
         # float16 input = DL16 on 1p0: elements_per_stick is 64, so the
@@ -172,7 +176,7 @@ class TestIm2colHappyPath:
         out_nb = conv2d_decomp(
             x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
         ref_nb = F.conv2d(x, weight, None)
-        torch.testing.assert_close(out_nb, ref_nb)
+        assert torch.equal(out_nb, ref_nb)
 
     def test_conv2d_overload_signature_matches(self):
         # aten.conv2d's 7-argument signature (no transposed /
@@ -484,3 +488,70 @@ class TestOneByOneRoutingUnchanged:
         graph_ops = [str(node.target) for node in gm.graph.nodes]
         assert not any("im2col" in op or "unfold" in op for op in graph_ops), (
             graph_ops)
+
+
+class TestGauntletFoldRefusals:
+    """RED-FIRST (three-axis gauntlet fold): dtype identity end-to-end,
+    zero-extent/O=0 geometry, and bias contiguity — each refuses NAMED
+    at the seam, never a raw RuntimeError and never a silent admission.
+
+    Torch-version pinning note (layout P2-3, adopted from the
+    PYTHONPATH-pinning rule): these are DIRECT-decomposition probes —
+    they call the decomposition on CPU tensors and do not depend on the
+    Inductor/Triton stack, so they are torch-version-robust. Any FUTURE
+    end-to-end (torch.compile) verification probe MUST pin the torch
+    version it was validated on: production-path behavior differs
+    across torch releases (on 2.13, aten.im2col decomposes into an
+    in-graph advanced-indexing gather — the exact shape the fallback
+    ledger vetoes — and the known-good 1x1 control fails there too, so
+    2.13 production-path results are confounded and unattributable).
+    """
+
+    def test_bfloat16_refuses_named_as_1p5(self):
+        # Dtype identity, not element width: bf16 is 16-bit but is 1p5's
+        # BF16, not 1p0's DL16 — and the downstream rcudd1a dtype map
+        # silently maps bf16 to DL16, so this seam is the only barrier.
+        # Must refuse NAMED (bfloat16 + 1p5 in the message).
+        _require_codegen()
+        x, weight = _im2col_inputs(dtype=torch.bfloat16)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        msg = str(excinfo.value)
+        assert "bfloat16" in msg
+        assert "1p5" in msg
+
+    def test_out_channels_zero_refuses_named(self):
+        # F.conv2d refuses O=0; the rewrite must refuse it NAMED too,
+        # not hand a 0-row mm to the route (ns=0 sails the product
+        # bound — zero is a dangerous default).
+        _require_codegen()
+        x, weight = _im2col_inputs(o=0)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "out_channels" in str(excinfo.value)
+
+    def test_zero_input_channels_refuses_named(self):
+        # Zero-extent geometry reaches the seam as a raw unfold
+        # RuntimeError today; it must refuse NAMED at admission instead.
+        _require_codegen()
+        x, weight = _im2col_inputs(c=0)
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "in_channels" in str(excinfo.value)
+
+    def test_non_contiguous_bias_refuses_named(self):
+        # Contract consistency: input and weight contiguity is already
+        # gated with strides named; a non-contiguous 1D bias must refuse
+        # the same way, never silently .contiguous()-copied.
+        _require_codegen()
+        x, weight = _im2col_inputs()
+        bias = torch.randn(weight.shape[0] * 2)[::2]
+        assert bias.shape == (weight.shape[0],)
+        assert not bias.is_contiguous()
+        with pytest.raises(Exception, match="does not support") as excinfo:
+            conv2d_decomp(
+                x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        assert "contiguous" in str(excinfo.value)
