@@ -363,19 +363,16 @@ class TestFoldConventionParity:
         torch.testing.assert_close(out, ref)
 
     def test_wrong_list_length_refuses_named(self):
+        # A 4D input carrying a rank-3 parameter list: the rank is fine,
+        # the list length is not — refuse naming the observed length.
+        # (The mirror case — a 5D input, rank-first naming — is pinned
+        # by test_conv3d_refusal_names_rank_not_stride above.)
         _require_codegen()
         x, weight = _im2col_inputs()
         with pytest.raises(Exception, match="does not support") as excinfo:
             conv2d_decomp(
-                x, weight, None, [1] * 3, [0] * 3, [1] * 3, False,
-                [0] * 3, 1)
-        # Rank-first: the 4D input with rank-3 lists names the rank.
-        assert "4D NCHW" in str(excinfo.value)
-        x5 = torch.randn(2, 8, 4, 4)
-        w5 = torch.randn(64, 8, 3, 3)
-        with pytest.raises(Exception, match="does not support") as excinfo:
-            conv2d_decomp(
-                x5, w5, None, [1, 1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+                x, weight, None, [1, 1, 1], [0, 0], [1, 1], False,
+                [0, 0], 1)
         assert "length" in str(excinfo.value)
 
     def test_mixed_weight_dtype_refuses_naming_both(self):
@@ -387,7 +384,7 @@ class TestFoldConventionParity:
                 x, w64, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
         msg = str(excinfo.value)
         assert "dtype" in msg
-        assert "Double" in msg and "Float" in msg
+        assert "float64" in msg and "float32" in msg
 
     def test_mixed_bias_dtype_refuses_naming_both(self):
         _require_codegen()

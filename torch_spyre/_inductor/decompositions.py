@@ -1108,25 +1108,47 @@ def _conv2d_im2col_core(
         raise Unsupported(
             f"conv2d im2col: grouped convolution (groups={groups}) — "
             f"only groups=1 rewrites to host im2col + matmul")
-    _stride = [int(s) for s in stride]
-    _padding = [int(p) for p in padding]
-    _dilation = [int(d) for d in dilation]
-    _output_padding = [int(p) for p in output_padding]
-    if _stride != [1, 1] or _dilation != [1, 1]:
-        raise Unsupported(
-            f"conv2d im2col: stride={_stride}, dilation={_dilation} — "
-            f"only stride=1/dilation=1 rewrites to host im2col + "
-            f"matmul (strided and dilated convolution are out of v0 "
-            f"scope by tier row)")
-    if any(p != 0 for p in _output_padding):
-        raise Unsupported(
-            f"conv2d im2col: output_padding={_output_padding} is only "
-            f"meaningful for transposed convolution, which is refused")
+    # Rank check BEFORE the parameter gates (the fold's rank-first
+    # rule): a conv1d/conv3d-shaped input must be told it is the wrong
+    # rank, not get a stride refusal naming the rank-3 list it
+    # legitimately carries.
     if input.dim() != 4 or weight.dim() != 4:
         raise Unsupported(
             f"conv2d im2col: only 4D NCHW convolution rewrites to host "
             f"im2col + matmul, got input.dim()={input.dim()}, "
             f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+    # Canonicalize the ATen len-1 shorthand ([1]/[0]/[1] == [1, 1]/
+    # [0, 0]/[1, 1] at spatial rank 2) BEFORE the equality gate — a
+    # traced RAW op call delivers the lists un-normalized (eager
+    # F.conv2d normalizes via CompositeImplicitAutograd, the traced
+    # path does not). Any other wrong length refuses loud naming the
+    # observed value (same fold convention as the 1x1 alias).
+    def _spatial_list(values, name):
+        _values = [int(v) for v in values]
+        if len(_values) == 1:
+            _values = _values * 2
+        if len(_values) != 2:
+            raise Unsupported(
+                f"conv2d im2col: {name}={list(values)} has length "
+                f"{len(list(values))} — a 4D convolution takes exactly 2 "
+                f"values per parameter (the ATen len-1 shorthand is "
+                f"canonicalized; conv1d/conv3d are refused)")
+        return _values
+
+    _stride = _spatial_list(stride, "stride")
+    _padding = _spatial_list(padding, "padding")
+    _dilation = _spatial_list(dilation, "dilation")
+    _output_padding = _spatial_list(output_padding, "output_padding")
+    if _stride != [1, 1] or _dilation != [1, 1]:
+        raise Unsupported(
+            f"conv2d im2col: stride={_stride}, dilation={_dilation} — "
+            f"only stride=(1, 1)/dilation=(1, 1) rewrites to host "
+            f"im2col + matmul (strided and dilated convolution are out "
+            f"of v0 scope by tier row)")
+    if any(p != 0 for p in _output_padding):
+        raise Unsupported(
+            f"conv2d im2col: output_padding={_output_padding} is only "
+            f"meaningful for transposed convolution, which is refused")
     out_channels, in_channels, kh, kw = weight.shape
     n, c_in, h, w = input.shape
     if c_in != in_channels:
@@ -1162,6 +1184,31 @@ def _conv2d_im2col_core(
             f"conv2d im2col: weight is not dense-contiguous OIHW "
             f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
             f"— non-contiguous layouts are refused, never silently copied")
+    # Dtype uniformity and bias shape (the fold conventions, same
+    # contract as the 1x1 alias): plain tensor ops would silently
+    # PROMOTE a mixed dtype where the conv2d reference refuses, and a
+    # non-1D or wrong-length bias must refuse named instead of dying
+    # inside the .view() or being leniently accepted.
+    if weight.dtype != input.dtype:
+        raise Unsupported(
+            f"conv2d im2col: weight dtype {weight.dtype} != input "
+            f"dtype {input.dtype} — mixed dtypes are refused, never "
+            f"silently promoted")
+    if bias is not None:
+        if bias.dim() != 1:
+            raise Unsupported(
+                f"conv2d im2col: bias must be 1-dimensional of length "
+                f"{out_channels}, got shape {tuple(bias.shape)} — matching "
+                f"the conv2d reference, which refuses non-1D bias")
+        if bias.dtype != input.dtype:
+            raise Unsupported(
+                f"conv2d im2col: bias dtype {bias.dtype} != input "
+                f"dtype {input.dtype} — mixed dtypes are refused, never "
+                f"silently promoted")
+        if bias.numel() != out_channels:
+            raise Unsupported(
+                f"conv2d im2col: bias has length {bias.numel()}, "
+                f"expected {out_channels} (one per output channel)")
 
     # The envelope boundary: fail-loud BEFORE any tensor is built.
     # Delegated to the codegen-side predicate (single source of truth,
