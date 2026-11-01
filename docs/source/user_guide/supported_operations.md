@@ -16,6 +16,9 @@ see [Adding Operations](../compiler/adding_operations.md).
 | `torch.addmm` | Y | Y | Spyre | Decomposed to `mm` + `add` |
 | `torch.bmm` | Y | Y | Spyre | |
 | `torch.nn.functional.linear` | Y | Y | Spyre | Decomposed to `matmul` + `add` |
+| **Convolution** | | | | |
+| `torch.nn.functional.conv2d` (1x1) | Y | Y | Spyre | kh=kw=1/s1/p0/d1/groups=1 only: aliased to `matmul` + separate bias `add`. Sub-stick C or non-contiguous NCHW/OIHW refuses loud |
+| `torch.nn.functional.conv2d` (general, v0) | Y | Y | Spyre (mm) + host (im2col) | stride=1/dilation=1/groups=1, padding 0 or `kernel//2` per dim. Rewritten to **host im2col (unfold) + `mm`** with K zero-padded to a whole stick; bias is a separate `add`. **Envelope, refuse-loud before emission:** `ks >= 9` (chunked-K not landed — every real 3x3 at C >= 64 refuses here) and `ks*ns > 127` (14-bit L3 LBR fit). **Host-vs-device ledger:** im2col runs on host — the device-side gather is hardware-vetoed (stick-granular L3 EAR strides; dot-operand provenance guard); the K zero-pad (`K_pad - K` structural zeros, exact) is the im2col amplification bill. Strided/dilated/grouped/transposed/conv1d/conv3d/asymmetric-padding variants refuse loud (no CPU fallback) |
 | **Activation Functions** | | | | |
 | `torch.nn.functional.softmax` | Y | Y | Spyre | **`dim=-1` only, and ONE shape: `[1024, 64]` float16 (DL16).** Routed via the `spyre::softmax` custom op; HW-verified eager + compiled at 3.28 ULP_DL16. Every other shape/dtype/axis raises `NotImplementedError` (no host fallback). Attention shapes (`[seq, seq]` prefill, `[1, seq]` decode) are NOT yet supported. See `codegen/docs/op-milestones/softmax.md`. |
 | `torch.nn.functional.layer_norm` | Y | Y | Spyre | Custom decomposition |

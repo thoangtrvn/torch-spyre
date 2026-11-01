@@ -154,13 +154,25 @@ class TestIm2colHappyPath:
         # float16 input = DL16 on 1p0: elements_per_stick is 64, so the
         # same K=72 geometry pads differently (to 128, not 96) — the
         # envelope must be evaluated at the request's own stick width.
+        # Tolerance note: the rewrite adds the bias as a SEPARATE fp16
+        # pointwise add after the mm, while the fused CPU reference
+        # folds it before the final rounding — a 1-ulp fp16 difference
+        # is the expected bias-ordering effect, not a layout bug (the
+        # no-bias form is bit-exact; the DL16 device-accumulation
+        # ruling is a separate lane's deliverable).
         _require_codegen()
         x, weight = _im2col_inputs(dtype=torch.float16)
         bias = torch.randn(weight.shape[0], dtype=torch.float16)
         out = conv2d_decomp(
             x, weight, bias, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
         ref = F.conv2d(x, weight, bias)
-        torch.testing.assert_close(out, ref)
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        # The no-bias form is bit-exact (structural zero-pad proof at
+        # the DL16 stick width).
+        out_nb = conv2d_decomp(
+            x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
+        ref_nb = F.conv2d(x, weight, None)
+        torch.testing.assert_close(out_nb, ref_nb)
 
     def test_conv2d_overload_signature_matches(self):
         # aten.conv2d's 7-argument signature (no transposed /
@@ -188,11 +200,11 @@ class TestEnvelopeRefusesLoud:
     """
 
     def test_3x3_c64_refuses_named_ks(self):
-        # The red-first pin: 3x3 over C=64 is K=576 = ks=9 — every real
-        # 3x3 layer at C >= 64 lands here. Must refuse with the
-        # offending ks named, before any binary emission.
+        # The red-first pin: 3x3 over C=64 at DL16 is K=576 = ks=9 —
+        # every real 3x3 layer at C >= 64 lands here. Must refuse with
+        # the offending ks named, before any binary emission.
         _require_codegen()
-        x, weight = _im2col_inputs(c=64, o=64)
+        x, weight = _im2col_inputs(c=64, o=64, dtype=torch.float16)
         with pytest.raises(Exception, match="does not support") as excinfo:
             conv2d_decomp(
                 x, weight, None, [1, 1], [0, 0], [1, 1], False, [0, 0], 1)
@@ -347,6 +359,10 @@ class TestTraceReceipt:
         assert any("matmul" in op or "mm" in op for op in graph_ops), (
             graph_ops)
         assert any("add" in op for op in graph_ops), graph_ops
+        # The ragged-K zero-pad shows up as the structural-zero block
+        # (new_zeros + slice/copy — backend-neutral by design, see the
+        # decomposition's comment on why not constant_pad_nd).
+        assert any("new_zeros" in op for op in graph_ops), graph_ops
 
     def test_make_fx_refuses_un_gated_variant(self):
         # The refusal must fire INSIDE the trace too.

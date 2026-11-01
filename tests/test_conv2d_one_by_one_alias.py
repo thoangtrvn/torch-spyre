@@ -181,6 +181,12 @@ class TestGateRefusesLoud:
         assert "transposed" in msg
 
     def test_k3_kernel_refused(self):
+        # Post im2col-v0: a 3x3 kernel routes through the im2col core,
+        # and at C=64 (fp32, K=576 -> ks=18) it refuses on the conv
+        # ENVELOPE (ks >= 9 needs chunked-K, not landed) — still
+        # refuse-loud, now named at the envelope boundary instead of
+        # the 1x1 alias's kernel guard. In-envelope 3x3 shapes are
+        # covered in test_conv2d_im2col.py.
         x, _ = _aligned_inputs()
         weight = torch.randn(64, 64, 3, 3)
         with pytest.raises(Exception, match="does not support"):

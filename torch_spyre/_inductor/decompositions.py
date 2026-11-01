@@ -981,9 +981,10 @@ def _conv2d_one_by_one_core(
     out_channels, in_channels, kh, kw = weight.shape
     if kh != 1 or kw != 1:
         raise Unsupported(
-            f"conv2d 1x1 alias: kernel ({kh}, {kw}) — only 1x1 aliases to "
-            f"matmul (general convolution needs host im2col, not this "
-            f"decomposition)")
+            f"conv2d 1x1 alias: kernel ({kh}, {kw}) — only 1x1 aliases "
+            f"directly to matmul (general kernels route through "
+            f"_conv2d_im2col_core; reaching this arm with k>1 means a "
+            f"direct call bypassing the _conv2d_core router)")
     n, c_in, h, w = input.shape
     if c_in != in_channels:
         raise Unsupported(
@@ -1048,6 +1049,212 @@ def _conv2d_one_by_one_core(
     return out
 
 
+def _conv2d_im2col_core(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """Rewrite a gated general convolution to HOST im2col + matmul
+    (+ separate bias add).
+
+    The hardware has no convolution datapath, and the device-side
+    gather is vetoed twice over: L3 EAR strides are stick-units (128B),
+    so a 1-2 element sliding-window hop is inexpressible in the L3->LX
+    path, and the analyzer's dot-operand provenance guard refuses
+    gathered dot operands by design. The im2col (unfold) therefore runs
+    on HOST — a documented disposition, not a silent CPU fallback of a
+    device-capable op — and only the matmul rides the silicon-witnessed
+    native-matmul route:
+
+        cols = im2col(x, (kh, kw), padding=(ph, pw))   # (N, K, L)
+        cols = pad(cols, K -> K_pad)                    # whole-stick K
+        w2   = pad(weight.view(O, K), K -> K_pad)       # zero-pad bill
+        out  = w2 @ cols                                # (N, O, L)
+        out  = out.view(N, O, H_out, W_out)
+        out  = out + bias.view(1, O, 1, 1)              # SEPARATE add
+
+    The K zero-pad is structural zeros in BOTH the weight rows and the
+    im2col columns, so the matmul is numerically exact; the bill
+    (K_pad - K elements) is the im2col amplification term on record in
+    the conv pathway catalog.
+
+    ENVELOPE (fail-loud BEFORE any tensor is built — this seam owns
+    the refusal, it is never silently inherited from the matmul
+    route's downstream shape checks): ks >= 9 refuses (single-ImpSync
+    clean-K caps at ks=8; the chunked-K mechanism is not landed), and
+    ks*ns > 127 refuses (14-bit L3 LBR single-kernel fit bound — the
+    matmul route would NOT refuse this). The bounds live in
+    ``sentient_codegen.scheduler.conv_predicate`` (single source of
+    truth); this decomposition delegates to it and refuses loud if
+    that authority is unreachable (never silently skips the check).
+
+    Gate (v0): stride=1, dilation=1, groups=1, not transposed,
+    padding 0 or kernel//2 per dim (symmetric-valid), 4D NCHW,
+    dense-contiguous input/weight, a window that fits at least once.
+    Everything else raises ``Unsupported``.
+    """
+    if transposed:
+        raise Unsupported(
+            f"conv2d im2col: transposed convolution (transposed="
+            f"{transposed}) — only the stride-1/no-dilation/groups-1 "
+            f"form rewrites to host im2col + matmul")
+    if groups != 1:
+        raise Unsupported(
+            f"conv2d im2col: grouped convolution (groups={groups}) — "
+            f"only groups=1 rewrites to host im2col + matmul")
+    _stride = [int(s) for s in stride]
+    _padding = [int(p) for p in padding]
+    _dilation = [int(d) for d in dilation]
+    _output_padding = [int(p) for p in output_padding]
+    if _stride != [1, 1] or _dilation != [1, 1]:
+        raise Unsupported(
+            f"conv2d im2col: stride={_stride}, dilation={_dilation} — "
+            f"only stride=1/dilation=1 rewrites to host im2col + "
+            f"matmul (strided and dilated convolution are out of v0 "
+            f"scope by tier row)")
+    if any(p != 0 for p in _output_padding):
+        raise Unsupported(
+            f"conv2d im2col: output_padding={_output_padding} is only "
+            f"meaningful for transposed convolution, which is refused")
+    if input.dim() != 4 or weight.dim() != 4:
+        raise Unsupported(
+            f"conv2d im2col: only 4D NCHW convolution rewrites to host "
+            f"im2col + matmul, got input.dim()={input.dim()}, "
+            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+    out_channels, in_channels, kh, kw = weight.shape
+    n, c_in, h, w = input.shape
+    if c_in != in_channels:
+        raise Unsupported(
+            f"conv2d im2col: input channels {c_in} != weight input "
+            f"channels {in_channels}")
+    # Per-dim symmetric-valid padding: 0 or kernel//2 (the "same"
+    # extent for odd kernels; 3x3 -> p=1, 5x5 -> p=2). Anything else —
+    # including asymmetric or arbitrary padding — refuses loud.
+    if _padding != [0, 0] and (
+            _padding[0] not in (0, kh // 2)
+            or _padding[1] not in (0, kw // 2)):
+        raise Unsupported(
+            f"conv2d im2col: padding={_padding} — only padding=0 or "
+            f"padding=kernel//2 per dim (kernel=({kh}, {kw})) rewrites "
+            f"to host im2col + matmul; arbitrary or asymmetric padding "
+            f"is out of v0 scope by tier row")
+    h_out = h + 2 * _padding[0] - kh + 1
+    w_out = w + 2 * _padding[1] - kw + 1
+    if h_out < 1 or w_out < 1:
+        raise Unsupported(
+            f"conv2d im2col: kernel ({kh}, {kw}) over input extent "
+            f"({h}, {w}) with padding={_padding} leaves a degenerate "
+            f"window (output extent ({h_out}, {w_out})) — the window "
+            f"must fit at least once")
+    if not input.is_contiguous():
+        raise Unsupported(
+            f"conv2d im2col: input is not dense-contiguous NCHW "
+            f"(stride={tuple(input.stride())}, shape={tuple(input.shape)}) "
+            f"— non-contiguous layouts are refused, never silently copied")
+    if not weight.is_contiguous():
+        raise Unsupported(
+            f"conv2d im2col: weight is not dense-contiguous OIHW "
+            f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
+            f"— non-contiguous layouts are refused, never silently copied")
+
+    # The envelope boundary: fail-loud BEFORE any tensor is built.
+    # Delegated to the codegen-side predicate (single source of truth,
+    # same delegation shape as softmax's witnessed-shape set); an
+    # unreachable authority refuses loud, never silently skips.
+    try:
+        from sentient_codegen.scheduler.conv_predicate import (
+            assert_conv_im2col_envelope,
+        )
+    except ImportError as exc:
+        raise Unsupported(
+            f"conv2d im2col: the envelope admission predicate "
+            f"(sentient_codegen.scheduler.conv_predicate) is not "
+            f"importable — the envelope check is never silently "
+            f"skipped, so the route refuses (source env.sh so codegen "
+            f"is on the path)") from exc
+    try:
+        assert_conv_im2col_envelope(
+            in_channels=in_channels, kh=kh, kw=kw,
+            out_channels=out_channels,
+            dtype_bits=input.element_size() * 8)
+    except Exception as exc:
+        raise Unsupported(f"conv2d im2col envelope: {exc}") from exc
+
+    # The gated rewrite. im2col's column ordering (channel-major, then
+    # kernel row, then kernel column) matches weight.view(O, K)'s
+    # (O, C, kh, kw) -> (O, C*kh*kw) flattening exactly, so the mm IS
+    # the convolution. K is zero-padded to a whole stick in BOTH
+    # operands (structural zeros — numerically exact; the bill is
+    # K_pad - K elements per weight row and per im2col column); the 2D
+    # weight sits on the LEFT of the broadcast batched matmul (the same
+    # stride-0-batch bmm class as the 1x1 alias and the witnessed
+    # linear path). .view() (not .reshape()) so any layout surprise
+    # raises instead of silently copying; the contiguity gates above
+    # are what make the views legal.
+    elems_per_stick = 128 // input.element_size()
+    k = in_channels * kh * kw
+    k_padded = ((k + elems_per_stick - 1) // elems_per_stick) \
+        * elems_per_stick
+    cols = torch.nn.functional.unfold(
+        input, (kh, kw), padding=(_padding[0], _padding[1]))
+    if k_padded != k:
+        # Zero-pad K by appending structural-zero columns to BOTH
+        # operands. Built with new_zeros + slice-copy rather than
+        # aten.constant_pad_nd deliberately: the Spyre pad
+        # decomposition routes through spyre::overwrite_f (a device op
+        # with no CPU kernel), which would make every offline trace of
+        # this decomposition on CPU tensors crash; the slice-copy form
+        # is backend-neutral, lowers to the same materialization under
+        # Inductor, and keeps the offline make_fx receipt honest
+        # against the unmodified production decomposition table.
+        n_patches = cols.shape[2]
+        cols_padded = cols.new_zeros((n, k_padded, n_patches))
+        cols_padded[:, :k] = cols
+        w2 = weight.view(out_channels, k)
+        w2_padded = w2.new_zeros((out_channels, k_padded))
+        w2_padded[:, :k] = w2
+        cols, w2 = cols_padded, w2_padded
+    else:
+        w2 = weight.view(out_channels, k)
+    out = w2 @ cols
+    out = out.view(n, out_channels, h_out, w_out)
+    if bias is not None:
+        # Separate pointwise add (default D-disposition) — never fold
+        # into a matmul_bias composite here.
+        out = out + bias.view(1, out_channels, 1, 1)
+    return out
+
+
+def _conv2d_core(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    stride: Sequence[int],
+    padding: Sequence[int],
+    dilation: Sequence[int],
+    transposed: bool,
+    output_padding: Sequence[int],
+    groups: int,
+) -> torch.Tensor:
+    """Route a convolution by kernel extent: the 1x1 form keeps its
+    cheaper direct-matmul alias (no unfold), every other kernel
+    rewrites to host im2col + matmul. Both cores refuse loud on
+    everything outside their gates."""
+    if weight.dim() == 4 and weight.shape[2] == 1 and weight.shape[3] == 1:
+        return _conv2d_one_by_one_core(
+            input, weight, bias, stride, padding, dilation, transposed,
+            output_padding, groups)
+    return _conv2d_im2col_core(
+        input, weight, bias, stride, padding, dilation, transposed,
+        output_padding, groups)
+
+
 @register_spyre_decomposition([torch.ops.aten.convolution.default])
 def conv2d_decomp(
     input: torch.Tensor,
@@ -1062,9 +1269,9 @@ def conv2d_decomp(
 ) -> torch.Tensor:
     """``aten.convolution``-signature wrapper (the compile-path funnel
     for conv1d/conv2d/conv3d): all nine arguments positional. See
-    ``_conv2d_one_by_one_core`` for the gated 1x1 -> matmul alias and
-    its refuse-loud layout contract."""
-    return _conv2d_one_by_one_core(
+    ``_conv2d_core`` for the kernel-extent routing, the gated 1x1 ->
+    matmul alias, and the general-conv host im2col rewrite."""
+    return _conv2d_core(
         input, weight, bias, stride, padding, dilation, transposed,
         output_padding, groups)
 
@@ -1083,7 +1290,7 @@ def conv2d_alias_decomp(
     — a different positional order than ``aten.convolution``, hence a
     separate entry point): eager dispatch and pre-decomposition traces
     can present this overload directly. Same gated core."""
-    return _conv2d_one_by_one_core(
+    return _conv2d_core(
         input, weight, bias, stride, padding, dilation, False, (0, 0),
         groups)
 
