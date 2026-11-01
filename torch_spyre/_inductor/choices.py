@@ -167,8 +167,12 @@ class SpyreHeuristics(InductorChoices):
         determine the signature downstream (so they cannot drift from it).
 
         Kernel types and the block keys their signature declares:
-        - Matmul (tl.dot): YBLOCK/R0_BLOCK/XBLOCK. Never persistent → all three always
-          declared.
+        - Matmul (tl.dot): YBLOCK/XBLOCK always; R0_BLOCK only when NOT persistent
+          (K fits one block → baked in-body); ZBLOCK only when the kernel is 3-range
+          (batched bmm: the tiling dict carries a "z" range tree). A 3-range kernel
+          declares one `<PREFIX>BLOCK` constexpr per range-tree root, so the z tree
+          means ZBLOCK is a required key — omitting it left the constexpr unbound and
+          crashed ast_to_ttir on `tl.program_id(0) * ZBLOCK`.
         - Reduction: XBLOCK always; R0_BLOCK ONLY when NOT persistent. A persistent
           reduction (reduction extent fits one block) bakes R0_BLOCK as an in-body
           `tl.constexpr` and does NOT declare it as a parameter — so R0_BLOCK is gated on
@@ -245,6 +249,33 @@ class SpyreHeuristics(InductorChoices):
             block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
             if not persistent:
                 block_config["R0_BLOCK"] = tile_k
+            # 3-range (batched bmm) matmul: the tiling dict carries a "z" range
+            # tree, and every range-tree root declares a `<PREFIX>BLOCK`
+            # constexpr parameter — so ZBLOCK is REQUIRED here, not optional.
+            # Omitting it left the ZBLOCK constexpr unbound in Triton's
+            # ast_to_ttir (ZBLOCK resolved to None; `tl.program_id(0) *
+            # ZBLOCK` crashed with AttributeError "'NoneType' object has no
+            # attribute 'type'", surfacing from Inductor as a ZBLOCK
+            # KeyError). The value 1 is Inductor's own bmm policy —
+            # torch/_inductor/codegen/triton.py keeps the batch dimension
+            # unblocked ("we force ZBLOCK to be always 1 during autotune";
+            # the 2d-dot reshape path also rewrites ZBLOCK out of the block
+            # shape) — so this key is a signature-shape obligation, not a
+            # tiling decision.
+            if "z" in tiling:
+                # PREDICTION-DRIFT NOTE (the #193 class): this gate is keyed on
+                # the TILING DICT carrying "z", not on an Inductor decision
+                # function (the R0_BLOCK gate below uses should_use_persistent_
+                # reduction, which cannot drift from the codegen). If a 3-range
+                # matmul ever surfaces whose tiling dict LACKS "z" (an Inductor
+                # schedule change re-rooting the batch range, or a new prefixed
+                # range family), the ZBLOCK key silently goes missing again and
+                # the compile dies at ast_to_ttir with the ZBLOCK-unbound
+                # AttributeError. Check on any such failure: print the tiling
+                # dict keys here and compare against the range-tree prefixes in
+                # torch/_inductor/codegen/triton.py's iteration_ranges (the
+                # same comparison the fixed_config key-set must match).
+                block_config["ZBLOCK"] = 1
             kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
 
         elif is_reduction:
