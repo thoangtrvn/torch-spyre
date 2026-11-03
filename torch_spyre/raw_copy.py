@@ -48,6 +48,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
+# torch_spyre registers "spyre" as a device alias, so tensors allocated on
+# the device report device.type "spyre"; the underlying torch backend key is
+# "privateuse1" and some torch versions surface that spelling instead. Both
+# direction guards must accept either — box-witnessed 2026-11-03 that a
+# single-literal "privateuse1" comparison rejects every real spyre tensor
+# (D2H always refuses) and lets spyre input slip into the H2D wrapper.
+_SPYRE_DEVICE_TYPES = frozenset({"spyre", "privateuse1"})
+
 
 def _raw_copy_entry():
     """Resolve ``torch_spyre._C.raw_copy_tensor`` or refuse loud."""
@@ -105,7 +113,7 @@ def raw_copy_to_device(
         raise TypeError(
             f"raw_copy_to_device expects a torch.Tensor, got {type(tensor)!r}"
         )
-    if tensor.device.type == "privateuse1":
+    if tensor.device.type in _SPYRE_DEVICE_TYPES:
         raise TypeError(
             "raw_copy_to_device expects a CPU tensor (input is already on "
             "the spyre device); use raw_copy_from_device for D2H"
@@ -139,7 +147,7 @@ def raw_copy_from_device(
         raise TypeError(
             f"raw_copy_from_device expects a torch.Tensor, got {type(tensor)!r}"
         )
-    if tensor.device.type != "privateuse1":
+    if tensor.device.type not in _SPYRE_DEVICE_TYPES:
         raise TypeError(
             "raw_copy_from_device expects a spyre tensor (input is on CPU); "
             "use raw_copy_to_device for H2D"

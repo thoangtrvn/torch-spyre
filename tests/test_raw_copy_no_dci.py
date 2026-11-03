@@ -171,3 +171,60 @@ def test_raw_copy_rejects_non_tensor_and_wrong_direction():
     # runtime/extension resolution.
     with pytest.raises(TypeError, match="expects a spyre tensor"):
         torch_spyre.raw_copy_from_device(torch.zeros(4, dtype=torch.int16))
+
+
+def _raw_copy_source():
+    from pathlib import Path
+
+    import torch_spyre.raw_copy as rc
+
+    return Path(rc.__file__).read_text()
+
+
+def test_raw_copy_device_guards_accept_registered_spyre_type():
+    """Box-witnessed 2026-11-03: real spyre tensors report device.type
+    "spyre" (torch_spyre registers the alias), NOT "privateuse1" — a guard
+    comparing against "privateuse1" alone rejects every real spyre tensor
+    (D2H always refuses) or lets one slip into the H2D wrapper. Both guards
+    must accept either spelling via the shared device-type set."""
+    src = _raw_copy_source()
+    assert '_SPYRE_DEVICE_TYPES' in src, (
+        "raw_copy must route both direction guards through the shared "
+        "_SPYRE_DEVICE_TYPES set"
+    )
+    assert '"spyre"' in src and '"privateuse1"' in src, (
+        "the set must cover both the registered alias and the underlying "
+        "backend key"
+    )
+    # Neither guard may compare device.type against a single literal anymore.
+    for bad in (
+        'tensor.device.type == "privateuse1"',
+        'tensor.device.type != "privateuse1"',
+    ):
+        assert bad not in src, (
+            f"stale single-literal device guard remains: {bad!r}"
+        )
+
+
+def test_raw_copy_to_device_still_refuses_spyre_input():
+    """Direction guard must catch a spyre tensor (type "spyre") handed to
+    the H2D wrapper — before _raw_copy_entry resolves the runtime."""
+    import torch
+    import torch_spyre
+    from torch_spyre.raw_copy import _SPYRE_DEVICE_TYPES
+
+    assert "spyre" in _SPYRE_DEVICE_TYPES
+
+    class _FakeSpyreTensor(torch.Tensor):
+        pass
+
+    # Static source-contract check (macOS cannot construct a real spyre
+    # tensor): the refuse-guard must test membership, not equality with a
+    # single literal.
+    src = _raw_copy_source()
+    assert "tensor.device.type in _SPYRE_DEVICE_TYPES" in src, (
+        "H2D refuse-guard must be a membership test over the device-type set"
+    )
+    assert "tensor.device.type not in _SPYRE_DEVICE_TYPES" in src, (
+        "D2H accept-guard must be a membership test over the device-type set"
+    )
