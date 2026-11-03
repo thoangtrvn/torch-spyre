@@ -49,6 +49,16 @@ class SpyreStream {
   void synchronize(std::chrono::milliseconds timeout) const;
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
+  // Bit-preserving host<->device copy with NO DataConversionInfo attached
+  // (dci=nullptr). The DMA transfers the full device allocation as raw bytes,
+  // bypassing deeptools' ConvertData entirely. Sanctioned escape hatch for
+  // dtypes with no same-format ConvertData arm on the device (e.g. SENINT16,
+  // DtException sen_data_convert.cpp:2505); never value-converting. Enforced
+  // preconditions: exactly one side CPU and the other spyre, matching scalar
+  // types, contiguous host tensor, and host storage large enough to hold the
+  // whole device allocation (the transfer is allocation-sized, not
+  // numel-sized).
+  void copyRawAsync(const at::Tensor& src, const at::Tensor& dst) const;
   // Copies exactly ``program_bytes`` from ``prog_cpu_ptr`` into the device
   // allocation. The byte count is explicit so the DMA never reads past the end
   // of the host program buffer when the allocation is rounded up beyond the

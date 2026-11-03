@@ -517,6 +517,14 @@ PYBIND11_MODULE(_C, m) {
         "Copy tensor between host and device using DMA", py::arg("self"),
         py::arg("dst"), py::arg("non_blocking") = false);
 
+  // Bit-preserving copy with NO DataConversionInfo: bypasses deeptools'
+  // ConvertData (which has no same-format arm for e.g. SENINT16 and throws
+  // DtException sen_data_convert.cpp:2505 on-box). Escape hatch for raw-word
+  // (DL16 bit-exact) harnesses; never converts.
+  m.def("raw_copy_tensor", &spyre::spyre_raw_copy,
+        "Bit-preserving host<->device copy bypassing ConvertData (dci=nullptr)",
+        py::arg("self"), py::arg("dst"), py::arg("non_blocking") = false);
+
   // Device-side fill using FillDMA (no host buffer or H2D copy)
   m.def("fill_tensor", &spyre::spyre_fill_tensor,
         "Fill a spyre tensor with a scalar value using device-side FillDMA",

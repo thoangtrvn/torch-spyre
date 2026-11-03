@@ -42,6 +42,7 @@ __all__: list[str] = [
     "get_elem_in_stick",
     "get_spyre_tensor_layout",
     "launch_kernel_from_bytes",
+    "raw_copy_tensor",
     "set_device",
     "set_spyre_tensor_layout",
     "spyre_empty_with_layout",
@@ -248,6 +249,12 @@ def launch_kernel_from_bytes(*args, **kwargs) -> None:
 
 def fill_tensor(*args, **kwargs):
     require_runtime("torch_spyre._C.fill_tensor")
+
+
+def raw_copy_tensor(*args, **kwargs):
+    # Bit-preserving dci=nullptr copy (spyre::spyre_raw_copy). Runtime-only:
+    # never re-exported from _codegen_backend, which has no DMA surface.
+    require_runtime("torch_spyre._C.raw_copy_tensor")
 
 
 def to_with_layout(*args, **kwargs):

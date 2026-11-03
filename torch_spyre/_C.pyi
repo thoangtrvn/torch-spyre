@@ -19,6 +19,7 @@ __all__: list[str] = [
     "as_strided_with_layout",
     "empty_with_layout",
     "copy_tensor",
+    "raw_copy_tensor",
     "fill_tensor",
     "encode_constant",
     "free_runtime",
@@ -247,6 +248,26 @@ def copy_tensor(
 
     Args:
         self or dst: one of that must be on spyre device
+    """
+    ...
+
+def raw_copy_tensor(
+    self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
+) -> None:
+    """
+    Bit-preserving host<->device copy with no DataConversionInfo (dci=nullptr),
+    bypassing deeptools' ConvertData entirely. Sanctioned escape hatch for
+    dtypes with no same-format ConvertData arm (e.g. torch.int16 ->
+    (SENINT16, SENINT16), DtException sen_data_convert.cpp:2505 on-box).
+
+    Contract: exactly one of self/dst on CPU and the other on spyre; identical
+    scalar types (never converts); contiguous host tensor whose storage holds
+    the full stick-padded device allocation (the transfer is allocation-sized).
+
+    Args:
+        self: one of the tensors (host or spyre)
+        dst: the other tensor (spyre or host)
+        non_blocking: if False, synchronize the stream before returning
     """
     ...
 

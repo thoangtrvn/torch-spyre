@@ -25,6 +25,7 @@ from ._runtime import (
 )
 
 from . import profiler
+from .raw_copy import raw_copy_from_device, raw_copy_to_device
 
 _runtime_init_lock = threading.Lock()
 

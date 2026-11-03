@@ -33,6 +33,33 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
                            bool non_blocking);
 
 /**
+ * Bit-preserving host<->device copy that bypasses the DCI/ConvertData path.
+ *
+ * Issues the DMA with dci=nullptr (the same raw-word mechanism
+ * copyProgramAsync uses for init packets), so deeptools' ConvertData is never
+ * involved. This is the sanctioned escape hatch for dtypes with no
+ * same-format ConvertData arm on the device (e.g. torch.int16 ->
+ * (SENINT16, SENINT16), which throws DtException at
+ * sen_data_convert.cpp:2505 on-box in both H2D and D2H).
+ *
+ * Contract (enforced in SpyreStream::copyRawAsync):
+ *   - exactly one of self/dst on CPU, the other on spyre;
+ *   - identical scalar types (bit-preserving, never value-converting);
+ *   - contiguous host tensor whose storage holds the full (stick-padded)
+ *     device allocation.
+ *
+ * Unlike spyre_copy_from there is no D2H staging/view path: the copy is a raw
+ * byte mirror of the physical allocation.
+ *
+ * @param self One of the tensors (host or spyre)
+ * @param dst The other tensor (spyre or host)
+ * @param non_blocking If false, synchronize the stream before returning
+ * @return dst
+ */
+at::Tensor spyre_raw_copy(const at::Tensor& self, const at::Tensor& dst,
+                          bool non_blocking);
+
+/**
  * Fill a spyre tensor with a scalar value using device-side FillDMA.
  *
  * Uses flex::RuntimeStream::fillAsync() to perform the fill entirely

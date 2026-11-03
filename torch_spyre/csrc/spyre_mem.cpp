@@ -618,6 +618,18 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   return dst;
 }
 
+at::Tensor spyre_raw_copy(const at::Tensor& self, const at::Tensor& dst,
+                          bool non_blocking) {
+  SpyreStream stream = dst.is_privateuseone()
+                           ? getCurrentStream(dst.device())
+                           : getCurrentStream(self.device());
+  stream.copyRawAsync(self, dst);
+  if (!non_blocking) {
+    stream.synchronize();
+  }
+  return dst;
+}
+
 at::Tensor empty_with_layout(
     c10::IntArrayRef size, SpyreTensorLayout device_layout,
     std::optional<c10::ScalarType> dtype_opt,

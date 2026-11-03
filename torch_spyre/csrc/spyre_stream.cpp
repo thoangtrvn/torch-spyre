@@ -231,6 +231,60 @@ void SpyreStream::copyAsync(const at::Tensor& src,
   }
 }
 
+void SpyreStream::copyRawAsync(const at::Tensor& src,
+                               const at::Tensor& dst) const {
+  DEBUGINFO("raw copy src (", src.scalar_type(), ") is on:", src.device());
+  DEBUGINFO("raw copy dst (", dst.scalar_type(), ") on:", dst.device());
+
+  const bool host2device = src.is_cpu() && dst.is_privateuseone();
+  const bool device2host = src.is_privateuseone() && dst.is_cpu();
+  TORCH_CHECK(host2device || device2host,
+              "raw_device_copy requires exactly one CPU tensor and one spyre "
+              "tensor (got src on ",
+              src.device(), ", dst on ", dst.device(), ")");
+
+  const at::Tensor* dev_tensor = host2device ? &dst : &src;
+  const at::Tensor* cpu_tensor = host2device ? &src : &dst;
+
+  // Bit-preserving only: the raw DMA never converts, so the scalar types must
+  // already match. A mismatch here is a caller bug, not something to route
+  // through ConvertData (whose same-format gaps are the reason this API
+  // exists).
+  TORCH_CHECK(src.scalar_type() == dst.scalar_type(),
+              "raw_device_copy is bit-preserving and does not convert: "
+              "scalar types must match (got src ",
+              src.scalar_type(), ", dst ", dst.scalar_type(),
+              "). Use the normal copy path for conversion.");
+
+  // Raw bytes only: no stride gymnastics, no view reassembly. The host tensor
+  // must be a dense contiguous mirror of the device allocation.
+  TORCH_CHECK(cpu_tensor->is_contiguous(),
+              "raw_device_copy requires a contiguous host tensor (raw byte "
+              "mirror of the device allocation; views/strided tensors are not "
+              "supported)");
+
+  void* cpu_ptr = const_cast<void*>(cpu_tensor->storage().data());
+  auto* spyre_impl =
+      static_cast<SpyreTensorImpl*>(dev_tensor->unsafeGetTensorImpl());
+  auto& storage = spyre_impl->storage();
+  auto* ctx = static_cast<SharedOwnerCtx*>(storage.data_ptr().get_context());
+
+  // The transfer is the full device allocation (allocation-sized, not
+  // numel-sized): the device layout is stick-padded, so the raw word mirror
+  // is the whole allocation. The host storage must be at least that large or
+  // the DMA would read/write past the end of the host buffer.
+  const uint64_t transfer_bytes = ctx->composite_addr.total_size();
+  TORCH_CHECK(static_cast<uint64_t>(cpu_tensor->storage().nbytes()) >=
+                  transfer_bytes,
+              "raw_device_copy transfers the full device allocation (",
+              transfer_bytes, " bytes) but the host tensor storage is only ",
+              cpu_tensor->storage().nbytes(),
+              " bytes; the host tensor must be sized to the device "
+              "allocation (stick-padded), not to numel");
+
+  copyAsyncImpl(cpu_ptr, &ctx->composite_addr, /*dci=*/nullptr, host2device);
+}
+
 flex::RuntimeStream* SpyreStream::getRuntimeHandle() const {
   if (flex_handle_ != nullptr) {
     return flex_handle_;
