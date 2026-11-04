@@ -1016,6 +1016,15 @@ def _conv2d_one_by_one_core(
             f"conv2d 1x1 alias: weight dtype {weight.dtype} != input "
             f"dtype {input.dtype} — mixed dtypes are refused, never "
             f"silently promoted")
+    # Dtype IDENTITY, not just uniformity: torch_spyre maps bfloat16 to
+    # DataFormats.BFLOAT16 (torch_spyre/_C.py:113) — the 1p5 format. On a
+    # 1p0 target a bf16 tensor's bits are consumed as DL16 (silent-wrong),
+    # and nothing downstream refuses the mapping, so this layer must.
+    # Same seam precedent as torch_spyre/ops/softmax.py's dtype refusal.
+    if input.dtype is torch.bfloat16:
+        raise Unsupported(
+            f"conv2d 1x1 alias: dtype {input.dtype} unsupported (1p0 is "
+            f"DL16, i.e. torch.float16; bfloat16 is 1p5)")
     if bias is not None:
         if bias.dim() != 1:
             raise Unsupported(
