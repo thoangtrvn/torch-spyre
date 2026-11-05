@@ -31,6 +31,38 @@ from torch.testing._internal.common_utils import (
     TestCase,
 )
 
+def _assert_dl16_readback(cpu_expected, device_tensor, symbol_id):
+    """Asymmetric-oracle device readback check for 16-bit float tensors.
+
+    Pulls the device words bit-preservingly (raw_copy_from_device — no
+    ConvertData on the return path) and compares them against the host-side
+    expected values through dtype_convert.compare_dl16_readback: EXACT for
+    grid values, the 2^-9 pivot band only for off-grid intermediates, typed
+    refusal on length mismatch. Asserts zero mismatches (range/zero-sign/
+    bit-move classes all count as mismatches; flush counts are reported in
+    the result, not asserted).
+
+    NOT for fp32 tensors: fp32 crosses the H2D seam as a pure bit-move
+    (2 words/element, fp32 semantics on device) — use bit-exact
+    torch.equal there instead.
+    """
+    from torch_spyre.raw_copy import raw_copy_from_device
+    from torch_spyre._inductor.dtype_convert import compare_dl16_readback
+
+    raw = raw_copy_from_device(device_tensor)
+    numel = device_tensor.numel()
+    words = [w & 0xFFFF for w in raw.view(torch.int16).flatten()[:numel].tolist()]
+    result = compare_dl16_readback(
+        cpu_expected.to(torch.float32).flatten().tolist(), words, symbol_id
+    )
+    assert not result.mismatches, (
+        f"{symbol_id}: DL16 readback mismatches "
+        f"({len(result.mismatches)} of {result.element_count}): "
+        f"{result.mismatches[:8]}"
+    )
+    return result
+
+
 # 0-dim scalar roundtrip: shared dtype × factory lambdas (used by parametrized fill test).
 _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.int8, lambda fn: fn((), dtype=torch.float32).to(dtype=torch.int8)),
@@ -562,8 +594,12 @@ class TestSpyre(TestCase):
 
         dst.copy_(src)
 
-        # Verify the copy worked
-        assert torch.allclose(src.cpu(), dst.cpu())
+        # Verify the copy worked: asymmetric DL16 oracle on the device words
+        # (EXACT for grid values, 2^-9 pivot band for off-grid, length
+        # mismatch refuses). torch.allclose default tolerances are both too
+        # strict for legitimate off-grid values and blind to grid-exactness
+        # (box-run item 4 receipt, claim bf16pivot-sixitem-20261105-002).
+        _assert_dl16_readback(src.cpu(), dst, "d2d-copy-fp16")
         assert src.data_ptr() != dst.data_ptr()
 
     def test_device_to_device_with_view(self):
@@ -572,8 +608,12 @@ class TestSpyre(TestCase):
         b = torch.zeros((512, 512), device="spyre")
         c = b.view((64, 8, 512))
         b.copy_(a)
-        assert torch.allclose(a.cpu(), b.cpu())
-        assert torch.allclose(a.cpu().view(64, 8, 512), c.cpu())
+        # fp32 crosses the H2D seam as a pure bit-move (box-run item 3
+        # receipt: device words are the fp32 bits verbatim), so a device
+        # copy must round-trip BIT-EXACTLY — allclose tolerance is pure
+        # slack on this path.
+        assert torch.equal(a.cpu(), b.cpu())
+        assert torch.equal(a.cpu().view(64, 8, 512), c.cpu())
 
     def test_d2h_copy_of_expanded_view(self):
         """D2H copy of a tensor with stride-0 (broadcast) dims must produce
