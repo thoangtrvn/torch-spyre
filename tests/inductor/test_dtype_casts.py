@@ -755,6 +755,72 @@ class TestH2DSeamGuard(unittest.TestCase):
             _C.dl16_h2d_seam_check(t, self._sen169_layout(2))
         )
 
+    # ------------------------------------------------------------------
+    # Hook-exercise tests (gauntlet r1 finding 1): the guard's PRODUCTION
+    # call site is SpyreStream::copyAsync (spyre_stream.cpp) — these drive
+    # the real H2D copy path through _C.dl16_h2d_seam_copy_probe, which
+    # fabricates a SEN169_FP16 destination and calls copyAsync exactly as
+    # spyre_copy_from does. The refusal must fire from the real hook
+    # (before generate_dci / any flex call), and a clean element must
+    # PASS the hook (stopping only at the runtime-free environment's
+    # stream-pool lookup) — not just at the oracle classifier.
+    # ------------------------------------------------------------------
+
+    def test_copy_hook_over_seam_element_refuses_from_real_path(self):
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([1.0, 2.0**33], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "converter-in seam"):
+            _C.dl16_h2d_seam_copy_probe(t)
+
+    def test_copy_hook_nonfinite_element_refuses_from_real_path(self):
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([1.0, float("inf")], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            _C.dl16_h2d_seam_copy_probe(t)
+
+    def test_copy_hook_at_ceiling_element_passes_the_hook(self):
+        # The largest bf16 grid point at or below the seam ceiling
+        # (truncation of decode(0x7DFF) onto the bf16 grid — derived, and
+        # strictly below the ceiling because decode(0x7DFF) needs 9
+        # mantissa bits): it must be ADMITTED by the real copyAsync hook.
+        # The copy then proceeds past the guard into DMA setup and stops
+        # at the stream-pool lookup — the runtime-free environment's own
+        # refusal, NOT the seam guard. That error shape is the witness
+        # that the hook (not just the oracle) let the value through.
+        import torch
+
+        _C = self._c()
+        seam = dl16_decode(0x7DFF)
+        at_ceiling_bf16 = _f32_from_bits((_bits_f32(seam) >> 16) << 16)
+        self.assertLessEqual(at_ceiling_bf16, seam)
+        self.assertGreater(at_ceiling_bf16, 0.0)
+        t = torch.tensor([1.0, at_ceiling_bf16], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "flex handle") as raised:
+            _C.dl16_h2d_seam_copy_probe(t)
+        self.assertNotIn(
+            "seam",
+            str(raised.exception),
+            "the at-ceiling element must pass the T-DC-17 guard; the "
+            "RuntimeError must come from the stream-pool lookup, not the "
+            "guard",
+        )
+
+    def test_copy_hook_witnessed_saturator_refuses_from_real_path(self):
+        # The box-run's in-range-but-seam-saturated grid value (module
+        # word 0x7FF8, derived through the decoder) refuses at the real
+        # hook too — the exact class the silicon witness saturated.
+        import torch
+
+        _C = self._c()
+        in_range_grid_max = dl16_decode(0x7FF8)
+        t = torch.tensor([in_range_grid_max], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "converter-in seam"):
+            _C.dl16_h2d_seam_copy_probe(t)
+
 
 if __name__ == "__main__":
     unittest.main()

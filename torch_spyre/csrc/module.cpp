@@ -126,6 +126,68 @@ uint32_t encodeConstant(float torch_const, DataFormats df) {
   return sen_const;
 }
 
+/*
+ * Test-only probe for the T-DC-17 H2D seam guard (gauntlet r1 finding 1):
+ * drives the REAL SpyreStream::copyAsync host-to-device path — the guard's
+ * production call site — in a runtime-free environment.
+ *
+ * It fabricates a bf16-typed Spyre destination tensor (SpyreTensorImpl +
+ * SEN169_FP16 layout + a dummy storage, no device allocation) and a
+ * fabricated PrivateUse1 stream, then calls copyAsync exactly as
+ * spyre_copy_from does. Outcomes, both witnessed through the real hook:
+ *
+ *   - an over-seam / non-finite element refuses at the guard, BEFORE
+ *     generate_dci or any flex call (the stubbed symbols are never
+ *     reached);
+ *   - a clean element passes the guard and proceeds into DMA setup until
+ *     the stream-pool lookup refuses ("no flex handle ... stream pool"),
+ *     which proves the hook admitted it — the environment, not the
+ *     guard, is what stops the copy at device_count()==0.
+ *
+ * Refused on a live runtime (flex::getNumDevices() != 0): the fabricated
+ * destination has no real device allocation, so the probe must never
+ * reach a live DMA there.
+ */
+void dl16H2DSeamCopyProbe(const at::Tensor& cpu_tensor) {
+  TORCH_CHECK(
+      flex::getNumDevices() == 0,
+      "dl16_h2d_seam_copy_probe is a runtime-free test hook for the "
+      "T-DC-17 seam guard; it fabricates a destination with no device "
+      "allocation and must not run against a live runtime");
+  TORCH_CHECK(cpu_tensor.is_cpu() && cpu_tensor.dim() > 0 &&
+                  cpu_tensor.scalar_type() == c10::kBFloat16,
+              "dl16_h2d_seam_copy_probe expects a non-empty CPU bf16 "
+              "tensor (got ",
+              cpu_tensor.device(), " ", cpu_tensor.scalar_type(), ")");
+
+  const auto sizes = cpu_tensor.sizes();
+  SpyreTensorLayout layout(sizes.vec(), c10::kBFloat16);
+  const size_t nbytes =
+      static_cast<size_t>(cpu_tensor.numel()) * c10::elementSize(c10::kBFloat16);
+  // Dummy storage: data/context are never dereferenced on the probe's two
+  // outcomes (the guard refuses first, or the stream-pool lookup does).
+  c10::DataPtr data_ptr(
+      /*data=*/nullptr, /*ctx=*/nullptr,
+      /*deleter=*/+[](void*) {},
+      c10::Device(c10::DeviceType::PrivateUse1, 0));
+  auto storage_impl = c10::make_intrusive<c10::StorageImpl>(
+      c10::StorageImpl::use_byte_size_t(), nbytes, std::move(data_ptr),
+      /*allocator=*/nullptr, /*resizable=*/false);
+
+  constexpr c10::DispatchKeySet pu1_dks(c10::DispatchKey::PrivateUse1);
+  auto tensor = at::Tensor(at::detail::make_tensor_base<SpyreTensorImpl>(
+      c10::Storage(std::move(storage_impl)), pu1_dks,
+      c10::scalarTypeToTypeMeta(c10::kBFloat16), std::move(layout)));
+  auto* impl = static_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl());
+  impl->set_sizes_contiguous(sizes);
+  impl->dma_sizes = sizes.vec();
+  impl->dma_strides = tensor.strides().vec();
+
+  SpyreStream stream(c10::Stream(c10::Stream::DEFAULT,
+                                 c10::Device(c10::DeviceType::PrivateUse1, 0)));
+  stream.copyAsync(cpu_tensor, tensor);
+}
+
 int64_t get_elem_in_stick(c10::ScalarType torch_dtype) {
   auto str_type = torchScalarToString[torch_dtype];
   const auto [sen_dtype_cpu, sen_dtype_dev] =
@@ -431,6 +493,18 @@ PYBIND11_MODULE(_C, m) {
       "(RuntimeError) any element the DL16 converter-in would silently "
       "saturate or corrupt. No-op for non-SEN169_FP16 destinations and "
       "non-16-bit-float sources.");
+  m.def(
+      "dl16_h2d_seam_copy_probe",
+      [](const at::Tensor& cpu_tensor) {
+        spyre::dl16H2DSeamCopyProbe(cpu_tensor);
+      },
+      py::arg("cpu_tensor"),
+      "Test-only (compile-only builds): drive the REAL "
+      "SpyreStream::copyAsync H2D path with a fabricated SEN169_FP16 "
+      "destination. Over-seam/non-finite elements refuse at the T-DC-17 "
+      "guard; clean elements pass the guard and stop at the stream-pool "
+      "lookup (no flex handle) — witness that the hook admitted them. "
+      "Refused on a live runtime.");
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
