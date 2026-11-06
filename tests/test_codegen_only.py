@@ -224,3 +224,47 @@ def test_codegen_only_torch_empty_spyre_allocates_fake_tensor():
         """
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_C_first_import_before_torch():
+    """Importing torch_spyre._C before torch must not trigger a circular import.
+
+    Regression test for the module-scope `import torch` in _C.py (codegen-only
+    branch) which, when _C is imported first in a fresh interpreter, triggered
+    torch's backend autoload -> _autoload_codegen_only -> _autoload ->
+    torch_spyre._inductor._autoload -> choices.py:24 `from torch_spyre._C import
+    get_elem_in_stick` while _C was still frozen at its own `import torch`.
+    """
+    result = _run_codegen_only_script(
+        """
+        import torch_spyre._C as _C
+        import torch
+
+        # Verify the public surface is accessible and functional
+        assert hasattr(_C, "get_elem_in_stick")
+        assert hasattr(_C, "get_device_dtype")
+        assert hasattr(_C, "DataFormats")
+        assert hasattr(_C, "SpyreTensorLayout")
+        assert hasattr(_C, "encode_constant")
+        assert hasattr(_C, "copy_tensor")
+        assert hasattr(_C, "empty_with_layout")
+        assert hasattr(_C, "current_device")
+        assert hasattr(_C, "device_count")
+        assert hasattr(_C, "set_device")
+
+        # Verify core functionality works
+        assert _C.get_elem_in_stick(torch.float16) == 64
+        assert _C.get_elem_in_stick(torch.float32) == 32
+        assert _C.get_elem_in_stick(torch.bfloat16) == 64
+        # IntEnum comparison with int is False in Python 3.11+; compare enum members directly
+        assert _C.get_device_dtype(torch.float16) == _C.DataFormats.SEN169_FP16
+        assert _C.get_device_dtype(torch.float32) == _C.DataFormats.IEEE_FP32
+        assert _C.get_device_dtype(torch.bfloat16) == _C.DataFormats.BFLOAT16
+
+        layout = _C.SpyreTensorLayout([512, 128], torch.float16)
+        assert layout.device_size == [512, 2, 64]
+        assert layout.stride_map == [128, 64, 1]
+        assert layout.elems_per_stick() == 64
+        """
+    )
+    assert result.returncode == 0, result.stderr
