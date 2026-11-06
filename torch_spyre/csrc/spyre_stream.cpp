@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "flex/flex.hpp"
+#include "dl16_seam_guard.h"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
@@ -213,6 +214,13 @@ void SpyreStream::copyAsync(const at::Tensor& src,
 
     // Get SpyreTensorLayout using the public API
     SpyreTensorLayout stl = get_spyre_tensor_layout(*dev_tensor);
+
+    if (host2device) {
+      // T-DC-17: the DMA converter-in silently saturates 16-bit float
+      // inputs above the DL16 seam ceiling (0x7DFF) — refuse loudly on
+      // the host before issuing the transfer.
+      check_dl16_h2d_seam(*cpu_tensor, stl);
+    }
 
     // Extract device allocation from Spyre tensor storage
     auto* spyre_impl =

@@ -568,5 +568,193 @@ class TestDl16ComparisonUtility(unittest.TestCase):
             )
 
 
+def _can_import_seam_guard_surface() -> bool:
+    """The seam-guard tests need torch_spyre._C (dl16_h2d_seam_boundary /
+    dl16_h2d_seam_check / SpyreTensorLayout). In environments without the
+    built extension they are skipped; the boundary itself is additionally
+    pinned source-side by the derivation in dl16_seam_guard.h (decode of
+    word 0x7DFF in the 1-6-9 format)."""
+    try:
+        import torch_spyre._C as _C  # noqa: F401
+
+        _C.dl16_h2d_seam_boundary  # noqa: B018
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        return False
+    return True
+
+
+@unittest.skipUnless(
+    _can_import_seam_guard_surface(),
+    "torch_spyre._C with the T-DC-17 seam guard not built",
+)
+class TestH2DSeamGuard(unittest.TestCase):
+    """The T-DC-17 contract: the H2D converter-in seam's silent saturation
+    (0x7DFF, silicon-witnessed 2026-11-05, claim
+    bf16pivot-sixitem-20261105-002 item 2) is converted to a typed loud
+    refusal on the host, before the DMA.
+
+    All boundary values are DERIVED from the DL16 decoder model above —
+    never hand-asserted. Two numbers, two sites: the seam ceiling
+    (decode(0x7DFF), the converter-in's usable limit) is distinct from
+    the DL16 format max (decode(0x7FFF), refused by the fp32 pivot in
+    dtype_convert) — the tests pin both, and their separation."""
+
+    def _c(self):
+        import torch_spyre._C as _C
+
+        return _C
+
+    def test_seam_ceiling_derived_from_saturation_word(self):
+        _C = self._c()
+        # The ceiling is the decode of the witnessed saturation word
+        # 0x7DFF — derived through the decoder model, and it sits one
+        # binade below the format max decode(0x7FFF).
+        seam = dl16_decode(0x7DFF)
+        self.assertEqual(seam, 4290772992.0)
+        self.assertLess(seam, dl16_decode(0x7FFF))
+        # The ceiling itself is admitted; the format max is NOT (it is
+        # above the seam — the honest narrowing this guard implements).
+        self.assertEqual(_C.dl16_h2d_seam_boundary(seam), "ok")
+        self.assertEqual(
+            _C.dl16_h2d_seam_boundary(dl16_decode(0x7FFF)),
+            "over-seam-ceiling",
+        )
+
+    def test_witnessed_saturators_refuse(self):
+        _C = self._c()
+        # The box-run divergence corpus: over-range inputs AND the largest
+        # in-range grid value (module word 0x7FF8) all saturate at 0x7DFF
+        # on device — every one of them must refuse on the host now.
+        in_range_grid_max = dl16_decode(0x7FF8)  # 8522825728, derived
+        self.assertGreater(in_range_grid_max, 4290772992.0)
+        for value in (in_range_grid_max, 2.0**33, 1e10, 2.0**40):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _C.dl16_h2d_seam_boundary(value), "over-seam-ceiling"
+                )
+                self.assertEqual(
+                    _C.dl16_h2d_seam_boundary(-value), "over-seam-ceiling"
+                )
+
+    def test_just_above_ceiling_refuses(self):
+        _C = self._c()
+        import math
+
+        seam = dl16_decode(0x7DFF)
+        just_above = math.nextafter(seam, math.inf)
+        self.assertEqual(_C.dl16_h2d_seam_boundary(seam), "ok")
+        self.assertEqual(
+            _C.dl16_h2d_seam_boundary(just_above), "over-seam-ceiling"
+        )
+
+    def test_in_band_values_pass(self):
+        _C = self._c()
+        # The entire witnessed-correct range, including the fp16 format
+        # max (eight binades below the ceiling) and the real-model census
+        # max (SmolLM2-135M max |w| = 5.25).
+        for value in (0.0, -0.0, 1.0, -1.0, 5.25, 65504.0, 2.0**31, -2.0**31):
+            with self.subTest(value=value):
+                self.assertEqual(_C.dl16_h2d_seam_boundary(value), "ok")
+
+    def test_nonfinite_refuses(self):
+        _C = self._c()
+        # No DL16 inf/nan word exists; the converter's field-63 marker
+        # decodes as a large finite value (silent corruption) — refuse.
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _C.dl16_h2d_seam_boundary(value), "non-finite"
+                )
+
+    def _sen169_layout(self, numel):
+        _C = self._c()
+        return _C.SpyreTensorLayout(
+            [numel], [numel], _C.DataFormats.SEN169_FP16
+        )
+
+    def test_tensor_guard_refuses_bad_bf16_element(self):
+        import torch
+
+        _C = self._c()
+        # A bf16 tensor with one over-seam element refuses loudly
+        # (RuntimeError from TORCH_CHECK), naming the seam.
+        t = torch.tensor([1.0, 2.0**33, 3.0], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "seam"):
+            _C.dl16_h2d_seam_check(t, self._sen169_layout(3))
+
+    def test_tensor_guard_refuses_nonfinite_bf16_element(self):
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([1.0, float("inf")], dtype=torch.bfloat16)
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            _C.dl16_h2d_seam_check(t, self._sen169_layout(2))
+
+    def test_tensor_guard_passes_clean_bf16_tensor(self):
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([1.0, -5.25, 65504.0], dtype=torch.bfloat16)
+        self.assertIsNone(
+            _C.dl16_h2d_seam_check(t, self._sen169_layout(3))
+        )
+
+    def test_tensor_guard_scans_strided_view(self):
+        # The DMA converts the logical view (stride-aware), so the guard
+        # must too: a bad element reachable only through a stride > 1
+        # still refuses — the odometer, not a contiguous memcpy.
+        import torch
+
+        _C = self._c()
+        base = torch.tensor(
+            [1.0, 1.0, 2.0**33, 1.0, 1.0, 1.0], dtype=torch.bfloat16
+        )
+        strided = base.as_strided((3,), (2,), storage_offset=0)
+        with self.assertRaisesRegex(RuntimeError, "seam"):
+            _C.dl16_h2d_seam_check(strided, self._sen169_layout(3))
+        # The same base tensor viewed without the bad element (indices
+        # 3 and 5, skipping the 2**33 at index 2) passes.
+        clean = base.as_strided((2,), (2,), storage_offset=3)
+        self.assertIsNone(
+            _C.dl16_h2d_seam_check(clean, self._sen169_layout(2))
+        )
+
+    def test_tensor_guard_noop_for_non_dl16_destination(self):
+        # A non-SEN169_FP16 destination never routes through the
+        # converting seam: the guard is a no-op even for wild values.
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([2.0**40, float("inf")], dtype=torch.bfloat16)
+        layout = _C.SpyreTensorLayout(
+            [2], [2], _C.DataFormats.IEEE_FP32
+        )
+        self.assertIsNone(_C.dl16_h2d_seam_check(t, layout))
+
+    def test_tensor_guard_noop_for_fp32_source(self):
+        # fp32 H2D is a pure bit-move (silicon-witnessed, claim item 3):
+        # no converter-in numerics, no seam exposure — no-op.
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([2.0**40, float("inf")], dtype=torch.float32)
+        self.assertIsNone(
+            _C.dl16_h2d_seam_check(t, self._sen169_layout(2))
+        )
+
+    def test_tensor_guard_covers_fp16_source(self):
+        # fp16's max (65504) cannot cross the ceiling, but the guard
+        # scans the whole 16-bit-float dtype class (derived from the
+        # seam's dtype class, not a guess): a synthetic fp16 tensor is
+        # scanned and passes; the guard surface does not skip it.
+        import torch
+
+        _C = self._c()
+        t = torch.tensor([1.0, 65504.0], dtype=torch.float16)
+        self.assertIsNone(
+            _C.dl16_h2d_seam_check(t, self._sen169_layout(2))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

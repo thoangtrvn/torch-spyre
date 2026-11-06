@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "dl16_seam_guard.h"
 #include "launch_identity.h"
 #include "logging.h"
 #include "spyre_allocator.h"
@@ -410,6 +411,26 @@ PYBIND11_MODULE(_C, m) {
       "native runtime observation.");
   m.def("get_last_launch_observation", &spyre::getLastLaunchObservation);
   m.def("encode_constant", &spyre::encodeConstant);
+  m.def(
+      "dl16_h2d_seam_boundary",
+      [](double value) {
+        return std::string(spyre::dl16_h2d_seam_boundary_name(
+            spyre::dl16_h2d_seam_boundary(value)));
+      },
+      py::arg("value"),
+      "Classify a host float against the DL16 H2D converter-in seam "
+      "ceiling (T-DC-17): 'ok', 'over-seam-ceiling' (the DMA converter "
+      "silently saturates above decode(0x7DFF)), or 'non-finite'.");
+  m.def(
+      "dl16_h2d_seam_check",
+      [](const at::Tensor& cpu_tensor, const spyre::SpyreTensorLayout& stl) {
+        spyre::check_dl16_h2d_seam(cpu_tensor, stl);
+      },
+      py::arg("cpu_tensor"), py::arg("device_layout"),
+      "Run the T-DC-17 H2D seam guard on a host tensor: TORCH_CHECK-refuse "
+      "(RuntimeError) any element the DL16 converter-in would silently "
+      "saturate or corrupt. No-op for non-SEN169_FP16 destinations and "
+      "non-16-bit-float sources.");
 
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
