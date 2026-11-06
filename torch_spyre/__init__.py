@@ -55,11 +55,7 @@ class _SpyreImpl:
 
     @staticmethod
     def _load_runtime_stubs():
-        """Compile-only builds ship a _runtime_stubs.dylib defining the
-        unresolved flex/senlib/sendnn/boost symbols so _C.so can load
-        without the real runtime libraries (macOS, no hardware). Its
-        presence is the build-mode marker; regular builds have no such
-        file and this is a no-op."""
+        """Load generated runtime stubs when the build ships them."""
         import ctypes
 
         stub = Path(__file__).parent / "_runtime_stubs.dylib"
@@ -91,11 +87,6 @@ class _SpyreImpl:
             # this will create the allocator
             if self.device_count() > 0:
                 self._C.start_runtime()
-            else:
-                # compile-only builds (no runtime libs / no devices): skip
-                # runtime init — _C is importable and kernel generation
-                # (inductor/triton-spyre/codegen) never calls into it.
-                pass
             self._initialized = True
 
     def _is_in_bad_fork(self) -> bool:
@@ -192,10 +183,7 @@ class _SpyreImpl:
         self._in_bad_fork = True
 
 
-# Compile-only builds (see setup.py, TORCH_SPYRE_COMPILE_ONLY=1) need the
-# runtime stub dylib in the process before ANY extension (_C or _hooks)
-# is dlopened. _hooks is imported by _autoload() ahead of _lazy_init(),
-# so preload at package import. No-op for regular builds.
+# Compile-only Darwin builds ship this dylib; other builds do not.
 _SpyreImpl._load_runtime_stubs()
 
 

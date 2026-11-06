@@ -14,6 +14,7 @@
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 os.environ.setdefault(
@@ -80,10 +81,12 @@ cmake_library_path = os.environ.get("CMAKE_LIBRARY_PATH", "")
 extra_library_dirs = cmake_library_path.split(":") if cmake_library_path else []
 LIBRARY_DIRS += [Path(p) for p in extra_library_dirs if p]
 
-# Kernel-generation-only build (e.g. macOS, no Spyre hardware or flex/sendnn
-# runtimes available): compile against the runtime headers but skip linking the
-# runtime shared libraries. Set TORCH_SPYRE_COMPILE_ONLY=1 to enable.
+# Kernel-generation-only build: compile/import the extension without probing or
+# initializing Spyre hardware. macOS uses generated runtime stubs because the
+# real runtime libraries are not available there; Linux is expected to link the
+# real runtime libraries and only bypass hardware discovery/initialization.
 COMPILE_ONLY_BUILD = os.environ.get("TORCH_SPYRE_COMPILE_ONLY", "0") == "1"
+RUNTIME_STUB_BUILD = COMPILE_ONLY_BUILD and sys.platform == "darwin"
 
 COMPILE_AIUPTI = (
     os.environ.get("USE_SPYRE_PROFILER", "0" if COMPILE_ONLY_BUILD else "1") == "1"
@@ -149,7 +152,7 @@ else:
             "or set the SPYRE_COMMS_INSTALL_DIR to the Spyre Comms install directory."
         )
 
-if COMPILE_ONLY_BUILD:
+if RUNTIME_STUB_BUILD:
     LIBRARIES = []
 else:
     LIBRARIES = ["flex"]
@@ -166,10 +169,10 @@ if COMPILE_AIUPTI:  # Include kineto and libaiupti headers
         LIBRARY_DIRS += [LIBAIUPTI_DIR / "lib"]
         INCLUDE_DIRS += [LIBAIUPTI_DIR / "include"]
 
-    if not COMPILE_ONLY_BUILD:
+    if not RUNTIME_STUB_BUILD:
         LIBRARIES.insert(-1, "aiupti")  # Build dependency on flex
 
-if use_spyre_ccl and not COMPILE_ONLY_BUILD:
+if use_spyre_ccl and not RUNTIME_STUB_BUILD:
     LIBRARIES.append("spyre_comms")
 
 # FIXME: added no-deprecated as this fails in sentensor_shape.hpp
@@ -184,21 +187,16 @@ if NO_OPT_BUILD:
     EXTRA_CXX_FLAGS += ["-O0"]
 
 if COMPILE_ONLY_BUILD:
-    # Compile-only conveniences: the flex/senlib headers require C++20
-    # (std::span), senlib's hal/platform.hpp has no __aarch64__ branch
-    # (map to the host little-endian X86 path — the macro is only consumed
-    # by senlib .cpp files that are not compiled here), and
-    # boost/stacktrace.hpp demands _GNU_SOURCE on Linux (macOS provides
-    # _Unwind_Backtrace without it).
+    # Compile-only bypasses hardware probing/runtime init. Darwin additionally
+    # builds without runtime libraries and uses generated stubs.
     EXTRA_CXX_FLAGS += [
         "-std=c++20",
         "-DTORCH_SPYRE_COMPILE_ONLY",
         "-DSENLIB_X86_SUPPORT=1",
         "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED",
-        # glibc's off64_t (sendnn/tensor/sentensor.hpp file offsets) does not
-        # exist on macOS; off_t is already 64-bit there.
-        "-Doff64_t=off_t",
     ]
+    if sys.platform == "darwin":
+        EXTRA_CXX_FLAGS.append("-Doff64_t=off_t")
 
 
 class clean(Command):
@@ -221,50 +219,48 @@ class clean(Command):
                 shutil.rmtree(str(path), ignore_errors=True)
 
 
+def _runtime_stub_path():
+    return ROOT_DIR / PATH_NAME / "_runtime_stubs.dylib"
+
+
+def _remove_runtime_stub_dylib():
+    stub = _runtime_stub_path()
+    if stub.exists():
+        stub.unlink()
+
+
 def _build_runtime_stub_dylib():
-    """Compile-only builds: emit a stub dylib for the unresolved runtime
-    (flex/senlib/sendnn/boost) symbols referenced by _C.so/_hooks.so.
+    """Emit the macOS compile-only dylib that lets _C.so import.
 
-    dlopen() eagerly binds data/vtable symbols even though the extensions
-    are linked with -undefined dynamic_lookup, so the extension cannot load
-    unless every unresolved runtime symbol is defined somewhere. The stub
-    defines them: functions as plain ``ret`` (module-init static
-    initializers may call a few and must survive; returning garbage is fine
-    because compile-only builds never execute runtime paths), vtables/RTTI
-    as zeroed data, and flex::getNumDevices as "return 0" so device_count()
-    honestly reports no devices instead of garbage.
-
-    The loader side (torch_spyre/__init__.py) dlopens this dylib
-    RTLD_GLOBAL before importing _C whenever it is present.
+    Compile-only builds link _C.so without the real runtime libraries, but dyld
+    still requires unresolved runtime symbols to exist at import time. The dylib
+    provides dummy definitions for unused runtime paths plus a few real helpers
+    needed by import, layout formatting, and constant encoding.
     """
     import subprocess  # noqa: PLC0415
 
     build_lib = ROOT_DIR / "build"
     exts = list(build_lib.glob("lib.*/torch_spyre/_C.so"))
+    in_place_ext = ROOT_DIR / PATH_NAME / "_C.so"
+    if in_place_ext.exists():
+        exts.append(in_place_ext)
     if not exts:
         return
-    pkg_dir = exts[0].parent
+    pkg_dir = exts[-1].parent
 
-    # `dyld_info -imports` is the authoritative list of everything dyld
-    # must resolve at load time — unlike nm/otool it includes symbols
-    # referenced only through chained fixups (e.g. vtables), which are
-    # exactly the ones that fail eagerly at dlopen. Names are already in
-    # full dyld form (C++ mangled names carry the extra leading
-    # underscore on macOS, e.g. __ZN4flex...).
+    # Use dyld's import list: it includes eager load-time fixups that nm misses.
     syms: set[str] = set()
-    for so in [pkg_dir / "_C.so", pkg_dir / "_hooks.so"]:
-        if not so.exists():
-            continue
-        dyld_info = subprocess.run(
-            ["dyld_info", "-imports", str(so)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        for line in dyld_info.stdout.splitlines():
-            tok = line.split()
-            if len(tok) >= 2 and tok[1] == "(from" and tok[0].startswith("__Z"):
-                syms.add(tok[0])
+    so = pkg_dir / "_C.so"
+    dyld_info = subprocess.run(
+        ["dyld_info", "-imports", str(so)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for line in dyld_info.stdout.splitlines():
+        tok = line.split()
+        if len(tok) >= 2 and tok[1] == "(from" and tok[0].startswith("__Z"):
+            syms.add(tok[0])
 
     # Only stub the runtime namespaces — torch/python/libc++ symbols resolve
     # from the host process.
@@ -277,6 +273,8 @@ def _build_runtime_stub_dylib():
         "moodycamel",
         "sendnn",
         "EnumsConversion",
+        "DataFormats",
+        "Hcm",
         "Sen",
     )
     stub_syms = sorted(
@@ -288,28 +286,139 @@ def _build_runtime_stub_dylib():
         return
 
     lines = [".section __TEXT,__text", ".globl ___stub_marker", "___stub_marker: ret"]
-    cpp_syms = {"__ZN4flex13getNumDevicesEv", "__ZN9deeptools14FloatToFp16BinEf"}
+    data_lines = [".section __DATA,__data"]
+    cpp_syms = {
+        "__ZN15EnumsConversion21dataFormatsToBitWidthE",
+        "__ZN15EnumsConversion19dataFormatsToStringE11DataFormats",
+        "__ZN4flex13getNumDevicesEv",
+        "__ZN9deeptools14FloatToFp16BinEf",
+        "__ZlsRNSt3__113basic_ostreamIcNS_11char_traitsIcEEEERK11DataFormats",
+    }
     for s in stub_syms:
         if s in cpp_syms:
             continue  # real implementations live in runtime_stubs.cpp
-        lines.append(f".globl {s}")
-        lines.append(f"{s}:")
         if s.startswith("__ZTV") or s.startswith("__ZTI") or s.startswith("__ZTS"):
-            lines.append("    .quad 0, 0, 0, 0")
+            data_lines.append(f".globl {s}")
+            data_lines.append(f"{s}:")
+            data_lines.append("    .quad 0, 0, 0, 0")
         else:
+            lines.append(f".globl {s}")
+            lines.append(f"{s}:")
             lines.append("    ret")
+    lines.extend(data_lines)
     asm = build_lib / "runtime_stubs.s"
     asm.write_text("\n".join(lines) + "\n")
 
-    # Real implementations for the stub symbols that must behave correctly
-    # even in compile-only builds. FloatToFp16Bin is ported verbatim from
-    # deeptools/util/sen_data_convert.cpp (DL16 1-6-9 encoding): it feeds
-    # encode_constant(), which lands in generated device binaries — a ret
-    # stub there would silently corrupt constants.
+    # Some import/codegen helpers need real behavior; everything else is a dummy.
     cpp = build_lib / "runtime_stubs.cpp"
     cpp.write_text(
         """#include <cstdint>
 #include <cstddef>
+#include <map>
+#include <ostream>
+#include <string>
+
+enum class DataFormats {
+  SEN169_FP16,
+  IEEE_FP32,
+  INVALID,
+  SEN143_FP8,
+  SEN152_FP8,
+  SEN153_FP9,
+  SENINT2,
+  SENINT4,
+  SENINT8,
+  SENINT16,
+  SENINT24,
+  IEEE_INT64,
+  IEEE_INT32,
+  SENUINT32,
+  SENUINT2,
+  IEEE_FP16,
+  BOOL,
+  BFLOAT16,
+  SEN18F_FP24,
+  SEN080_FP8,
+  SEN053_FP8,
+  SEN121_FP4,
+  SENUINT8,
+  NUM_DATA_FORMATS,
+};
+
+namespace EnumsConversion {
+extern const std::map<DataFormats, int> dataFormatsToBitWidth = {
+    {DataFormats::SEN169_FP16, 16}, {DataFormats::IEEE_FP32, 32},
+    {DataFormats::SEN143_FP8, 8},   {DataFormats::SEN152_FP8, 8},
+    {DataFormats::SEN153_FP9, 9},   {DataFormats::SENINT2, 2},
+    {DataFormats::SENINT4, 4},      {DataFormats::SENINT8, 8},
+    {DataFormats::SENINT16, 16},    {DataFormats::SENINT24, 24},
+    {DataFormats::IEEE_INT64, 64},  {DataFormats::IEEE_INT32, 32},
+    {DataFormats::SENUINT32, 32},   {DataFormats::SENUINT2, 2},
+    {DataFormats::IEEE_FP16, 16},   {DataFormats::BOOL, 8},
+    {DataFormats::BFLOAT16, 16},    {DataFormats::SEN18F_FP24, 24},
+    {DataFormats::SEN080_FP8, 8},   {DataFormats::SEN053_FP8, 8},
+    {DataFormats::SEN121_FP4, 4},   {DataFormats::SENUINT8, 8},
+};
+
+std::string dataFormatsToString(DataFormats df) {
+  switch (df) {
+    case DataFormats::SEN169_FP16:
+      return "SEN169_FP16";
+    case DataFormats::IEEE_FP32:
+      return "IEEE_FP32";
+    case DataFormats::INVALID:
+      return "INVALID";
+    case DataFormats::SEN143_FP8:
+      return "SEN143_FP8";
+    case DataFormats::SEN152_FP8:
+      return "SEN152_FP8";
+    case DataFormats::SEN153_FP9:
+      return "SEN153_FP9";
+    case DataFormats::SENINT2:
+      return "SENINT2";
+    case DataFormats::SENINT4:
+      return "SENINT4";
+    case DataFormats::SENINT8:
+      return "SENINT8";
+    case DataFormats::SENINT16:
+      return "SENINT16";
+    case DataFormats::SENINT24:
+      return "SENINT24";
+    case DataFormats::IEEE_INT64:
+      return "IEEE_INT64";
+    case DataFormats::IEEE_INT32:
+      return "IEEE_INT32";
+    case DataFormats::SENUINT32:
+      return "SENUINT32";
+    case DataFormats::SENUINT2:
+      return "SENUINT2";
+    case DataFormats::IEEE_FP16:
+      return "IEEE_FP16";
+    case DataFormats::BOOL:
+      return "BOOL";
+    case DataFormats::BFLOAT16:
+      return "BFLOAT16";
+    case DataFormats::SEN18F_FP24:
+      return "SEN18F_FP24";
+    case DataFormats::SEN080_FP8:
+      return "SEN080_FP8";
+    case DataFormats::SEN053_FP8:
+      return "SEN053_FP8";
+    case DataFormats::SEN121_FP4:
+      return "SEN121_FP4";
+    case DataFormats::SENUINT8:
+      return "SENUINT8";
+    case DataFormats::NUM_DATA_FORMATS:
+      return "NUM_DATA_FORMATS";
+  }
+  return "UNKNOWN";
+}
+}  // namespace EnumsConversion
+
+std::ostream& operator<<(std::ostream& os, const DataFormats& df) {
+  os << EnumsConversion::dataFormatsToString(df);
+  return os;
+}
 
 namespace flex {
 int getNumDevices() { return 0; }  // compile-only: honestly no devices
@@ -357,7 +466,7 @@ uint16_t FloatToFp16Bin(float f) { return FloatToFp16BinInternal(f); }
 """
     )
 
-    out = pkg_dir / "_runtime_stubs.dylib"
+    out = _runtime_stub_path()
     subprocess.run(
         [
             "clang++",
@@ -467,8 +576,10 @@ if __name__ == "__main__":
 
             def run(self):
                 super().run()
-                if COMPILE_ONLY_BUILD:
+                if RUNTIME_STUB_BUILD:
                     _build_runtime_stub_dylib()
+                else:
+                    _remove_runtime_stub_dylib()
 
         setup(
             ext_modules=ext_modules,

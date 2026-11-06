@@ -202,7 +202,11 @@ bool is_supported_dtype(c10::ScalarType dtype) {
          elems_per_stick(sen_dtype_dev) > 0;
 }
 int device_count() {
+#ifdef TORCH_SPYRE_COMPILE_ONLY
+  return 0;
+#else
   return getVisibleDeviceCount();
+#endif
 }
 
 }  // namespace spyre
@@ -269,7 +273,7 @@ PYBIND11_MODULE(_C, m) {
         "Extract a canonical bundle key from a Spyre profiler event name");
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
-  m.def("device_count", &spyre::getVisibleDeviceCount);
+  m.def("device_count", &spyre::device_count);
   m.def("encode_constant", &spyre::encodeConstant);
 
   // Initialize logging bindings
