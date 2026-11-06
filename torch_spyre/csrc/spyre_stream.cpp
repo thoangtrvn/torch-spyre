@@ -29,8 +29,8 @@
 #include <utility>
 #include <vector>
 
-#include "flex/flex.hpp"
 #include "dl16_seam_guard.h"
+#include "flex/flex.hpp"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"

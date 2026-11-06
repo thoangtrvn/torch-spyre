@@ -22,6 +22,9 @@ __all__: list[str] = [
     "raw_copy_tensor",
     "fill_tensor",
     "encode_constant",
+    "dl16_h2d_seam_boundary",
+    "dl16_h2d_seam_check",
+    "dl16_h2d_seam_copy_probe",
     "free_runtime",
     "get_device_dtype",
     "get_downcast_warning",
@@ -290,6 +293,18 @@ def empty_with_layout(
     arg5: torch.memory_format | None,
 ) -> torch.Tensor: ...
 def encode_constant(arg0: typing.SupportsFloat, arg1: DataFormats) -> int: ...
+def dl16_h2d_seam_boundary(arg0: float) -> str:
+    """
+    Classify a host float against the DL16 H2D converter-in seam ceiling (T-DC-17): 'ok', 'over-seam-ceiling' (the DMA converter silently saturates above decode(0x7DFF)), or 'non-finite'.
+    """
+def dl16_h2d_seam_check(arg0: torch.Tensor, arg1: SpyreTensorLayout) -> None:
+    """
+    Run the T-DC-17 H2D seam guard on a host tensor: TORCH_CHECK-refuse (RuntimeError) any element the DL16 converter-in would silently saturate or corrupt. No-op for non-SEN169_FP16 destinations and non-16-bit-float sources.
+    """
+def dl16_h2d_seam_copy_probe(arg0: torch.Tensor) -> None:
+    """
+    Test-only (compile-only builds): drive the REAL SpyreStream::copyAsync H2D path with a fabricated SEN169_FP16 destination. Over-seam/non-finite elements refuse at the T-DC-17 guard; clean elements pass the guard and stop at the stream-pool lookup (no flex handle) — witness that the hook admitted them. Refused on a live runtime.
+    """
 def free_runtime() -> None: ...
 def get_device_dtype(arg0: torch.dtype) -> DataFormats: ...
 def get_downcast_warning() -> bool:

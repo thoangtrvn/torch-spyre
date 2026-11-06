@@ -86,7 +86,10 @@ inline const char* dl16_h2d_seam_boundary_name(Dl16H2DSeamBoundary b) {
     case Dl16H2DSeamBoundary::kNonFinite:
       return "non-finite";
   }
-  return "ok";
+  // An out-of-enum value must not masquerade as "ok" — the boundary name
+  // feeds the refusal message and the test oracle.
+  TORCH_CHECK(false, "invalid Dl16H2DSeamBoundary value: ",
+              static_cast<int>(b));
 }
 
 /*
