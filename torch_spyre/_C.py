@@ -106,31 +106,43 @@ else:
                 f"elements-per-stick is undefined for {self.name}"
             )
 
-    import torch
+    # Lazy torch dtype mapping — avoids module-scope `import torch` which
+    # triggers torch's backend autoload before _C is fully initialized,
+    # causing a circular import when choices.py tries to import from _C.
+    def _get_torch_dtype_map() -> dict:
+        import torch
 
-    _TORCH_DTYPE_TO_DEVICE_DTYPE = {
-        torch.float16: DataFormats.SEN169_FP16,
-        torch.float32: DataFormats.IEEE_FP32,
-        torch.bfloat16: DataFormats.BFLOAT16,
-        torch.int64: DataFormats.IEEE_INT64,
-        torch.int32: DataFormats.IEEE_INT32,
-        torch.bool: DataFormats.BOOL,
-    }
+        mapping = {
+            torch.float16: DataFormats.SEN169_FP16,
+            torch.float32: DataFormats.IEEE_FP32,
+            torch.bfloat16: DataFormats.BFLOAT16,
+            torch.int64: DataFormats.IEEE_INT64,
+            torch.int32: DataFormats.IEEE_INT32,
+            torch.bool: DataFormats.BOOL,
+        }
+        if hasattr(torch, "float8_e4m3fn"):
+            mapping[torch.float8_e4m3fn] = DataFormats.SEN143_FP8
+        if hasattr(torch, "float8_e5m2"):
+            mapping[torch.float8_e5m2] = DataFormats.SEN152_FP8
+        return mapping
 
-    if hasattr(torch, "float8_e4m3fn"):
-        _TORCH_DTYPE_TO_DEVICE_DTYPE[torch.float8_e4m3fn] = DataFormats.SEN143_FP8
-    if hasattr(torch, "float8_e5m2"):
-        _TORCH_DTYPE_TO_DEVICE_DTYPE[torch.float8_e5m2] = DataFormats.SEN152_FP8
+    _TORCH_DTYPE_TO_DEVICE_DTYPE: dict | None = None
 
-    def get_device_dtype(dtype: torch.dtype) -> DataFormats:
+    def _get_dtype_map() -> dict:
+        global _TORCH_DTYPE_TO_DEVICE_DTYPE
+        if _TORCH_DTYPE_TO_DEVICE_DTYPE is None:
+            _TORCH_DTYPE_TO_DEVICE_DTYPE = _get_torch_dtype_map()
+        return _TORCH_DTYPE_TO_DEVICE_DTYPE
+
+    def get_device_dtype(dtype) -> DataFormats:  # dtype: torch.dtype (torch not imported here)
         try:
-            return _TORCH_DTYPE_TO_DEVICE_DTYPE[dtype]
+            return _get_dtype_map()[dtype]
         except KeyError as e:
             raise NotImplementedError(
                 f"unsupported Spyre dtype in codegen-only mode: {dtype}"
             ) from e
 
-    def get_elem_in_stick(dtype: torch.dtype) -> int:
+    def get_elem_in_stick(dtype) -> int:  # dtype: torch.dtype
         return get_device_dtype(dtype).elems_per_stick()
 
     class SpyreTensorLayout:
