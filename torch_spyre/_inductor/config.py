@@ -361,6 +361,14 @@ core_id_k_fast_emission: bool = (
 # emitter, i.e. also requires ktir_emitter=True / TORCH_SPYRE_KTIR=1.)
 bundle_symbolic_args: bool = os.environ.get("BUNDLE_SYMBOLIC_ARGS", "1") == "1"
 
+# Compile reductions over the shard dim of a sharded tensor as one program
+# whose partials DeepTools combines across cores (its cross-core reduction,
+# the same one split-K reductions use). Set SPYRE_SHARDED_RING_REDUCTION=0 to
+# reject them instead (kill switch).
+sharded_ring_reduction: bool = (
+    os.environ.get("SPYRE_SHARDED_RING_REDUCTION", "1") == "1"
+)
+
 # Cache and reuse sdsc.json files during codegen when two OpSpecs produce
 # identical SuperDSC content, reducing bundle size for programs with loops.
 # Set SPYRE_INDUCTOR_SDSC_CACHE=0 to disable.
