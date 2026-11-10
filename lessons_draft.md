@@ -57,17 +57,21 @@ tuning knob. Root: `torch_spyre/_inductor/choices.py`
 
 ## L-DRAFT-r0-gauntlet-handback-silent
 
-**Law:** a reviewer agent that completes its tool run but delivers no
-report has NOT reviewed — three consecutive subagent dispatches (each
-~20-25 tool uses, ~65k tokens, ~10-13 min) ended with "no report was
-delivered through SubagentHandback", and SendMessage resumes produced no
-reply. The gauntlet channel can fail silently in both directions.
+**Law:** a reviewer agent's report can arrive as a teammate message LONG
+after the dispatch returns "no report was delivered through
+SubagentHandback" — three consecutive dispatches (each ~20-25 tool uses,
+~65k tokens, ~10-13 min) initially appeared reportless, and all three full
+reports (convergent GAUNTLET-CLEAN) landed later as teammate messages, one
+per reviewer. An absent handback is not evidence of an absent review.
 
-**Why:** "dispatched a reviewer" is not "got a review"; the receipt is the
-report, not the dispatch.
+**Why:** "dispatched a reviewer" is not "got a review"; but neither is
+"no handback yet" — the receipt is the report content, and its delivery
+channel can lag by tens of minutes.
 
-**How to apply:** treat a missing reviewer report as a blocked lane, not
-as a pass; disclose the channel failure to the coordinator and hold
-rather than self-certify. (This lane's gauntlet is INCOMPLETE for this
-reason; all mutation/red-first/base-diff verification was executed by the
-author and must be re-reviewed before merge.)
+**How to apply:** before declaring the gauntlet channel failed and
+holding on that basis, wait for delayed teammate-message delivery (and
+re-prompt the reviewer once); only then disclose a channel failure. A
+premature "gauntlet incomplete" stop report must be corrected when the
+reports land, as this one was. (This lane's r1 gauntlet completed with
+three convergent reports; the initial incomplete-gauntlet disclosure was
+superseded.)
