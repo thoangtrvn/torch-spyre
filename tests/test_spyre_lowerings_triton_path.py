@@ -23,6 +23,13 @@ codegen with AttributeError. These tests pin:
   - the triton path (explicit AND the default) installs no clamp adapter;
   - clamp_min/clamp_max keep their in-tree maximum/minimum lowerings;
   - the CM restores the lowerings table on exit.
+
+Scope: lowerings-table state only — no end-to-end compile, no clamp-bearing
+graph execution, no silicon. The adapter-absence assertion is name-based
+(adapter functions are identified by their _impl_lower_aten_clamp* names /
+"clamp" in __name__); an adapter installed under an unrelated name or via a
+nameless wrapper would evade it (the restore test, by contrast, checks
+identity with ``is``).
 """
 
 import pytest

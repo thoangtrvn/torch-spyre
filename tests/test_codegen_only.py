@@ -259,6 +259,137 @@ def test_codegen_only_factory_family_materializes_fake_tensors():
     assert result.returncode == 0, result.stderr
 
 
+def test_codegen_only_transposed_view_keeps_reference_strides():
+    """View strides must come from PyTorch's own stride math (meta-tensor
+    view), not a hand-rolled contiguous-stride fabrication."""
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        x = torch.ones((2, 3), device="spyre", dtype=torch.float16)
+        y = x.t().view(3, 2, 1)
+        ref = torch.ones((2, 3), dtype=torch.float16).t().view(3, 2, 1)
+        assert tuple(y.stride()) == tuple(ref.stride()) == (1, 3, 3), y.stride()
+        assert y.device.type == "spyre"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_as_strided_nonzero_offset_refuses():
+    """A fake tensor has no backing storage to offset into — silently
+    fabricating a layout would be a silent wrong-answer."""
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        x = torch.ones((512, 128), device="spyre", dtype=torch.float16)
+        # offset 0 is fine (plain view semantics)
+        y = x.as_strided((512, 128), (128, 1), 0)
+        assert y.device.type == "spyre"
+        try:
+            x.as_strided((512, 128), (128, 1), 4)
+        except RuntimeError as e:
+            assert "storage_offset" in str(e) or "backing storage" in str(e), e
+        else:
+            raise AssertionError("nonzero storage_offset unexpectedly accepted")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_local_scalar_warns_and_returns_zero():
+    """.item() on a fake tensor warns (deduplicated on (size, dtype)) and
+    returns 0 in the default policy."""
+    result = _run_codegen_only_script(
+        """
+        import warnings
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        # .item() requires numel == 1 (frontend check precedes dispatch)
+        x = torch.ones((1,), device="spyre", dtype=torch.float16)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert x.item() == 0
+            assert x.item() == 0  # same (size, dtype): no second warning
+            y = torch.ones((1, 1), device="spyre", dtype=torch.float16)
+            assert y.item() == 0  # different size: warns again
+        texts = [str(w.message) for w in caught]
+        assert sum("codegen-only mode" in t for t in texts) == 2, texts
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_strict_item_env_raises():
+    """TORCH_SPYRE_STRICT_ITEM turns .item() into a hard
+    SpyreRuntimeUnavailableError — the capture-fidelity probe."""
+    env = os.environ.copy()
+    env["TORCH_SPYRE_CODEGEN_ONLY"] = "1"
+    env["TORCH_SPYRE_STRICT_ITEM"] = "1"
+    script = textwrap.dedent(
+        """
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        from torch_spyre._runtime import SpyreRuntimeUnavailableError
+        x = torch.ones((1,), device="spyre", dtype=torch.float16)
+        try:
+            x.item()
+        except SpyreRuntimeUnavailableError as e:
+            assert "TORCH_SPYRE_STRICT_ITEM" in str(e), e
+        else:
+            raise AssertionError("strict mode did not raise")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_codegen_only_ones_memory_format_noncontiguous_refuses_loudly():
+    """ones/new_ones refuse non-contiguous memory_format loudly
+    (AssertionError naming the kwarg) at the decomposition layer — the
+    compile-path entry. Note the eager Tensor.new_ones Python binding does
+    not accept memory_format at all in this torch version (upstream limit,
+    same class as torch._refs.ones); the factory kernel default path still
+    works."""
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        x = torch.ones((512, 128), device="spyre", dtype=torch.float16)
+        y = x.new_ones((512, 128))  # factory kernel default path still works
+        assert y.device.type == "spyre"
+
+        from torch_spyre._inductor.decompositions import new_ones_decomp
+        try:
+            new_ones_decomp(x, (512, 128), memory_format=torch.channels_last)
+        except AssertionError as e:
+            assert "memory_format" in str(e), e
+        else:
+            raise AssertionError("channels_last new_ones unexpectedly accepted")
+        out = new_ones_decomp(x, (512, 128))  # default: contiguous, passes
+        assert out.device.type == "spyre"
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_codegen_only_C_first_import_before_torch():
     """Importing torch_spyre._C before torch must not trigger a circular import.
 

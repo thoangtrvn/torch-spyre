@@ -151,13 +151,23 @@ def _register_codegen_only_factory_kernels() -> None:
             pin_memory=pin_memory,
         )
 
-    def _new_ones(self, size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    def _new_ones(
+        self,
+        size,
+        *,
+        dtype=None,
+        layout=None,
+        device=None,
+        pin_memory=None,
+        memory_format=None,
+    ):
         return torch.ops.aten.empty.memory_format(
             size,
             dtype=dtype if dtype is not None else self.dtype,
             layout=layout,
             device=device if device is not None else self.device,
             pin_memory=pin_memory,
+            memory_format=memory_format,
         )
 
     _factory_kernel_lib.impl("fill_.Scalar", _fill_noop)
@@ -228,7 +238,8 @@ def _register_codegen_only_factory_kernels() -> None:
     # Inductor constant-folds scalar outputs of fallback kernels via
     # .item() (aten::_local_scalar_dense). Fake tensors carry no data, so
     # the true scalar is unknowable in codegen-only mode; return 0 with a
-    # per-call-site warning. A constant folded from fake data is a
+    # warning deduplicated on the calling tensor's (size, dtype). A constant
+    # folded from fake data is a
     # placeholder: a compiled artifact embedding it must not be treated as
     # deployable. TORCH_SPYRE_STRICT_ITEM=1 turns the placeholder into a
     # hard raise (SpyreRuntimeUnavailableError) so pipelines can
