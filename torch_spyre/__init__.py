@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import sys
 import threading
 import types
 import importlib
@@ -22,13 +23,202 @@ from .constants import DEVICE_NAME
 from ._runtime import (
     SpyreRuntimeUnavailableError,
     codegen_only_available,
-    require_runtime,
 )
 
 from . import profiler
 from .raw_copy import raw_copy_from_device, raw_copy_to_device
 
 _runtime_init_lock = threading.Lock()
+
+
+def _install_codegen_only_C() -> types.ModuleType:
+    """Bind torch_spyre._C to the pure-Python module in codegen-only mode.
+
+    An environment that carries both _codegen_backend.so and a built _C.so
+    (mixed build state; see PLAN_COMPILE_ONLY_FLAG.md) must not load _C.so
+    in codegen-only mode: its spyre_mem aten::empty PrivateUse1
+    registrations override the codegen fake kernels, and its
+    @rpath/libc10.dylib dependency fails to dlopen when torch has not been
+    imported first. The pure-Python _C re-exports the fake backend surface
+    when _codegen_backend is importable and keeps runtime-only APIs
+    fail-loud otherwise. The real module executes lazily on first
+    attribute access so the backend resolves against whichever import
+    order the process used.
+    """
+    existing = sys.modules.get("torch_spyre._C")
+    if existing is not None:
+        return existing
+
+    import importlib.util
+
+    placeholder = types.ModuleType("torch_spyre._C")
+    placeholder.__doc__ = (
+        "Lazy alias: executes torch_spyre/_C.py on first attribute access."
+    )
+    placeholder.__file__ = str(Path(__file__).parent / "_C.py")
+
+    def _lazy_exec(name):
+        current = sys.modules.get("torch_spyre._C")
+        if current is not None and current is not placeholder:
+            return getattr(current, name)
+        spec = importlib.util.spec_from_file_location(
+            "torch_spyre._C", Path(__file__).parent / "_C.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["torch_spyre._C"] = module
+        spec.loader.exec_module(module)
+        return getattr(module, name)
+
+    placeholder.__getattr__ = _lazy_exec
+    sys.modules["torch_spyre._C"] = placeholder
+    return placeholder
+
+
+_factory_kernel_lib = None
+
+
+def _register_codegen_only_factory_kernels() -> None:
+    """Register fake-materializing kernels for the aten factory family on
+    PrivateUse1 in codegen-only mode.
+
+    Fake Spyre tensors carry no data (their storage is a 1-byte token), so
+    torch.zeros / torch.ones / torch.full materialize a fake tensor whose
+    contents are undefined — consistent with copy_tensor's no-op semantics.
+    Two registrations matter:
+
+    - zero_ / fill_: the C-level tail of torch.zeros et al. Without a
+      kernel they raise "Could not run aten::fill_".
+    - ones / full / new_ones: registered BEFORE the spyre decompositions
+      load, so register_spyre_decomposition's has-kernel check skips
+      them — otherwise eager torch.ones routes into the compiled
+      spyre.ones_scalar custom op and dies at the launch seam instead
+      of materializing.
+
+    Launching on a fake tensor still fails loudly (launch-ABI seam).
+    """
+    global _factory_kernel_lib
+    if _factory_kernel_lib is not None:
+        return
+    import torch
+
+    _factory_kernel_lib = torch.library.Library("aten", "IMPL", "PrivateUse1")
+
+    def _fill_noop(self, value):
+        return self
+
+    def _zero_noop(self):
+        return self
+
+    def _ones(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+        return torch.ops.aten.empty.memory_format(
+            size,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            pin_memory=pin_memory,
+        )
+
+    def _full(
+        size,
+        fill_value,
+        *,
+        dtype=None,
+        layout=None,
+        device=None,
+        pin_memory=None,
+    ):
+        return torch.ops.aten.empty.memory_format(
+            size,
+            dtype=dtype,
+            layout=layout,
+            device=device,
+            pin_memory=pin_memory,
+        )
+
+    def _new_ones(self, size, *, dtype=None, layout=None, device=None, pin_memory=None):
+        return torch.ops.aten.empty.memory_format(
+            size,
+            dtype=dtype if dtype is not None else self.dtype,
+            layout=layout,
+            device=device if device is not None else self.device,
+            pin_memory=pin_memory,
+        )
+
+    _factory_kernel_lib.impl("fill_.Scalar", _fill_noop)
+    _factory_kernel_lib.impl("fill_.Tensor", _fill_noop)
+    _factory_kernel_lib.impl("zero_", _zero_noop)
+    _factory_kernel_lib.impl("ones", _ones)
+    _factory_kernel_lib.impl("full", _full)
+    _factory_kernel_lib.impl("new_ones", _new_ones)
+
+    # View family — mirrors the full runtime's spyre_views.cpp registration
+    # set (view / _unsafe_view / _reshape_alias / alias / as_strided), which
+    # lives in _C.so and never loads in codegen-only mode. A view of a fake
+    # tensor materializes as a new fake tensor with the requested
+    # sizes/strides and the source's SpyreTensorLayout tag (same
+    # layout-preservation semantics as reinterpret_tensor_with_layout).
+    from torch_spyre import _codegen_backend as _cb
+
+    def _contiguous_strides(size):
+        strides = []
+        acc = 1
+        for dim in reversed(list(size)):
+            strides.append(acc)
+            acc *= max(int(dim), 1)
+        return list(reversed(strides))
+
+    def _fake_view(self, size):
+        return _cb.spyre_empty_with_layout(
+            list(size),
+            _contiguous_strides(size),
+            self.dtype,
+            _cb.get_spyre_tensor_layout(self),
+        )
+
+    def _fake_as_strided(self, size, stride, storage_offset=0):
+        return _cb.spyre_empty_with_layout(
+            list(size),
+            list(stride),
+            self.dtype,
+            _cb.get_spyre_tensor_layout(self),
+        )
+
+    def _fake_alias(self):
+        return _cb.spyre_empty_with_layout(
+            list(self.size()),
+            list(self.stride()),
+            self.dtype,
+            _cb.get_spyre_tensor_layout(self),
+        )
+
+    _factory_kernel_lib.impl("view", _fake_view)
+    _factory_kernel_lib.impl("_unsafe_view", _fake_view)
+    _factory_kernel_lib.impl("_reshape_alias", _fake_as_strided)
+    _factory_kernel_lib.impl("alias", _fake_alias)
+    _factory_kernel_lib.impl("as_strided", _fake_as_strided)
+
+    # Inductor constant-folds scalar outputs of fallback kernels via
+    # .item() (aten::_local_scalar_dense). Fake tensors carry no data, so
+    # the true scalar is unknowable in codegen-only mode; return 0 and warn
+    # ONCE, loudly — a constant folded from fake data is a placeholder, and
+    # a compiled artifact embedding it must not be treated as deployable.
+    import warnings
+
+    _local_scalar_warned = False
+
+    def _local_scalar_dense(self):
+        nonlocal _local_scalar_warned
+        if not _local_scalar_warned:
+            _local_scalar_warned = True
+            warnings.warn(
+                "codegen-only mode: .item() on a fake Spyre tensor returned "
+                "0; constants folded from fake data are placeholders "
+                "(torch_spyre/__init__.py::_local_scalar_dense)",
+                stacklevel=3,
+            )
+        return 0
+
+    _factory_kernel_lib.impl("_local_scalar_dense", _local_scalar_dense)
 
 
 def _activate_spyre_triton_driver() -> None:
@@ -81,29 +271,19 @@ class _SpyreImpl:
         self._lazy_init()
         return super().__getattribute__(name)
 
-    @staticmethod
-    def _load_runtime_stubs():
-        """Compile-only builds ship a _runtime_stubs.dylib defining the
-        unresolved flex/senlib/sendnn/boost symbols so _C.so can load
-        without the real runtime libraries (macOS, no hardware). Its
-        presence is the build-mode marker; regular builds have no such
-        file and this is a no-op."""
-        import ctypes
-
-        stub = Path(__file__).parent / "_runtime_stubs.dylib"
-        if stub.exists():
-            ctypes.CDLL(str(stub), mode=ctypes.RTLD_GLOBAL)
-
     def _lazy_init(self):
         if self._initialized:
             return
-        require_runtime("torch.spyre runtime initialization")
+        # Codegen-only mode: init is admission, not a runtime operation —
+        # proceed so the compile-only branch below (device_count() == 0)
+        # installs the monkey patches and dispatch-key kernels. Runtime-only
+        # APIs (start_runtime, launch_kernel, DMA fill/copy) keep their own
+        # fail-loud seams in torch_spyre._C.
         with _runtime_init_lock:
             if self._initialized:
                 return
             # Load the C++ Module
             # put any light, once-per-process setup here
-            self._load_runtime_stubs()
             self._C = importlib.import_module("torch_spyre._C")
             # Apply pending device index before runtime init
             pending = self._pending_device_idx
@@ -196,11 +376,11 @@ class _SpyreImpl:
         self._in_bad_fork = True
 
 
-# Compile-only builds (see setup.py, TORCH_SPYRE_COMPILE_ONLY=1) need the
-# runtime stub dylib in the process before ANY extension (_C or _hooks)
-# is dlopened. _hooks is imported by _autoload() ahead of _lazy_init(),
-# so preload at package import. No-op for regular builds.
-_SpyreImpl._load_runtime_stubs()
+# Codegen-only mode must resolve torch_spyre._C to the pure-Python module
+# before anything (this package, torch's backend autoload, or a direct
+# `import torch_spyre._C`) can load a built _C.so from a mixed checkout.
+if codegen_only_available():
+    _install_codegen_only_C()
 
 
 def make_spyre_module() -> types.ModuleType:
@@ -323,6 +503,7 @@ def _autoload():
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
     if codegen_only_available():
         import torch_spyre._C  # noqa: F401
+        _register_codegen_only_factory_kernels()
         _activate_spyre_triton_driver()
         from torch_spyre._inductor import _autoload as ts_autoload
         from torch_spyre._inductor import _light_autoload

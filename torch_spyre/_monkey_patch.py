@@ -217,6 +217,7 @@ def _patch_tensor_for_spyre():
 
     def spyre_empty(
         *args,
+        size=None,
         device_layout=None,
         out=None,
         dtype=None,
@@ -226,6 +227,12 @@ def _patch_tensor_for_spyre():
         pin_memory=False,
         memory_format=torch.contiguous_format,
     ):
+        # torch.empty accepts the size as a keyword (transformers' meta
+        # checkpoint loader calls torch.empty(size=..., device="meta"));
+        # normalize it into the positional form the branches below use.
+        if size is not None:
+            args = (size,) + args
+            size = None
         requested_device = _codegen_requested_spyre_device(device)
         if torch.compiler.is_compiling():
             # Dynamo-transparent: the spyre-layout allocation is an eager

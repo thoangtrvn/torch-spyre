@@ -226,6 +226,39 @@ def test_codegen_only_torch_empty_spyre_allocates_fake_tensor():
     assert result.returncode == 0, result.stderr
 
 
+def test_codegen_only_factory_family_materializes_fake_tensors():
+    """zeros/ones/full/empty_strided materialize fake tensors via the
+    PrivateUse1 kernels, and torch_spyre._C resolves to the pure-Python
+    module even when a built _C.so sits next to it (mixed checkout)."""
+    result = _run_codegen_only_script(
+        """
+        import torch
+        import torch_spyre
+
+        torch_spyre._autoload()
+        for y in (
+            torch.zeros((512, 128), device="spyre", dtype=torch.float16),
+            torch.ones((512, 128), device="spyre", dtype=torch.float16),
+            torch.full((512, 128), 1.5, device="spyre", dtype=torch.float16),
+            torch.empty_strided(
+                (512, 128), (128, 1), device="spyre", dtype=torch.float16
+            ),
+        ):
+            assert y.device.type == "spyre"
+            assert y.device.index == 0
+            assert tuple(y.shape) == (512, 128)
+            layout = y.device_tensor_layout()
+            assert layout.device_size == [512, 2, 64]
+            assert layout.stride_map == [128, 64, 1]
+
+        import torch_spyre._C as _C
+
+        assert _C.__file__.endswith("_C.py")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_codegen_only_C_first_import_before_torch():
     """Importing torch_spyre._C before torch must not trigger a circular import.
 
