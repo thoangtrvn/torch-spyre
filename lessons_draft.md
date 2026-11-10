@@ -19,6 +19,12 @@
 **General lesson**: Backend shims that may be imported before torch must not execute `import torch` at module scope — it triggers torch's backend autoload recursively. All torch-dependent initialization must be deferred to first-use functions.
 
 **Affected files**: `torch_spyre/_C.py` (codegen-only branch), `tests/test_codegen_only.py` (new regression test)
+
+---
+
+# Lessons draft — r0-persistent-prediction-drift
+
+DRAFT rows, provisional numbers, renumber on merge (renumber note: these
 rows must be merged into the staging LESSONS_LEDGER with the next free
 L-nnn numbers; the numbers below are placeholders only).
 
