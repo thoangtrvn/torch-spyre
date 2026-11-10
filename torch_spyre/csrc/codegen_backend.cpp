@@ -676,6 +676,9 @@ at::Tensor& spyre_codegen_copy_(at::Tensor& self, const at::Tensor& src,
   // spyre -> spyre and spyre -> cpu both read the source's shadow channel:
   // sound when it exists, loud otherwise (the old implementation silently
   // copied nothing in these directions — silent-wrong class, removed).
+  // Note: an EMPTY channel-less source also refuses, loudly-and-vacuously —
+  // deliberate (uniform refusal surface; nothing in the fold chain copies
+  // empty tensors).
   TORCH_CHECK(
       find_shadow(src) != nullptr,
       "Spyre codegen copy_ (", copy_direction_name(direction),
@@ -841,7 +844,11 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   // consumer chain (scalar_tensor/full -> empty + fill_.Scalar;
   // flatten()[0].item() -> view/as_strided/_local_scalar_dense), implemented
   // with the shadow host-value channel. Anything outside this surface keeps
-  // the dispatcher's loud NotImplementedError.
+  // the dispatcher's loud NotImplementedError — including consumer-reachable
+  // but deliberately excluded paths: pointwise re-execution
+  // (joint_graph.py pointwise branch; the transformers where-pattern bails
+  // to unknown_value on the unknown mask) and aten.view.dtype
+  // (_deduce_value runs it when itemsize matches; kept loud by policy).
   m.impl("fill_.Scalar", TORCH_FN(spyre_codegen_fill_));
   m.impl("view", TORCH_FN(spyre_codegen_view));
   m.impl("as_strided", TORCH_FN(spyre_codegen_as_strided));

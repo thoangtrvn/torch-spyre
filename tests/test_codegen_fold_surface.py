@@ -183,14 +183,14 @@ def test_refusal_outside_derived_set():
         try:
             out.copy_(t)
         except RuntimeError as e:
-            assert "spyre" in str(e).lower(), e
+            assert "no host-side data channel" in str(e), e
         else:
             raise AssertionError("copy_ from a channel-less spyre tensor must fail loudly")
 
         try:
             t.flatten()[0].item()
         except RuntimeError as e:
-            assert "spyre" in str(e).lower(), e
+            assert "no host-side data channel" in str(e), e
         else:
             raise AssertionError("item on a channel-less spyre tensor must fail loudly")
         print("OK")
