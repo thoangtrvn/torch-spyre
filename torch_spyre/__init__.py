@@ -66,7 +66,14 @@ def _install_codegen_only_C() -> types.ModuleType:
         )
         module = importlib.util.module_from_spec(spec)
         sys.modules["torch_spyre._C"] = module
-        spec.loader.exec_module(module)
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            # Restore the placeholder: a half-executed _C.py left in
+            # sys.modules would make later imports "succeed" and fail with
+            # misleading AttributeErrors instead of the original error.
+            sys.modules["torch_spyre._C"] = placeholder
+            raise
         return getattr(module, name)
 
     placeholder.__getattr__ = _lazy_exec
@@ -109,13 +116,22 @@ def _register_codegen_only_factory_kernels() -> None:
     def _zero_noop(self):
         return self
 
-    def _ones(size, *, dtype=None, layout=None, device=None, pin_memory=None):
+    def _ones(
+        size,
+        *,
+        dtype=None,
+        layout=None,
+        device=None,
+        pin_memory=None,
+        memory_format=None,
+    ):
         return torch.ops.aten.empty.memory_format(
             size,
             dtype=dtype,
             layout=layout,
             device=device,
             pin_memory=pin_memory,
+            memory_format=memory_format,
         )
 
     def _full(
@@ -159,23 +175,35 @@ def _register_codegen_only_factory_kernels() -> None:
     # layout-preservation semantics as reinterpret_tensor_with_layout).
     from torch_spyre import _codegen_backend as _cb
 
-    def _contiguous_strides(size):
-        strides = []
-        acc = 1
-        for dim in reversed(list(size)):
-            strides.append(acc)
-            acc *= max(int(dim), 1)
-        return list(reversed(strides))
-
     def _fake_view(self, size):
+        # Derive the view's strides with torch's own view-stride algorithm:
+        # a meta tensor carrying the source's sizes/strides, viewed to the
+        # new size. Fabricating contiguous strides silently diverges from
+        # real view semantics whenever the true result is non-contiguous
+        # (e.g. a size-1-dim insertion on a transposed base). A non-viewable
+        # request raises here, loudly, exactly like the real op.
+        base = torch.empty_strided(
+            tuple(self.size()), tuple(self.stride()), device="meta"
+        )
+        viewed = base.view(size)
         return _cb.spyre_empty_with_layout(
             list(size),
-            _contiguous_strides(size),
+            list(viewed.stride()),
             self.dtype,
             _cb.get_spyre_tensor_layout(self),
         )
 
     def _fake_as_strided(self, size, stride, storage_offset=0):
+        if storage_offset != 0:
+            # Fake tensors carry a 1-byte token, not backing storage — an
+            # offset-aliased view cannot be represented. Fail loudly rather
+            # than fabricate metadata that diverges from the real op.
+            raise RuntimeError(
+                "codegen-only mode: as_strided with a non-zero "
+                "storage_offset is not supported on fake Spyre tensors "
+                "(no backing storage to offset into); the full runtime "
+                "build is required for offset-aliased views"
+            )
         return _cb.spyre_empty_with_layout(
             list(size),
             list(stride),
@@ -199,22 +227,38 @@ def _register_codegen_only_factory_kernels() -> None:
 
     # Inductor constant-folds scalar outputs of fallback kernels via
     # .item() (aten::_local_scalar_dense). Fake tensors carry no data, so
-    # the true scalar is unknowable in codegen-only mode; return 0 and warn
-    # ONCE, loudly — a constant folded from fake data is a placeholder, and
-    # a compiled artifact embedding it must not be treated as deployable.
+    # the true scalar is unknowable in codegen-only mode; return 0 with a
+    # per-call-site warning. A constant folded from fake data is a
+    # placeholder: a compiled artifact embedding it must not be treated as
+    # deployable. TORCH_SPYRE_STRICT_ITEM=1 turns the placeholder into a
+    # hard raise (SpyreRuntimeUnavailableError) so pipelines can
+    # machine-check that no fake constant entered their artifacts.
+    import os
     import warnings
 
-    _local_scalar_warned = False
+    _local_scalar_warned_sites = set()
 
     def _local_scalar_dense(self):
-        nonlocal _local_scalar_warned
-        if not _local_scalar_warned:
-            _local_scalar_warned = True
+        if os.environ.get("TORCH_SPYRE_STRICT_ITEM", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise SpyreRuntimeUnavailableError(
+                ".item() on a fake Spyre tensor (TORCH_SPYRE_STRICT_ITEM=1): "
+                "the true scalar is unknowable in codegen-only mode; a "
+                "constant folded from fake data is a placeholder and a "
+                "compiled artifact embedding it is not deployable"
+            )
+        site = (tuple(self.size()), self.dtype)
+        if site not in _local_scalar_warned_sites:
+            _local_scalar_warned_sites.add(site)
             warnings.warn(
                 "codegen-only mode: .item() on a fake Spyre tensor returned "
                 "0; constants folded from fake data are placeholders "
                 "(torch_spyre/__init__.py::_local_scalar_dense)",
-                stacklevel=3,
+                stacklevel=2,
             )
         return 0
 

@@ -128,7 +128,7 @@ _TRITON_INCOMPATIBLE_LOWERINGS = frozenset({
 
 # Context manager that enables spyre specific lowerings in addition to PyTorch in-tree lowerings
 @contextmanager
-def enable_spyre_lowerings(*, triton_path: bool = False):
+def enable_spyre_lowerings(*, triton_path: bool = True):
     """
     CM that enables Spyre lowerings:
       - Temporarily redirect relevant aten ops → Spyre lowering
@@ -143,6 +143,12 @@ def enable_spyre_lowerings(*, triton_path: bool = False):
             "mean", etc.). These ops are handled by Inductor's standard
             lowerings, which create "dot"/"sum" reduction types that
             TritonKernel can emit as tt.dot/tt.reduce.
+
+            Defaults to True: TritonScheduling is the only registered Spyre
+            backend, and the non-triton branch installs adapters
+            (aten.clamp -> lower_clamp) whose inner_fn demands V.ops.clamp —
+            a handler no live ops class defines. A bare call with the old
+            False default armed exactly that AttributeError.
     """
     global _lowerings_nesting
     with _lowerings_lock:

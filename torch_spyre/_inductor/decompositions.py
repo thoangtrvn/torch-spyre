@@ -352,9 +352,16 @@ def ones_decomp(
     layout: Optional[torch.layout] = None,
     device: Optional[torch.device] = None,
     pin_memory: Optional[bool] = None,
+    memory_format: Optional[torch.memory_format] = None,
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    # Fail loudly rather than silently materialize contiguous strides for a
+    # channels-last request (the expand/clone route below is contiguous-only).
+    assert memory_format in (
+        None,
+        torch.contiguous_format,
+    ), f"doesn't support memory_format={memory_format}"
     scalar = torch.ops.spyre.ones_scalar(device, dtype=dtype)
     return scalar.reshape(()) if not size else scalar.expand(size).clone()
 
@@ -368,9 +375,14 @@ def new_ones_decomp(
     layout: Optional[torch.layout] = None,
     device: Optional[torch.device] = None,
     pin_memory: Optional[bool] = None,
+    memory_format: Optional[torch.memory_format] = None,
 ) -> torch.Tensor:
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
     assert not pin_memory, f"doesn't support pin_memory={pin_memory}"
+    assert memory_format in (
+        None,
+        torch.contiguous_format,
+    ), f"doesn't support memory_format={memory_format}"
     dev = device if device is not None else self.device
     dt = dtype if dtype is not None else self.dtype
     scalar = torch.ops.spyre.ones_scalar(dev, dtype=dt)

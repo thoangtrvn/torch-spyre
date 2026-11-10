@@ -3983,8 +3983,10 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     def test_range_op(self, op, input, min, max, err):
-        # aten::clamp is not registered for Spyre eager dispatch; it uses the
-        # spyre::clamp custom op which only works inside torch.compile
+        # aten::clamp is not registered for Spyre eager dispatch; on the
+        # triton route it goes through Inductor's standard where-based
+        # clamp decomposition (clamp_min/clamp_max use the in-tree
+        # maximum/minimum lowerings)
         self.compare_with_cpu(
             lambda x: op(x, min, max), input, atol=err, rtol=err, run_eager=False
         )
