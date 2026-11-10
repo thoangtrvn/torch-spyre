@@ -17,11 +17,73 @@ import math
 import torch
 
 from torch._inductor.choices import InductorChoices
-from torch._inductor.codegen.triton import FixedTritonConfig
+from torch._inductor.codegen.triton import FixedTritonConfig, TRITON_MAX_BLOCK
 from torch._inductor.scheduler import BaseSchedulerNode, Scheduler
 from torch._inductor.virtualized import V
 
 from torch_spyre._C import get_elem_in_stick
+
+
+class SpyreFixedTritonConfig(FixedTritonConfig):
+    """A FixedTritonConfig that answers EVERY block-size query Inductor makes.
+
+    torch's ``TritonKernel.max_block`` does a raw
+    ``self.fixed_config[f"{prefix.upper()}BLOCK"]`` for ANY range-tree prefix
+    (via ``_has_constant_mask`` -> ``iteration_ranges_codegen_header``, which
+    runs for every tree during kernel construction). The injected key set
+    carries EXACTLY the signature-declared keys (the ASTSource binding
+    invariant documented on ``triton_kernel_kwargs``), so any kernel whose
+    range-tree prefixes exceed the predicted key set died with
+    ``KeyError: 'YBLOCK'`` / ``KeyError: 'R0_BLOCK'`` at codegen time. On CUDA
+    ``fixed_config is None`` (autotune) and ``max_block`` falls back to
+    ``TRITON_MAX_BLOCK`` — this class restores that same fallback on the
+    QUERY side only: an undeclared ``<PREFIX>BLOCK`` key resolves to torch's
+    own ``TRITON_MAX_BLOCK[prefix]`` (the exact value the CUDA path returns),
+    everything else KeyErrors as before.
+
+    Deliberately NOT a key-set change. Everything the config channel
+    introspects is untouched:
+
+    - ``.config`` (the dict) is byte-identical, so the runtime channel —
+      codegen emits ``config={self.fixed_config.config!r}`` as a plain dict
+      literal — and the autotune cache key derived from it are unchanged.
+    - ``__eq__`` compares by ``.config`` against ANY FixedTritonConfig
+      (subclass or plain), which is exactly the plain class's semantics for
+      plain-on-plain pairs; the inherited dataclass ``__eq__`` would compare
+      ``other.__class__ is self.__class__`` and make a wrapped config
+      compare UNEQUAL to a plain config with the same dict — a silent
+      cache-hit surface change. The class stays unhashable, like the plain
+      dataclass (eq without frozen).
+    - ``__contains__`` stays exact-key: the ``_has_constant_mask``
+      ``f"...BLOCK" in self.fixed_config`` short-circuit and the
+      exactly-declared-keys binding invariant are preserved. The fallback is
+      a property of the query side, not of the key set.
+
+    Boundary: keys that do not name a ``TRITON_MAX_BLOCK`` prefix (e.g.
+    ``"RSPLIT"``, read by ``max_rsplit`` on cooperative reductions) still
+    raise ``KeyError`` — mirroring ``TRITON_MAX_BLOCK`` there would need
+    ``TRITON_MAX_RSPLIT`` semantics this lane does not own.
+    """
+
+    def __getitem__(self, item):
+        try:
+            return self.config[item]
+        except KeyError:
+            prefix = item.removesuffix("BLOCK")
+            if prefix != item and prefix in TRITON_MAX_BLOCK:
+                return TRITON_MAX_BLOCK[prefix]
+            raise
+
+    def __eq__(self, other):
+        # The dataclass-generated __eq__ compares other.__class__ is
+        # self.__class__, which would make this subclass compare UNEQUAL to
+        # a plain FixedTritonConfig carrying the same dict. Compare by
+        # .config against any FixedTritonConfig so the equality surface is
+        # identical to the all-plain world (defining __eq__ also leaves this
+        # class unhashable, matching the plain dataclass).
+        if isinstance(other, FixedTritonConfig):
+            return self.config == other.config
+        return NotImplemented
 
 
 class SpyreHeuristics(InductorChoices):
@@ -180,9 +242,11 @@ class SpyreHeuristics(InductorChoices):
           unconditionally was the #193 'R0_BLOCK' is not in list break.
         - Pointwise: XBLOCK only. Always blocked in x → XBLOCK always declared.
         """
-        is_matmul = (features.is_reduction()
-                     and hasattr(features, 'contains_op')
-                     and features.contains_op("dot"))
+        is_matmul = (
+            features.is_reduction()
+            and hasattr(features, "contains_op")
+            and features.contains_op("dot")
+        )
         is_reduction = features.is_reduction()
 
         # Stick-aligned block sizes. Elements per stick is dtype-dependent
@@ -245,7 +309,8 @@ class SpyreHeuristics(InductorChoices):
             n_val = _resolve_dim("x") or 0
             problem_dims = {"M": m_val, "K": k_val, "N": n_val}
             persistent = self.should_use_persistent_reduction(
-                features, cooperative_reduction=False)
+                features, cooperative_reduction=False
+            )
             block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
             if not persistent:
                 block_config["R0_BLOCK"] = tile_k
@@ -276,7 +341,7 @@ class SpyreHeuristics(InductorChoices):
                 # torch/_inductor/codegen/triton.py's iteration_ranges (the
                 # same comparison the fixed_config key-set must match).
                 block_config["ZBLOCK"] = 1
-            kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
+            kernel_kwargs["fixed_config"] = SpyreFixedTritonConfig(block_config)
 
         elif is_reduction:
             # Reduction: XBLOCK always; R0_BLOCK ONLY for looped (non-persistent) kernels.
@@ -297,11 +362,12 @@ class SpyreHeuristics(InductorChoices):
             problem_dims = {"X": x_val, "R0": r0_val}
 
             persistent = self.should_use_persistent_reduction(
-                features, cooperative_reduction=False)
+                features, cooperative_reduction=False
+            )
             block_config = {"XBLOCK": elements_per_stick}
             if not persistent:
                 block_config["R0_BLOCK"] = elements_per_stick
-            kernel_kwargs["fixed_config"] = FixedTritonConfig(block_config)
+            kernel_kwargs["fixed_config"] = SpyreFixedTritonConfig(block_config)
 
         else:
             # Pointwise: XBLOCK only, stick-aligned
@@ -332,9 +398,11 @@ class SpyreHeuristics(InductorChoices):
                 # 1D grid: recover the true 2D (M, N) from the output buffer layout.
                 true_m, true_n = self._recover_pointwise_shape(features, x_val)
                 n_val = elements_per_stick
-                if (true_n is not None
-                        and true_n % elements_per_stick != 0
-                        and true_m > 1):
+                if (
+                    true_n is not None
+                    and true_n % elements_per_stick != 0
+                    and true_m > 1
+                ):
                     # Ragged N with M>1: flatten over the ROW-PADDED physical stick
                     # count so the kernel writes M*ceil(N/64) sticks (== the device
                     # tensor), not the flat ceil(M*N/64). This is the ONLY case that
@@ -362,13 +430,16 @@ class SpyreHeuristics(InductorChoices):
             # tiling dict (the scheduled range trees), not a shape guess, so
             # it cannot drift from the generated signature. Values are
             # stick-aligned; block >= dim is masked, same as XBLOCK.
+            # Wrapped in SpyreFixedTritonConfig (fixed-config-fallback lane):
+            # query-side TRITON_MAX_BLOCK fallback for any undeclared
+            # <PREFIX>BLOCK, .config byte-identical to the plain class.
             pointwise_block_config = {"XBLOCK": elements_per_stick}
             if "y" in tiling:
                 pointwise_block_config["YBLOCK"] = elements_per_stick
             if "z" in tiling:
                 # Inductor's own policy: the batch dimension stays unblocked.
                 pointwise_block_config["ZBLOCK"] = 1
-            kernel_kwargs["fixed_config"] = FixedTritonConfig(
+            kernel_kwargs["fixed_config"] = SpyreFixedTritonConfig(
                 pointwise_block_config
             )
 
@@ -383,7 +454,9 @@ class SpyreHeuristics(InductorChoices):
         # A monkey-patch on _create_compile_options (in __init__.py _autoload)
         # copies Spyre-recognized keys from cfg.kwargs into the options dict,
         # so backend.parse_options() receives them.
-        config_dict = kernel_kwargs.get("fixed_config", FixedTritonConfig({})).config.copy()
+        config_dict = kernel_kwargs.get(
+            "fixed_config", FixedTritonConfig({})
+        ).config.copy()
         if problem_dims and tiling:
             m = problem_dims.get("M", 0)
             n = problem_dims.get("N", 0)
@@ -456,11 +529,9 @@ class SpyreHeuristics(InductorChoices):
                 )
             resolve_descriptor_unary_normal_route_authority(
                 route_request["_descriptor_normal_route_request_operation"],
-                route_request[
-                    "_descriptor_normal_route_request_authority_fingerprint"
-                ],
+                route_request["_descriptor_normal_route_request_authority_fingerprint"],
             )
             config_dict.update(route_request)
-        kernel_kwargs["fixed_config"] = FixedTritonConfig(config_dict)
+        kernel_kwargs["fixed_config"] = SpyreFixedTritonConfig(config_dict)
 
         return kernel_kwargs
