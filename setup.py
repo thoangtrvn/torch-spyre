@@ -89,21 +89,11 @@ INCLUDE_DIRS = [
 ]
 LIBRARY_DIRS = []
 
-# Kernel-generation-only build (e.g. macOS, no Spyre hardware or flex/sendnn
-# runtimes available): compile against the flex/sendnn *headers* but skip
-# linking the runtime shared libraries. The C++ extension bundles are linked
-# with undefined symbols allowed (macOS: -undefined dynamic_lookup; Linux:
-# GNU ld permits undefined symbols in shared objects by default), so the
-# extension loads as long as no runtime code path (allocator, streams,
-# start_runtime, kernel launch) is executed. Kernel generation —
-# torch.compile through the inductor/triton-spyre/codegen path — never calls
-# into flex/sendnn. Set TORCH_SPYRE_COMPILE_ONLY=1 to enable.
-COMPILE_ONLY_BUILD = os.environ.get("TORCH_SPYRE_COMPILE_ONLY", "0") == "1"
-
-if COMPILE_ONLY_BUILD:
-    LIBRARIES = []
-else:
-    LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+# The link-deferred "compile-only" build flavor (TORCH_SPYRE_COMPILE_ONLY,
+# stub-dylib emission) is RETIRED: kernel-generation-only environments use
+# the codegen-only build (TORCH_SPYRE_CODEGEN_ONLY), which ships
+# _codegen_backend.so + the pure-Python _C and never links the runtime.
+LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
 
 if not CODEGEN_ONLY:
     INCLUDE_DIRS += [maybe_download_nlohmann_json()]
@@ -148,23 +138,6 @@ EXTRA_CXX_FLAGS = ["-g", "-Wall", "-Wno-deprecated", "-std=c++17"]
 if NO_OPT_BUILD:
     EXTRA_CXX_FLAGS += ["-O0"]
 
-if COMPILE_ONLY_BUILD:
-    # Compile-only conveniences: the flex/senlib headers require C++20
-    # (std::span), senlib's hal/platform.hpp has no __aarch64__ branch
-    # (map to the host little-endian X86 path — the macro is only consumed
-    # by senlib .cpp files that are not compiled here), and
-    # boost/stacktrace.hpp demands _GNU_SOURCE on Linux (macOS provides
-    # _Unwind_Backtrace without it).
-    EXTRA_CXX_FLAGS += [
-        "-std=c++20",
-        "-DTORCH_SPYRE_COMPILE_ONLY",
-        "-DSENLIB_X86_SUPPORT=1",
-        "-DBOOST_STACKTRACE_GNU_SOURCE_NOT_REQUIRED",
-        # glibc's off64_t (sendnn/tensor/sentensor.hpp file offsets) does not
-        # exist on macOS; off_t is already 64-bit there.
-        "-Doff64_t=off_t",
-    ]
-
 
 class clean(Command):
     def initialize_options(self):
@@ -185,142 +158,6 @@ class clean(Command):
             if path.exists():
                 shutil.rmtree(str(path), ignore_errors=True)
 
-
-def _build_runtime_stub_dylib():
-    """Compile-only builds: emit a stub dylib for the unresolved runtime
-    (flex/senlib/sendnn/boost) symbols referenced by _C.so/_hooks.so.
-
-    dlopen() eagerly binds data/vtable symbols even though the extensions
-    are linked with -undefined dynamic_lookup, so the extension cannot load
-    unless every unresolved runtime symbol is defined somewhere. The stub
-    defines them: functions as plain ``ret`` (module-init static
-    initializers may call a few and must survive; returning garbage is fine
-    because compile-only builds never execute runtime paths), vtables/RTTI
-    as zeroed data, and flex::getNumDevices as "return 0" so device_count()
-    honestly reports no devices instead of garbage.
-
-    The loader side (torch_spyre/__init__.py) dlopens this dylib
-    RTLD_GLOBAL before importing _C whenever it is present.
-    """
-    import subprocess  # noqa: PLC0415
-
-    build_lib = ROOT_DIR / "build"
-    exts = list(build_lib.glob("lib.*/torch_spyre/_C.so"))
-    if not exts:
-        return
-    pkg_dir = exts[0].parent
-
-    # `dyld_info -imports` is the authoritative list of everything dyld
-    # must resolve at load time — unlike nm/otool it includes symbols
-    # referenced only through chained fixups (e.g. vtables), which are
-    # exactly the ones that fail eagerly at dlopen. Names are already in
-    # full dyld form (C++ mangled names carry the extra leading
-    # underscore on macOS, e.g. __ZN4flex...).
-    syms: set[str] = set()
-    for so in [pkg_dir / "_C.so", pkg_dir / "_hooks.so"]:
-        if not so.exists():
-            continue
-        dyld_info = subprocess.run(
-            ["dyld_info", "-imports", str(so)],
-            capture_output=True, text=True, check=True,
-        )
-        for line in dyld_info.stdout.splitlines():
-            tok = line.split()
-            if len(tok) >= 2 and tok[1] == "(from" and tok[0].startswith("__Z"):
-                syms.add(tok[0])
-
-    # Only stub the runtime namespaces — torch/python/libc++ symbols resolve
-    # from the host process.
-    runtime_ns = ("flex", "senlib", "deeptools", "data_conversion_info",
-                  "boost", "moodycamel", "sendnn", "EnumsConversion", "Sen")
-    stub_syms = sorted(
-        s for s in syms
-        if s.startswith("__Z") and any(
-            f"{len(ns)}{ns}" in s for ns in runtime_ns
-        )
-    )
-    if not stub_syms:
-        return
-
-    lines = [".section __TEXT,__text", ".globl ___stub_marker",
-             "___stub_marker: ret"]
-    cpp_syms = {"__ZN4flex13getNumDevicesEv", "__ZN9deeptools14FloatToFp16BinEf"}
-    for s in stub_syms:
-        if s in cpp_syms:
-            continue  # real implementations live in runtime_stubs.cpp
-        lines.append(f".globl {s}")
-        lines.append(f"{s}:")
-        if s.startswith("__ZTV") or s.startswith("__ZTI") or s.startswith("__ZTS"):
-            lines.append("    .quad 0, 0, 0, 0")
-        else:
-            lines.append("    ret")
-    asm = build_lib / "runtime_stubs.s"
-    asm.write_text("\n".join(lines) + "\n")
-
-    # Real implementations for the stub symbols that must behave correctly
-    # even in compile-only builds. FloatToFp16Bin is ported verbatim from
-    # deeptools/util/sen_data_convert.cpp (DL16 1-6-9 encoding): it feeds
-    # encode_constant(), which lands in generated device binaries — a ret
-    # stub there would silently corrupt constants.
-    cpp = build_lib / "runtime_stubs.cpp"
-    cpp.write_text(
-        """#include <cstdint>
-#include <cstddef>
-
-namespace flex {
-int getNumDevices() { return 0; }  // compile-only: honestly no devices
-}
-
-namespace deeptools {
-static inline uint16_t FloatToFp16BinInternal(float f) {
-  uint32_t f32;
-  {  // BinaryConvert<uint32_t>: bit-level float->uint32
-    __builtin_memcpy(&f32, &f, 4);
-  }
-  int32_t exponent = ((f32 >> 23) & 0xFF) - 127;
-  uint32_t fraction = f32 & 0x7FFFFF;
-  // fp32: 1 (sign) + 8 (exp) + 23 (fra) -> sentient fp16: 1 + 6 + 9
-
-  uint32_t rounding = 0;
-  if (((fraction >> (23 - 9 - 1)) & 1) && ((fraction >> (23 - 9)) != 0x1FF)) {
-    rounding = 1;
-  }
-  fraction = (fraction >> (23 - 9)) + rounding;
-  uint32_t f16;
-  if (exponent > 31) {
-    f16 = (f32 >> 16) | 0x7FFF;  // INF with sign bit
-
-    // Typical DL use-case is mask operation where saturating does not
-    // impact accuracy and avoids potential NaN values during computation
-    if (f < 0) {
-      // for large negative values, cap saturation at 0xEFFF
-      f16 = f16 & 0xEFFF;
-    } else {
-      // for large positive values, cap saturation at 0x6FFF
-      f16 = f16 & 0x6FFF;
-    }
-  } else if (exponent < -30) {
-    f16 = (f32 >> 16) & 0x8000;  // Zero with sign bit
-  } else {
-    f16 = ((f32 >> 16) & 0x8000) |
-          static_cast<uint32_t>(exponent + 31) << 9u | fraction;
-  }
-  return uint16_t(f16);
-}
-
-uint16_t FloatToFp16Bin(float f) { return FloatToFp16BinInternal(f); }
-}  // namespace deeptools
-"""
-    )
-
-    out = pkg_dir / "_runtime_stubs.dylib"
-    subprocess.run(
-        ["clang++", "-arch", "arm64", "-shared", "-std=c++17",
-         str(cpp), str(asm), "-o", str(out)],
-        check=True,
-    )
-    print(f"compile-only build: wrote runtime stub dylib ({len(stub_syms)} symbols) "
-          f"-> {out}")
 
 
 if __name__ == "__main__":
@@ -437,8 +274,6 @@ if __name__ == "__main__":
 
             def run(self):
                 super().run()
-                if COMPILE_ONLY_BUILD:
-                    _build_runtime_stub_dylib()
 
         setup(
             ext_modules=ext_modules,
