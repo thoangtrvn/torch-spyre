@@ -36,9 +36,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -424,8 +426,84 @@ struct SpyreCodegenGuardImpl final : public c10::impl::DeviceGuardImplInterface 
 
 C10_REGISTER_GUARD_IMPL(PrivateUse1, SpyreCodegenGuardImpl);
 
+// ---------------------------------------------------------------------------
+// Fold-surface shadow host-value channel.
+//
+// Storage truth: a codegen-only Spyre tensor has NO device bytes — the DataPtr
+// is a malloc(1) token (see make_fake_data_ptr below) and the full-runtime DMA
+// machinery (spyre_storage_impl / spyre_stream / spyre_mem) is not linked into
+// _codegen_backend. Inductor's eager-evaluation passes
+// (torch/_inductor/fx_passes/joint_graph.py::constant_fold_uniform_value) only
+// ever need the HOST value of scalars they themselves constructed (fill_ /
+// copy_ from a CPU source), so the fold surface keeps a side table mapping the
+// fake-storage token -> CPU shadow tensor holding the real values. The token's
+// lifetime equals the storage's, and delete_fake_allocation erases the entry,
+// so entries cannot outlive their tensor and freed-token address reuse cannot
+// produce stale hits. Ops outside the derived fold surface keep failing
+// loudly, and fold-surface ops on a tensor with no shadow channel refuse
+// loudly rather than fabricate values.
+// ---------------------------------------------------------------------------
+
+std::mutex& shadow_registry_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+// Leaky singleton: avoids static-destruction-order hazards against torch's
+// allocator teardown (registry entries hold at::Tensor refcounts).
+std::unordered_map<void*, at::Tensor>* shadow_registry() {
+  static auto* registry = new std::unordered_map<void*, at::Tensor>();
+  return registry;
+}
+
 void delete_fake_allocation(void* ptr) {
+  if (ptr != nullptr) {
+    std::lock_guard<std::mutex> lock(shadow_registry_mutex());
+    shadow_registry()->erase(ptr);
+  }
   std::free(ptr);
+}
+
+// Key by the STORAGE token (not tensor data_ptr, which includes the storage
+// offset): a tensor and its storage share one token. nullptr tokens belong to
+// zero-byte storages, which carry no elements and therefore no shadow.
+void* shadow_key(const at::Tensor& tensor) {
+  return tensor.storage().data_ptr().get();
+}
+
+const at::Tensor* find_shadow(const at::Tensor& tensor) {
+  void* key = shadow_key(tensor);
+  if (key == nullptr) {
+    return nullptr;
+  }
+  std::lock_guard<std::mutex> lock(shadow_registry_mutex());
+  const auto it = shadow_registry()->find(key);
+  return it == shadow_registry()->end() ? nullptr : &it->second;
+}
+
+void set_shadow(const at::Tensor& tensor, at::Tensor shadow) {
+  TORCH_CHECK(!shadow.is_privateuseone(),
+              "internal error: shadow channel values must be host tensors");
+  void* key = shadow_key(tensor);
+  if (key == nullptr) {
+    TORCH_CHECK(shadow.numel() == 0,
+                "internal error: non-empty shadow for a zero-byte Spyre "
+                "codegen storage");
+    return;
+  }
+  std::lock_guard<std::mutex> lock(shadow_registry_mutex());
+  (*shadow_registry())[key] = std::move(shadow);
+}
+
+// Loud refusal shared by every fold-surface op that needs values.
+void require_shadow(const at::Tensor& tensor, const char* op_name) {
+  TORCH_CHECK(
+      find_shadow(tensor) != nullptr,
+      "aten::", op_name,
+      " on a Spyre codegen tensor with no host-side data channel: this "
+      "tensor's values were never produced on the host (no fill_/copy_ from "
+      "a host source), and codegen-only Spyre tensors carry no device bytes. "
+      "Refusing loudly instead of returning a fabricated value.");
 }
 
 c10::DataPtr make_fake_data_ptr(size_t logical_nbytes, c10::Device device) {
@@ -553,15 +631,135 @@ at::Tensor& spyre_codegen_set_storage(at::Tensor& result, at::Storage storage,
   return result;
 }
 
+// Fold-surface copy_ directions. The previous implementation was a silent
+// no-op in every direction (a silent-wrong member of the surface); each
+// direction now either moves real (shadow) data or refuses loudly.
+enum class CopyDirection { IntoSpyre, OutOfSpyre, SpyreToSpyre };
+
+const char* copy_direction_name(CopyDirection direction) {
+  switch (direction) {
+    case CopyDirection::IntoSpyre:
+      return "cpu -> spyre";
+    case CopyDirection::OutOfSpyre:
+      return "spyre -> cpu";
+    case CopyDirection::SpyreToSpyre:
+      return "spyre -> spyre";
+  }
+  TORCH_CHECK(false, "unreachable CopyDirection");
+}
+
 at::Tensor& spyre_codegen_copy_(at::Tensor& self, const at::Tensor& src,
                                 bool non_blocking) {
-  TORCH_CHECK(self.is_privateuseone(),
-              "Spyre codegen copy_ expects a Spyre destination tensor");
+  TORCH_CHECK(self.is_privateuseone() || src.is_privateuseone(),
+              "Spyre codegen copy_ expects at least one Spyre tensor");
   TORCH_CHECK(self.scalar_type() == src.scalar_type(),
               "Spyre codegen copy_ does not perform dtype conversion");
   TORCH_CHECK(self.sizes() == src.sizes(),
               "Spyre codegen copy_ expects matching logical sizes");
+
+  const auto direction = self.is_privateuseone()
+                             ? (src.is_privateuseone()
+                                    ? CopyDirection::SpyreToSpyre
+                                    : CopyDirection::IntoSpyre)
+                             : CopyDirection::OutOfSpyre;
+
+  if (direction == CopyDirection::IntoSpyre) {
+    // cpu -> spyre: snapshot the source into this tensor's CPU shadow.
+    // Snapshot (not a reference): honest copy_ semantics, exact round-trip.
+    auto shadow =
+        at::empty_strided(self.sizes(), self.strides(), src.options());
+    shadow.copy_(src);
+    set_shadow(self, std::move(shadow));
+    return self;
+  }
+
+  // spyre -> spyre and spyre -> cpu both read the source's shadow channel:
+  // sound when it exists, loud otherwise (the old implementation silently
+  // copied nothing in these directions — silent-wrong class, removed).
+  TORCH_CHECK(
+      find_shadow(src) != nullptr,
+      "Spyre codegen copy_ (", copy_direction_name(direction),
+      "): the source tensor has no host-side data channel (its values were "
+      "never produced on the host), and codegen-only Spyre tensors carry no "
+      "device bytes. Refusing loudly instead of silently copying nothing.");
+  if (direction == CopyDirection::SpyreToSpyre) {
+    // src.options() carries the spyre device — force CPU or the "shadow"
+    // would itself be a spyre tensor (and its fake storage's destruction
+    // inside registry erase would deadlock the registry mutex).
+    auto shadow = at::empty_strided(self.sizes(), self.strides(),
+                                    src.options().device(c10::kCPU));
+    shadow.copy_(*find_shadow(src));
+    set_shadow(self, std::move(shadow));
+  } else {
+    self.copy_(*find_shadow(src));
+  }
   return self;
+}
+
+at::Tensor& spyre_codegen_fill_(at::Tensor& self, const c10::Scalar& value) {
+  // Constructor path of the fold (aten.full / aten.scalar_tensor decompose to
+  // empty + fill_): the value is known on the host at fold time, so it seeds
+  // this tensor's CPU shadow.
+  auto shadow = at::empty_strided(self.sizes(), self.strides(),
+                                  self.options().device(c10::kCPU));
+  shadow.fill_(value);
+  set_shadow(self, std::move(shadow));
+  return self;
+}
+
+// Materialize a shadow for a fold-surface view op. The spyre output gets a
+// FRESH storage (storage_offset 0), so the shadow must be rebased to offset 0
+// with identical sizes/strides — otherwise downstream composites (e.g.
+// select's as_strided, which computes offsets from the SPYRE tensor's
+// storage_offset) would apply offsets in the wrong coordinate system. This
+// makes view/as_strided value-correct but NOT aliasing-correct (a copy): no
+// consumer in the derived fold chain mutates through a view (the fold only
+// reads), and aliasing semantics on channel-less codegen tensors were
+// already impossible.
+at::Tensor rebased_shadow(const at::Tensor& base_shadow,
+                          c10::IntArrayRef size, c10::IntArrayRef stride,
+                          int64_t offset) {
+  auto shadow = at::empty_strided(
+      size, stride, base_shadow.options().device(c10::kCPU));
+  shadow.copy_(base_shadow.as_strided(size, stride, offset));
+  return shadow;
+}
+
+at::Tensor spyre_codegen_view(const at::Tensor& self,
+                              c10::IntArrayRef size) {
+  // add_node_replacement chain: tensor.flatten()[0].item() -> flatten ->
+  // reshape -> view. The CPU shadow enforces real ATen view semantics
+  // (compatibility, computed strides).
+  require_shadow(self, "view");
+  auto shadow_view = find_shadow(self)->view(size);
+  const auto out_strides = shadow_view.strides();
+  auto out = make_fake_spyre_tensor(size, out_strides, self.scalar_type(),
+                                    self.device());
+  set_shadow(out, rebased_shadow(*find_shadow(self), size, out_strides,
+                                 /*offset=*/0));
+  return out;
+}
+
+at::Tensor spyre_codegen_as_strided(const at::Tensor& self,
+                                    c10::IntArrayRef size,
+                                    c10::IntArrayRef stride,
+                                    std::optional<int64_t> storage_offset) {
+  // [0] / select path of the fold chain (select decomposes to as_strided).
+  // The storage_offset argument is absolute w.r.t. the spyre tensor's
+  // storage; the shadow applies it against the input's shadow, then rebases.
+  require_shadow(self, "as_strided");
+  const int64_t offset = storage_offset.value_or(0);
+  auto out = make_fake_spyre_tensor(size, stride, self.scalar_type(),
+                                    self.device());
+  set_shadow(out,
+             rebased_shadow(*find_shadow(self), size, stride, offset));
+  return out;
+}
+
+c10::Scalar spyre_codegen_local_scalar_dense(const at::Tensor& self) {
+  // .item() on a Spyre codegen tensor: read the shadow channel.
+  require_shadow(self, "_local_scalar_dense");
+  return find_shadow(self)->item();
 }
 
 SpyreTensorLayout get_spyre_tensor_layout(const at::Tensor& tensor) {
@@ -638,6 +836,16 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
   m.impl("copy_", TORCH_FN(spyre_codegen_copy_));
   m.impl("set_.source_Storage_storage_offset",
          TORCH_FN(spyre_codegen_set_storage));
+  // Fold surface: the aten ops Inductor's eager-evaluation passes
+  // (constant_fold_uniform_value) reach on device tensors. Derived from the
+  // consumer chain (scalar_tensor/full -> empty + fill_.Scalar;
+  // flatten()[0].item() -> view/as_strided/_local_scalar_dense), implemented
+  // with the shadow host-value channel. Anything outside this surface keeps
+  // the dispatcher's loud NotImplementedError.
+  m.impl("fill_.Scalar", TORCH_FN(spyre_codegen_fill_));
+  m.impl("view", TORCH_FN(spyre_codegen_view));
+  m.impl("as_strided", TORCH_FN(spyre_codegen_as_strided));
+  m.impl("_local_scalar_dense", TORCH_FN(spyre_codegen_local_scalar_dense));
 }
 
 }  // namespace
