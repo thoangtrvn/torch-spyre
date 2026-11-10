@@ -27,7 +27,7 @@ from typing import Any, Callable, Union
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import SpyreReduction
-from torch._inductor.virtualized import V
+from torch._inductor.virtualized import V, ops as inductor_ops
 import threading
 from .logging_utils import get_inductor_logger
 import logging
@@ -480,11 +480,30 @@ def lower_clamp(x, min=None, max=None):
         min = torch.finfo(torch.float16).min
     if max is None:
         max = torch.finfo(torch.float16).max
+    # Emit the loop body as a min/max composition, NOT ops.clamp: no clamp
+    # printer exists anywhere in the Inductor handler chain (stock torch
+    # decomposes clamp to min/max and never prints it), so an ops.clamp
+    # emission dies at codegen with
+    #   AttributeError: 'TritonKernelOverrides' object has no attribute 'clamp'
+    # (vLLM compile-gap wall #3). The composition mirrors torch's own
+    # in-tree clamp lowering (torch/_inductor/lowering.py::clamp, via
+    # promote_constants -> ExpandView(ir.Constant)) exactly; the fp16-bounds
+    # fill above already happened at lowering time, so the semantics are
+    # unchanged.
+    min_node = ir.ExpandView.create(
+        ir.Constant(value=min, dtype=x.get_dtype(), device=x.get_device()),
+        list(x.get_size()),
+    )
+    max_node = ir.ExpandView.create(
+        ir.Constant(value=max, dtype=x.get_dtype(), device=x.get_device()),
+        list(x.get_size()),
+    )
     pw = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
-        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.clamp.__name__)(
-            x.make_loader()(index), min, max
+        inner_fn=lambda index: inductor_ops.maximum(
+            min_node.make_loader()(index),
+            inductor_ops.minimum(max_node.make_loader()(index), x.make_loader()(index)),
         ),
         ranges=x.get_size(),
         origin_node=x.get_origin_node(),
