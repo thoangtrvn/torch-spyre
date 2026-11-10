@@ -290,6 +290,9 @@ class _StubFeatures:
         return None
 
     reduction_numel = sympy.Integer(4096)
+    # numel: read by _kernel_persistent_reduction's cooperative-resolution
+    # leg (same SIMDKernelFeatures surface the real kernel provides).
+    numel = sympy.Integer(96 * 64)
 
 
 class _DotFeatures(_StubFeatures):
@@ -313,9 +316,18 @@ def _fixed_config_keys(features, tiling):
     class _VProxy(virtualized._V):
         @property
         def graph(self):
-            return SimpleNamespace(sizevars=SimpleNamespace(
-                statically_known_int=lambda v: int(v),
-                statically_known_leq=lambda a, b: int(a) <= int(b)))
+            # get_current_device_or_throw: read by
+            # _kernel_persistent_reduction's cooperative-resolution leg (the
+            # same V.graph API TritonKernel.should_use_cooperative_reduction
+            # reads at init). cpu => torch's heuristic returns False (no
+            # cooperative reduction), the correct stub semantic.
+            import torch
+
+            return SimpleNamespace(
+                sizevars=SimpleNamespace(
+                    statically_known_int=lambda v: int(v),
+                    statically_known_leq=lambda a, b: int(a) <= int(b)),
+                get_current_device_or_throw=lambda: torch.device("cpu"))
 
     original_cls = virtualized.V.__class__
     virtualized.V.__class__ = _VProxy

@@ -145,6 +145,44 @@ class SpyreHeuristics(InductorChoices):
     ) -> bool:
         return False
 
+    def _kernel_persistent_reduction(self, features, kernel_kwargs):
+        """The CONSTRUCTED kernel's own loop/persistent decision, evaluated at
+        hook time from the same inputs ``SIMDKernel.__init__`` resolves
+        (torch/_inductor/codegen/simd.py): ``override_persistent_reduction``
+        from kernel_kwargs wins; otherwise ``inside_reduction and
+        should_use_persistent_reduction(features, cooperative_reduction)``
+        with the kernel's cooperative_reduction
+        (``override_cooperative_reduction`` if set, else
+        ``should_use_cooperative_reduction(device, numel, reduction_numel)``).
+
+        Why the override must be honored (executed witness: dynamic masked-sum
+        pooling, reduction_numel s20): torch's
+        ``TritonScheduling.create_kernel_choices`` calls
+        ``TritonKernel.apply_feature_required_overrides`` BEFORE this hook,
+        and that call FORCES ``override_persistent_reduction=False`` whenever
+        ``TritonKernel.has_persistent_RBLOCK(reduction_numel)`` fails — which
+        it does for dynamic reduction extents with no static upper bound at
+        that point (s20 bounds were [2, int_oo] at override time). The kernel
+        is then LOOPED no matter what the heuristics predict. Calling
+        ``should_use_persistent_reduction`` directly here can disagree with
+        that (our own dim resolution specializes the symbol afterwards, so
+        the heuristic then says persistent) — a prediction that can disagree
+        with the codegen it predicts is a defect, not a tuning knob.
+        """
+        override = kernel_kwargs.get("override_persistent_reduction")
+        if override is not None:
+            return bool(override)
+        cooperative = kernel_kwargs.get("override_cooperative_reduction")
+        if cooperative is None:
+            cooperative = features.is_reduction() and self.should_use_cooperative_reduction(
+                V.graph.get_current_device_or_throw(),
+                features.numel,
+                features.reduction_numel,
+            )
+        return features.is_reduction() and self.should_use_persistent_reduction(
+            features, cooperative
+        )
+
     def triton_kernel_kwargs(self, kernel_cls, features, groups, kernel_kwargs):
         """Override TritonKernel block sizes and capture problem dimensions.
 
@@ -162,9 +200,16 @@ class SpyreHeuristics(InductorChoices):
         the kernel does not declare raises `ValueError: '<KEY>' is not in list` (and a
         missing required key would leave the block size unset). The concrete kernel does
         not exist at this hook (kernel_cls is the CLASS, not an instance), so we cannot
-        read the signature directly — instead we predict the declared keys using
-        Inductor's OWN kernel-shape decision functions, which are the same calls that
-        determine the signature downstream (so they cannot drift from it).
+        read the signature directly — instead we derive the declared keys from the SAME
+        inputs the constructed kernel resolves its loop/persistent decision from
+        (`_kernel_persistent_reduction`: torch's `override_persistent_reduction` /
+        `override_cooperative_reduction` kernel_kwargs, set by
+        `apply_feature_required_overrides` BEFORE this hook, then the heuristic
+        chain `SIMDKernel.__init__` itself runs). Calling the heuristic directly
+        with `cooperative_reduction=False` is NOT sufficient: the pre-hook
+        override can force the kernel looped for dynamic reduction extents that
+        `should_use_persistent_reduction` would call persistent (executed
+        witness: dynamic masked-sum pooling — see `_kernel_persistent_reduction`).
 
         Kernel types and the block keys their signature declares:
         - Matmul (tl.dot): YBLOCK/XBLOCK always; R0_BLOCK only when NOT persistent
@@ -175,9 +220,9 @@ class SpyreHeuristics(InductorChoices):
           crashed ast_to_ttir on `tl.program_id(0) * ZBLOCK`.
         - Reduction: XBLOCK always; R0_BLOCK ONLY when NOT persistent. A persistent
           reduction (reduction extent fits one block) bakes R0_BLOCK as an in-body
-          `tl.constexpr` and does NOT declare it as a parameter — so R0_BLOCK is gated on
-          `should_use_persistent_reduction` (Inductor's own decision). Injecting it
-          unconditionally was the #193 'R0_BLOCK' is not in list break.
+          `tl.constexpr` and does NOT declare it as a parameter — so R0_BLOCK is gated
+          on the kernel's own persistent decision (`_kernel_persistent_reduction`).
+          Injecting it unconditionally was the #193 'R0_BLOCK' is not in list break.
         - Pointwise: XBLOCK only. Always blocked in x → XBLOCK always declared.
         """
         is_matmul = (features.is_reduction()
@@ -226,8 +271,10 @@ class SpyreHeuristics(InductorChoices):
             # signature parameter, so injecting it makes Triton's ASTSource do
             # `arg_names.index("R0_BLOCK")` on a signature that lacks it ->
             # `ValueError: 'R0_BLOCK' is not in list` (HW-observed for sp1_2x64x64: signature
-            # was {XBLOCK,YBLOCK} only). Gate R0_BLOCK on should_use_persistent_reduction
-            # (Inductor's own kernel-shape decision) so the fixed_config key-set matches the
+            # was {XBLOCK,YBLOCK} only). Gate R0_BLOCK on the kernel's own
+            # persistent decision (`_kernel_persistent_reduction` — the pre-hook
+            # override_persistent_reduction plus the heuristic chain
+            # SIMDKernel.__init__ resolves) so the fixed_config key-set matches the
             # generated signature exactly — the same rule that fixed reduction #193.
             #
             # Separately, the prior `m_val>=32` guard installed NO fixed_config for SP5's
@@ -244,8 +291,8 @@ class SpyreHeuristics(InductorChoices):
             k_val = _resolve_dim("r0_") or 0
             n_val = _resolve_dim("x") or 0
             problem_dims = {"M": m_val, "K": k_val, "N": n_val}
-            persistent = self.should_use_persistent_reduction(
-                features, cooperative_reduction=False)
+            persistent = self._kernel_persistent_reduction(
+                features, kernel_kwargs)
             block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
             if not persistent:
                 block_config["R0_BLOCK"] = tile_k
@@ -288,16 +335,18 @@ class SpyreHeuristics(InductorChoices):
             #     `ValueError: 'R0_BLOCK' is not in list` (the #193 frontend break).
             #   - looped (large reduction extent): signature declares BOTH XBLOCK and
             #     R0_BLOCK (the `for r0_offset in range(...)` form) — R0_BLOCK is required.
-            # `should_use_persistent_reduction` is Inductor's own decision function
-            # (same one the codegen uses to pick the kernel shape), so this matches the
-            # generated signature exactly. cooperative_reduction=False: Spyre does not
-            # emit cooperative reductions.
+            # The gate is the kernel's OWN decision (`_kernel_persistent_reduction`):
+            # torch's `apply_feature_required_overrides` runs BEFORE this hook and can
+            # force `override_persistent_reduction=False` (looped) for dynamic
+            # reduction extents with no static upper bound — the bare heuristic call
+            # would then predict persistent and leave the looped kernel's R0_BLOCK
+            # unbound (the r0-persistent-prediction-drift defect).
             x_val = _resolve_dim("x") or 0
             r0_val = _resolve_dim("r0_") or 0
             problem_dims = {"X": x_val, "R0": r0_val}
 
-            persistent = self.should_use_persistent_reduction(
-                features, cooperative_reduction=False)
+            persistent = self._kernel_persistent_reduction(
+                features, kernel_kwargs)
             block_config = {"XBLOCK": elements_per_stick}
             if not persistent:
                 block_config["R0_BLOCK"] = elements_per_stick
