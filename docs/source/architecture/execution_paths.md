@@ -63,10 +63,11 @@ Design choices in this mode (`torch_spyre/__init__.py`):
   `torch._refs.ones` does not accept `memory_format` at all — an upstream
   limit for composite decompositions, upstream of this layer.)
 - **`.item()` / `_local_scalar_dense`**: the fake tensor has no data, so any
-  scalar answer is a lie. Policy: return `0` with a warning deduplicated per
-  call-site (keeps incidental uses — logging prints — from killing a capture),
-  OR raise `SpyreRuntimeUnavailableError` when `TORCH_SPYRE_STRICT_ITEM` is
-  set to a truthy value.
+  scalar answer is a lie. Policy: return `0` with a warning deduplicated by
+  the calling tensor's `(size, dtype)` (keeps incidental uses — logging
+  prints — from killing a capture without per-iteration warning spam), OR
+  raise `SpyreRuntimeUnavailableError` when `TORCH_SPYRE_STRICT_ITEM` is set
+  to a truthy value.
 
 ### Why the strict-item escape hatch exists
 
