@@ -10,3 +10,4 @@ who want to understand or extend the stack.
 
    spyre_accelerator
    dataflow_architecture
+   execution_paths
