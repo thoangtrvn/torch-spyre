@@ -351,9 +351,26 @@ class SpyreHeuristics(InductorChoices):
 
             problem_dims = {"M": m_val, "N": n_val}
 
-            kernel_kwargs["fixed_config"] = FixedTritonConfig({
-                "XBLOCK": elements_per_stick,
-            })
+            # Pointwise: XBLOCK always; YBLOCK/ZBLOCK when the tiling dict
+            # carries those range trees. Every range-tree root declares a
+            # `<PREFIX>BLOCK` constexpr parameter (the same signature law the
+            # matmul branch's ZBLOCK gate follows), so a 2D-grid pointwise
+            # kernel (e.g. a broadcast multiply [B,S,H]*[B,S,1] scheduling y+x
+            # trees) REQUIRES YBLOCK in the fixed_config — omitting it made
+            # Inductor's _has_constant_mask -> max_block("y") die with
+            # KeyError: 'YBLOCK' (MiniLM pooled-embedding repro). Keyed on the
+            # tiling dict (the scheduled range trees), not a shape guess, so
+            # it cannot drift from the generated signature. Values are
+            # stick-aligned; block >= dim is masked, same as XBLOCK.
+            pointwise_block_config = {"XBLOCK": elements_per_stick}
+            if "y" in tiling:
+                pointwise_block_config["YBLOCK"] = elements_per_stick
+            if "z" in tiling:
+                # Inductor's own policy: the batch dimension stays unblocked.
+                pointwise_block_config["ZBLOCK"] = 1
+            kernel_kwargs["fixed_config"] = FixedTritonConfig(
+                pointwise_block_config
+            )
 
         # Pass problem dims through FixedTritonConfig → cfg.kwargs →
         # CachingAutotuner._create_compile_options() → options dict →
