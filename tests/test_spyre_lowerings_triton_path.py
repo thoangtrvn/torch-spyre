@@ -75,3 +75,23 @@ def test_lowerings_table_restored_on_exit():
     after = _lowerings()
     for ov in (torch_clamp, torch_clamp_min, torch_clamp_max):
         assert after.get(ov) is before.get(ov), ov
+
+
+def test_exit_does_not_pop_excluded_intree_lowerings():
+    """Leak regression: mean.dim is in spyre_lowerings AND in
+    _TRITON_INCOMPATIBLE_LOWERINGS — on the triton path it is never
+    installed, so the exit loop must NOT pop it (the old exit popped every
+    spyre_lowerings op absent from the saved dict, deleting the in-tree
+    lowering)."""
+    from torch._inductor import lowering
+
+    from torch_spyre._inductor.lowering import enable_spyre_lowerings
+
+    mean_ov = torch.ops.aten.mean.dim
+    before = lowering.lowerings.get(mean_ov)
+    assert before is not None, "in-tree mean.dim lowering must pre-exist"
+    with enable_spyre_lowerings(triton_path=True):
+        pass
+    assert lowering.lowerings.get(mean_ov) is before, (
+        "exit popped the in-tree mean.dim lowering it never installed"
+    )

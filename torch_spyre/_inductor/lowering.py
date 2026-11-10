@@ -163,6 +163,7 @@ def enable_spyre_lowerings(*, triton_path: bool = True):
                 fallback_ops, lowering.lowerings, allow_missing=True
             )
             saved_intree_lowerings = {}
+            installed_lowering_ops = []
             for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
                 if spyre_lowering_op in excluded:
                     continue
@@ -171,6 +172,7 @@ def enable_spyre_lowerings(*, triton_path: bool = True):
                         spyre_lowering_op
                     ]
                 lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
+                installed_lowering_ops.append(spyre_lowering_op)
 
             # Build adapters that call your Spyre lowering. Skipped on the
             # Triton path: lower_clamp's inner_fn demands V.ops.clamp, which
@@ -214,6 +216,11 @@ def enable_spyre_lowerings(*, triton_path: bool = True):
                 # Attach to the function so we can restore on last exit
                 enable_spyre_lowerings._saved_aten_lowerings = saved
             enable_spyre_lowerings._saved_lowerings = saved_intree_lowerings
+            # Exit must restore exactly what this enter installed — excluded
+            # ops (e.g. mean.dim on the triton path) were never written, so
+            # popping them would delete the IN-TREE lowering (leak class:
+            # pop-what-was-never-installed).
+            enable_spyre_lowerings._installed_lowering_ops = installed_lowering_ops
 
         try:
             yield
@@ -234,13 +241,16 @@ def enable_spyre_lowerings(*, triton_path: bool = True):
                 saved_intree_lowerings = getattr(
                     enable_spyre_lowerings, "_saved_lowerings", {}
                 )
-                for spyre_lowering_op, spyre_lowering_impl in spyre_lowerings.items():
+                for spyre_lowering_op in getattr(
+                    enable_spyre_lowerings, "_installed_lowering_ops", []
+                ):
                     if spyre_lowering_op in saved_intree_lowerings:
                         lowering.lowerings[spyre_lowering_op] = saved_intree_lowerings[
                             spyre_lowering_op
                         ]
                     else:
                         lowering.lowerings.pop(spyre_lowering_op, None)
+                enable_spyre_lowerings._installed_lowering_ops = []
                 restore_lowerings(
                     enable_spyre_lowerings._removed_fallbacks, lowering.lowerings
                 )
