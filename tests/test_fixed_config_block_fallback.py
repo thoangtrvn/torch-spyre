@@ -46,9 +46,13 @@ not "the whole compile succeeds".
 
 Mutation targets: replacing ``SpyreFixedTritonConfig`` with plain
 ``FixedTritonConfig`` at the construction sites must redden
+``test_construction_sites_use_the_wrapper`` (the source pin) and
 ``test_pooling_max_block_queries_all_answered`` (the recorded query list
-shows the unresolved KeyError) and
-``test_undeclared_block_keys_fall_back_to_triton_max_block``.
+shows the unresolved KeyError). Deleting or breaking the fallback in the
+class itself additionally reddens
+``test_undeclared_block_keys_fall_back_to_triton_max_block`` (that unit
+test imports the class directly, so it is blind to the construction-site
+mutation).
 """
 
 import json
