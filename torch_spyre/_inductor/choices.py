@@ -145,7 +145,7 @@ class SpyreHeuristics(InductorChoices):
     ) -> bool:
         return False
 
-    def _kernel_persistent_reduction(self, features, kernel_kwargs):
+    def _kernel_persistent_reduction(self, kernel_cls, features, kernel_kwargs):
         """The CONSTRUCTED kernel's own loop/persistent decision, evaluated at
         hook time from the same inputs ``SIMDKernel.__init__`` resolves
         (torch/_inductor/codegen/simd.py): ``override_persistent_reduction``
@@ -168,7 +168,24 @@ class SpyreHeuristics(InductorChoices):
         that (our own dim resolution specializes the symbol afterwards, so
         the heuristic then says persistent) — a prediction that can disagree
         with the codegen it predicts is a defect, not a tuning knob.
+
+        The kernel CLASS is also an input: ``create_kernel_choices`` swaps
+        kernel_type to ``TritonSplitScanKernel`` for split scans BEFORE the
+        hook, and that class overrides ``should_use_persistent_reduction``
+        to a hard False (always looped; the scan path sets only
+        ``override_cooperative_reduction``, not the persistent override), so
+        the heuristic chain below must not run for it. Latent on spyre today
+        (scan ops do not reach TritonKernel through the spyre frontend —
+        verified compile-only), but the key set is keyed on the kernel's
+        decision, not on today's reachability.
         """
+        if kernel_cls is not None:
+            from torch._inductor.codegen.triton_split_scan import (
+                TritonSplitScanKernel,
+            )
+
+            if issubclass(kernel_cls, TritonSplitScanKernel):
+                return False
         override = kernel_kwargs.get("override_persistent_reduction")
         if override is not None:
             return bool(override)
@@ -292,7 +309,7 @@ class SpyreHeuristics(InductorChoices):
             n_val = _resolve_dim("x") or 0
             problem_dims = {"M": m_val, "K": k_val, "N": n_val}
             persistent = self._kernel_persistent_reduction(
-                features, kernel_kwargs)
+                kernel_cls, features, kernel_kwargs)
             block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
             if not persistent:
                 block_config["R0_BLOCK"] = tile_k
@@ -346,7 +363,7 @@ class SpyreHeuristics(InductorChoices):
             problem_dims = {"X": x_val, "R0": r0_val}
 
             persistent = self._kernel_persistent_reduction(
-                features, kernel_kwargs)
+                kernel_cls, features, kernel_kwargs)
             block_config = {"XBLOCK": elements_per_stick}
             if not persistent:
                 block_config["R0_BLOCK"] = elements_per_stick

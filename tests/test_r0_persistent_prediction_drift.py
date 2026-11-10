@@ -289,3 +289,85 @@ def test_static_looped_reduction_carries_r0_block():
         assert "R0_BLOCK" in (k["fixed_config"] or {}), (
             f"looped reduction kernel missing R0_BLOCK: {k}"
         )
+
+
+def _call_hook(kernel_cls, reduction_numel):
+    """Call triton_kernel_kwargs in-process with minimal V.graph/features
+    stubs (same read-only surface a real compile provides) and return the
+    injected fixed_config dict.
+    """
+    import sympy
+    from types import SimpleNamespace
+
+    import torch
+    from torch._inductor import virtualized
+    from torch_spyre._inductor.choices import SpyreHeuristics
+
+    class _StubNode:
+        class node:
+            @staticmethod
+            def get_dtype():
+                return torch.float32
+
+    class _StubFeatures:
+        def is_reduction(self):
+            return True
+
+        def contains_op(self, name):
+            return None
+
+        def scheduler_nodes(self):
+            return [_StubNode()]
+
+        def get_reduction_hint(self):
+            return None
+
+    # Class bodies do not enclose the function scope — assign after def.
+    _StubFeatures.reduction_numel = sympy.Integer(reduction_numel)
+    _StubFeatures.numel = sympy.Integer(384)
+
+    class _VProxy(virtualized._V):
+        @property
+        def graph(self):
+            return SimpleNamespace(
+                sizevars=SimpleNamespace(
+                    statically_known_int=lambda v: int(v),
+                    statically_known_leq=lambda a, b: int(a) <= int(b),
+                ),
+                # cpu => torch's cooperative heuristic returns False.
+                get_current_device_or_throw=lambda: torch.device("cpu"),
+            )
+
+    original_cls = virtualized.V.__class__
+    virtualized.V.__class__ = _VProxy
+    try:
+        kernel_kwargs = {}
+        SpyreHeuristics().triton_kernel_kwargs(
+            kernel_cls, _StubFeatures(), [{"x": 384, "r0_": reduction_numel}],
+            kernel_kwargs)
+    finally:
+        virtualized.V.__class__ = original_cls
+    cfg = kernel_kwargs["fixed_config"]
+    cfg = getattr(cfg, "config", cfg)
+    return dict(cfg)
+
+
+def test_split_scan_kernel_class_is_always_looped():
+    """TritonSplitScanKernel overrides should_use_persistent_reduction to a
+    hard False (always looped) and the scan path sets only
+    override_cooperative_reduction — so a small reduction extent that the
+    heuristic would call PERSISTENT must still get R0_BLOCK injected when the
+    hook's kernel_cls is the split-scan class. Latent on spyre today (scan
+    ops do not reach TritonKernel through the spyre frontend — verified
+    compile-only), so this is an in-process pin on the kernel-class input,
+    with the plain TritonKernel as the persistent control leg.
+    """
+    from torch._inductor.codegen.triton import TritonKernel
+    from torch._inductor.codegen.triton_split_scan import TritonSplitScanKernel
+
+    # Control: plain kernel, small static extent -> persistent -> no R0_BLOCK.
+    plain = _call_hook(TritonKernel, 16)
+    assert "R0_BLOCK" not in plain, plain
+    # Split-scan class: hard-False persistent override -> looped -> R0_BLOCK.
+    scan = _call_hook(TritonSplitScanKernel, 16)
+    assert "R0_BLOCK" in scan, scan
