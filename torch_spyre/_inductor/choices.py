@@ -178,6 +178,17 @@ class SpyreHeuristics(InductorChoices):
         (scan ops do not reach TritonKernel through the spyre frontend —
         verified compile-only), but the key set is keyed on the kernel's
         decision, not on today's reachability.
+
+        KNOWN UNSUPPORTED (pre-existing, disclosed): (a) split-scan kernels
+        assert ``fixed_config is None`` at construction
+        (triton_split_scan.py), so hook injection is incompatible with them
+        regardless of this gate; (b) ``config.triton.multi_kernel`` (torch
+        default 0; torch_spyre never sets it) makes
+        ``add_multi_kernel_choices`` construct extra looped kernel variants
+        AFTER the hook reusing the SAME fixed_config — a persistent primary's
+        config (no R0_BLOCK) would then be shared with a looped variant that
+        requires it (KeyError 'R0_BLOCK' in max_block). Neither is reachable
+        under spyre defaults.
         """
         if kernel_cls is not None:
             from torch._inductor.codegen.triton_split_scan import (
@@ -191,10 +202,13 @@ class SpyreHeuristics(InductorChoices):
             return bool(override)
         cooperative = kernel_kwargs.get("override_cooperative_reduction")
         if cooperative is None:
-            cooperative = features.is_reduction() and self.should_use_cooperative_reduction(
-                V.graph.get_current_device_or_throw(),
-                features.numel,
-                features.reduction_numel,
+            cooperative = (
+                features.is_reduction()
+                and self.should_use_cooperative_reduction(
+                    V.graph.get_current_device_or_throw(),
+                    features.numel,
+                    features.reduction_numel,
+                )
             )
         return features.is_reduction() and self.should_use_persistent_reduction(
             features, cooperative
@@ -242,9 +256,11 @@ class SpyreHeuristics(InductorChoices):
           Injecting it unconditionally was the #193 'R0_BLOCK' is not in list break.
         - Pointwise: XBLOCK only. Always blocked in x → XBLOCK always declared.
         """
-        is_matmul = (features.is_reduction()
-                     and hasattr(features, 'contains_op')
-                     and features.contains_op("dot"))
+        is_matmul = (
+            features.is_reduction()
+            and hasattr(features, "contains_op")
+            and features.contains_op("dot")
+        )
         is_reduction = features.is_reduction()
 
         # Stick-aligned block sizes. Elements per stick is dtype-dependent
@@ -309,7 +325,8 @@ class SpyreHeuristics(InductorChoices):
             n_val = _resolve_dim("x") or 0
             problem_dims = {"M": m_val, "K": k_val, "N": n_val}
             persistent = self._kernel_persistent_reduction(
-                kernel_cls, features, kernel_kwargs)
+                kernel_cls, features, kernel_kwargs
+            )
             block_config = {"YBLOCK": tile_m, "XBLOCK": tile_n}
             if not persistent:
                 block_config["R0_BLOCK"] = tile_k
@@ -329,8 +346,10 @@ class SpyreHeuristics(InductorChoices):
             if "z" in tiling:
                 # PREDICTION-DRIFT NOTE (the #193 class): this gate is keyed on
                 # the TILING DICT carrying "z", not on an Inductor decision
-                # function (the R0_BLOCK gate below uses should_use_persistent_
-                # reduction, which cannot drift from the codegen). If a 3-range
+                # function (unlike the R0_BLOCK gate above, which resolves the
+                # kernel's own decision via `_kernel_persistent_reduction` —
+                # the bare heuristic call CAN drift from the codegen, see that
+                # helper's docstring). If a 3-range
                 # matmul ever surfaces whose tiling dict LACKS "z" (an Inductor
                 # schedule change re-rooting the batch range, or a new prefixed
                 # range family), the ZBLOCK key silently goes missing again and
@@ -363,7 +382,8 @@ class SpyreHeuristics(InductorChoices):
             problem_dims = {"X": x_val, "R0": r0_val}
 
             persistent = self._kernel_persistent_reduction(
-                kernel_cls, features, kernel_kwargs)
+                kernel_cls, features, kernel_kwargs
+            )
             block_config = {"XBLOCK": elements_per_stick}
             if not persistent:
                 block_config["R0_BLOCK"] = elements_per_stick
@@ -398,9 +418,11 @@ class SpyreHeuristics(InductorChoices):
                 # 1D grid: recover the true 2D (M, N) from the output buffer layout.
                 true_m, true_n = self._recover_pointwise_shape(features, x_val)
                 n_val = elements_per_stick
-                if (true_n is not None
-                        and true_n % elements_per_stick != 0
-                        and true_m > 1):
+                if (
+                    true_n is not None
+                    and true_n % elements_per_stick != 0
+                    and true_m > 1
+                ):
                     # Ragged N with M>1: flatten over the ROW-PADDED physical stick
                     # count so the kernel writes M*ceil(N/64) sticks (== the device
                     # tensor), not the flat ceil(M*N/64). This is the ONLY case that
@@ -417,9 +439,11 @@ class SpyreHeuristics(InductorChoices):
 
             problem_dims = {"M": m_val, "N": n_val}
 
-            kernel_kwargs["fixed_config"] = FixedTritonConfig({
-                "XBLOCK": elements_per_stick,
-            })
+            kernel_kwargs["fixed_config"] = FixedTritonConfig(
+                {
+                    "XBLOCK": elements_per_stick,
+                }
+            )
 
         # Pass problem dims through FixedTritonConfig → cfg.kwargs →
         # CachingAutotuner._create_compile_options() → options dict →
@@ -432,7 +456,9 @@ class SpyreHeuristics(InductorChoices):
         # A monkey-patch on _create_compile_options (in __init__.py _autoload)
         # copies Spyre-recognized keys from cfg.kwargs into the options dict,
         # so backend.parse_options() receives them.
-        config_dict = kernel_kwargs.get("fixed_config", FixedTritonConfig({})).config.copy()
+        config_dict = kernel_kwargs.get(
+            "fixed_config", FixedTritonConfig({})
+        ).config.copy()
         if problem_dims and tiling:
             m = problem_dims.get("M", 0)
             n = problem_dims.get("N", 0)
@@ -505,9 +531,7 @@ class SpyreHeuristics(InductorChoices):
                 )
             resolve_descriptor_unary_normal_route_authority(
                 route_request["_descriptor_normal_route_request_operation"],
-                route_request[
-                    "_descriptor_normal_route_request_authority_fingerprint"
-                ],
+                route_request["_descriptor_normal_route_request_authority_fingerprint"],
             )
             config_dict.update(route_request)
         kernel_kwargs["fixed_config"] = FixedTritonConfig(config_dict)

@@ -65,8 +65,6 @@ import sys
 import tempfile
 import textwrap
 
-import pytest
-
 
 def _run_compile(script: str) -> subprocess.CompletedProcess:
     env = os.environ.copy()
@@ -191,15 +189,15 @@ def test_dynamic_pooling_r0_block_parity():
             "dynamo.mark_dynamic(m, 0)\n"
             "dynamo.mark_dynamic(m, 1)"
         ),
-        call=(
-            "torch.compile(lambda a, b: (a * b.unsqueeze(-1)).sum(dim=1))(x, m)"
-        ),
+        call=("torch.compile(lambda a, b: (a * b.unsqueeze(-1)).sum(dim=1))(x, m)"),
     )
     result = _run_compile(script)
     assert result.returncode == 0, result.stderr
-    lines = [l for l in result.stdout.splitlines() if l.startswith("R0PD_RESULT ")]
+    lines = [
+        line for line in result.stdout.splitlines() if line.startswith("R0PD_RESULT ")
+    ]
     assert lines, f"no result line; stderr={result.stderr[-2000:]}"
-    summary = json.loads(lines[0][len("R0PD_RESULT "):])
+    summary = json.loads(lines[0][len("R0PD_RESULT ") :])
 
     reds = _reduction_kernels(summary)
     assert reds, "no reduction kernel was constructed — stale pin"
@@ -237,15 +235,15 @@ def test_static_persistent_reduction_has_no_r0_block():
             "x = torch.empty(4, 16, 384, dtype=torch.float32).to(dev)\n"
             "m = torch.ones(4, 16, dtype=torch.float32).to(dev)"
         ),
-        call=(
-            "torch.compile(lambda a, b: (a * b.unsqueeze(-1)).sum(dim=1))(x, m)"
-        ),
+        call=("torch.compile(lambda a, b: (a * b.unsqueeze(-1)).sum(dim=1))(x, m)"),
     )
     result = _run_compile(script)
     assert result.returncode == 0, result.stderr
-    lines = [l for l in result.stdout.splitlines() if l.startswith("R0PD_RESULT ")]
+    lines = [
+        line for line in result.stdout.splitlines() if line.startswith("R0PD_RESULT ")
+    ]
     assert lines, f"no result line; stderr={result.stderr[-2000:]}"
-    summary = json.loads(lines[0][len("R0PD_RESULT "):])
+    summary = json.loads(lines[0][len("R0PD_RESULT ") :])
 
     reds = _reduction_kernels(summary)
     assert reds, "no reduction kernel was constructed — stale pin"
@@ -275,9 +273,11 @@ def test_static_looped_reduction_carries_r0_block():
     )
     result = _run_compile(script)
     assert result.returncode == 0, result.stderr
-    lines = [l for l in result.stdout.splitlines() if l.startswith("R0PD_RESULT ")]
+    lines = [
+        line for line in result.stdout.splitlines() if line.startswith("R0PD_RESULT ")
+    ]
     assert lines, f"no result line; stderr={result.stderr[-2000:]}"
-    summary = json.loads(lines[0][len("R0PD_RESULT "):])
+    summary = json.loads(lines[0][len("R0PD_RESULT ") :])
 
     reds = _reduction_kernels(summary)
     assert reds, "no reduction kernel was constructed — stale pin"
@@ -289,6 +289,64 @@ def test_static_looped_reduction_carries_r0_block():
         assert "R0_BLOCK" in (k["fixed_config"] or {}), (
             f"looped reduction kernel missing R0_BLOCK: {k}"
         )
+
+
+def test_dynamic_k_matmul_r0_block_parity():
+    """Matmul-leg witness: dynamic K extent forces the looped shape too.
+
+    The matmul branch shares `_kernel_persistent_reduction` with the
+    reduction branch, but before this test its drift DIRECTION was untested
+    (all matmul/bmm tests use static K extents, where base and fix agree).
+    Here K is dynamic (mark_dynamic on the contraction dim): the pre-hook
+    override forces the kernel looped (rnumel s? with no static upper bound
+    at override time) while the post-specialization heuristic would say
+    persistent — so R0_BLOCK must be injected for the looped matmul
+    signature (executed witness at fix time: tiling {"y","x","r0_": s52},
+    override_persistent_reduction=False, R0_BLOCK present).
+    """
+    script = _recorder_body(
+        case_setup=(
+            "x = torch.empty(8, 16, dtype=torch.float32).to(dev)\n"
+            "w = torch.empty(16, 64, dtype=torch.float32).to(dev)\n"
+            "dynamo.mark_dynamic(x, 1)\n"
+            "dynamo.mark_dynamic(w, 0)"
+        ),
+        call="torch.compile(lambda a, b: a @ b)(x, w)",
+    )
+    result = _run_compile(script)
+    assert result.returncode == 0, result.stderr
+    lines = [
+        line for line in result.stdout.splitlines() if line.startswith("R0PD_RESULT ")
+    ]
+    assert lines, f"no result line; stderr={result.stderr[-2000:]}"
+    summary = json.loads(lines[0][len("R0PD_RESULT ") :])
+
+    # Matmul kernels: tiling carries a y-range (the M tile) plus the r0_
+    # contraction — the is_matmul branch's domain.
+    matmuls = [
+        k for k in summary["kernels"] if "y" in k["tiling"] and "r0_" in k["tiling"]
+    ]
+    assert matmuls, (
+        f"no matmul kernel was constructed — stale pin: {summary['kernels']}"
+    )
+    for k in matmuls:
+        assert ("R0_BLOCK" in (k["fixed_config"] or {})) == (
+            not k["persistent_reduction"]
+        ), (
+            f"matmul R0_BLOCK key set does not match the kernel's own "
+            f"decision: persistent_reduction={k['persistent_reduction']}, "
+            f"fixed_config={k['fixed_config']}"
+        )
+    # The drift direction itself: the dynamic-K matmul kernel is FORCED
+    # looped and must carry R0_BLOCK (the bare heuristic would have called
+    # this shape persistent post-specialization and omitted it).
+    assert any(
+        (not k["persistent_reduction"]) and "R0_BLOCK" in (k["fixed_config"] or {})
+        for k in matmuls
+    ), f"no looped matmul kernel with R0_BLOCK injected: {matmuls}"
+    chain_text = "\n".join(summary["chain"])
+    assert "KeyError: 'R0_BLOCK'" not in chain_text, summary["chain"]
+    assert "'R0_BLOCK' is not in list" not in chain_text, summary["chain"]
 
 
 def _call_hook(kernel_cls, reduction_numel):
@@ -343,8 +401,11 @@ def _call_hook(kernel_cls, reduction_numel):
     try:
         kernel_kwargs = {}
         SpyreHeuristics().triton_kernel_kwargs(
-            kernel_cls, _StubFeatures(), [{"x": 384, "r0_": reduction_numel}],
-            kernel_kwargs)
+            kernel_cls,
+            _StubFeatures(),
+            [{"x": 384, "r0_": reduction_numel}],
+            kernel_kwargs,
+        )
     finally:
         virtualized.V.__class__ = original_cls
     cfg = kernel_kwargs["fixed_config"]
