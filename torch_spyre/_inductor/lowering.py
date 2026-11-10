@@ -166,39 +166,47 @@ def enable_spyre_lowerings(*, triton_path: bool = False):
                     ]
                 lowering.lowerings[spyre_lowering_op] = spyre_lowering_impl
 
-            # Build adapters that call your Spyre lowering
-            def _impl_lower_aten_clamp(x, min=None, max=None):
-                return lower_clamp(x, min=min, max=max)
+            # Build adapters that call your Spyre lowering. Skipped on the
+            # Triton path: lower_clamp's inner_fn demands V.ops.clamp, which
+            # only the SDSC ops handler defines — TritonKernelOverrides has
+            # no clamp, so routing aten.clamp_min through it fails with
+            # "'TritonKernelOverrides' object has no attribute 'clamp'".
+            # In-tree lowerings (clamp_min → maximum, clamp_max → minimum)
+            # are pointwise and Triton-compatible; leave them in place.
+            if not triton_path:
 
-            def _impl_lower_aten_clamp_min(x, min):
-                return lower_clamp(x, min=min, max=None)
+                def _impl_lower_aten_clamp(x, min=None, max=None):
+                    return lower_clamp(x, min=min, max=max)
 
-            def _impl_lower_aten_clamp_max(x, max):
-                return lower_clamp(x, min=None, max=max)
+                def _impl_lower_aten_clamp_min(x, min):
+                    return lower_clamp(x, min=min, max=None)
 
-            # Collect overload handles
-            clamp_ovs = [
-                getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
-            ]
-            clamp_min_ov = getattr(torch.ops.aten.clamp_min, "default", None)
-            clamp_max_ov = getattr(torch.ops.aten.clamp_max, "default", None)
+                def _impl_lower_aten_clamp_max(x, max):
+                    return lower_clamp(x, min=None, max=max)
 
-            # Save originals and patch — keep references in function attribute
-            saved = {}
+                # Collect overload handles
+                clamp_ovs = [
+                    getattr(torch.ops.aten.clamp, name, None) for name in _CLAMP_FUNC_OVS
+                ]
+                clamp_min_ov = getattr(torch.ops.aten.clamp_min, "default", None)
+                clamp_max_ov = getattr(torch.ops.aten.clamp_max, "default", None)
 
-            def _save_set(ov, fn):
-                if ov is None:
-                    return
-                saved[ov] = lowering.lowerings.get(ov)
-                lowering.lowerings[ov] = fn
+                # Save originals and patch — keep references in function attribute
+                saved = {}
 
-            for ov in clamp_ovs:
-                _save_set(ov, _impl_lower_aten_clamp)
-            _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
-            _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
+                def _save_set(ov, fn):
+                    if ov is None:
+                        return
+                    saved[ov] = lowering.lowerings.get(ov)
+                    lowering.lowerings[ov] = fn
 
-            # Attach to the function so we can restore on last exit
-            enable_spyre_lowerings._saved_aten_lowerings = saved
+                for ov in clamp_ovs:
+                    _save_set(ov, _impl_lower_aten_clamp)
+                _save_set(clamp_min_ov, _impl_lower_aten_clamp_min)
+                _save_set(clamp_max_ov, _impl_lower_aten_clamp_max)
+
+                # Attach to the function so we can restore on last exit
+                enable_spyre_lowerings._saved_aten_lowerings = saved
             enable_spyre_lowerings._saved_lowerings = saved_intree_lowerings
 
         try:
