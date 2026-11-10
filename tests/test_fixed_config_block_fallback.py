@@ -153,16 +153,21 @@ def test_construction_sites_use_the_wrapper():
     branch lose the query fallback silently.
     """
     import inspect
+    import re
 
     from torch_spyre._inductor import choices
 
     src = inspect.getsource(choices)
-    assert src.count('SpyreFixedTritonConfig(block_config)') == 2
-    assert 'SpyreFixedTritonConfig({\n                "XBLOCK"' in src
-    assert "SpyreFixedTritonConfig(config_dict)" in src
+    # Whitespace-normalized so a reindent/rewrap of the pointwise branch
+    # cannot false-red the pin (the mutation target is the CLASS at the
+    # construction site, not the formatting).
+    flat = re.sub(r"\s+", " ", src)
+    assert flat.count("SpyreFixedTritonConfig(block_config)") == 2
+    assert 'SpyreFixedTritonConfig({ "XBLOCK": elements_per_stick, })' in flat
+    assert "SpyreFixedTritonConfig(config_dict)" in flat
     # The empty-default read at the problem-dims channel stays plain (it is
     # only .config-copied, never queried by prefix).
-    assert 'FixedTritonConfig({})).config.copy()' in src
+    assert "FixedTritonConfig({})).config.copy()" in flat
 
 
 # ---------------------------------------------------------------------------
