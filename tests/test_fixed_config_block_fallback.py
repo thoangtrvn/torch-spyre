@@ -167,11 +167,17 @@ def test_construction_sites_use_the_wrapper():
     # construction site, not the formatting).
     flat = re.sub(r"\s+", " ", src)
     assert flat.count("SpyreFixedTritonConfig(block_config)") == 2
-    assert 'SpyreFixedTritonConfig({ "XBLOCK": elements_per_stick, })' in flat
+    # Pointwise site (merged form): the YBLOCK/ZBLOCK tiling-dict-gated
+    # pointwise_block_config from the codegen-only arc, wrapped in the
+    # lane's subclass. Pin BOTH the wrapper class and the dict name so a
+    # regression to either the plain class or the XBLOCK-only dict reddens.
+    assert "SpyreFixedTritonConfig( pointwise_block_config )" in flat
+    assert 'pointwise_block_config = {"XBLOCK": elements_per_stick}' in flat
+    assert 'pointwise_block_config["YBLOCK"] = elements_per_stick' in flat
     assert "SpyreFixedTritonConfig(config_dict)" in flat
     # The empty-default read at the problem-dims channel stays plain (it is
     # only .config-copied, never queried by prefix).
-    assert "FixedTritonConfig({})).config.copy()" in flat
+    assert 'kernel_kwargs.get( "fixed_config", FixedTritonConfig({}) ).config.copy()' in flat
 
 
 # ---------------------------------------------------------------------------
