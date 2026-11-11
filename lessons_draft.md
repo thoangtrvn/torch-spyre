@@ -77,3 +77,59 @@
 **Fix**: Materialize the shadow rebased to offset 0 with identical sizes/strides (`empty_strided(...).copy_(view)`), maintaining the invariant `spyre.storage_offset() == shadow.storage_offset()` (both 0) for every registry entry.
 
 **General lesson**: A host-side sidecar for a custom-backend tensor is a COORDINATE SYSTEM, not just a value bag: every layout property the dispatcher's composites read off the backend tensor (storage_offset, sizes, strides) must match the sidecar exactly, or offset arithmetic computed on one is applied to the other. When the backend op gives the output a fresh storage, the sidecar must be materialized to match — a lazy CPU view silently diverges on the first chained op.
+
+---
+
+# Lessons draft — r0-persistent-prediction-drift
+
+DRAFT rows, provisional numbers, renumber on merge (renumber note: these
+rows must be merged into the staging LESSONS_LEDGER with the next free
+L-nnn numbers; the numbers below are placeholders only).
+
+## L-DRAFT-r0-override-before-hook
+
+**Law:** a key set injected at a hook must be derived from the decision
+inputs the CONSUMER resolves, including any overrides the framework
+installs into the hook's own arguments BEFORE the hook runs — not from a
+parallel heuristic call that evaluates the same nominal question at a
+different time.
+
+**Why:** torch's `TritonScheduling.create_kernel_choices` calls
+`TritonKernel.apply_feature_required_overrides` BEFORE the
+`triton_kernel_kwargs` hook, forcing
+`kernel_kwargs["override_persistent_reduction"]=False` whenever
+`has_persistent_RBLOCK(reduction_numel)` fails. For dynamic reduction
+extents the sizevar state DIFFERS between the two moments (executed:
+reduction_numel `s20` bounds `[2, int_oo]` at override time, `[16,16]` by
+hook exit — the hook's own dim resolution specializes the symbol), so the
+override and a hook-time heuristic call can disagree and the constructed
+kernel is looped while the prediction said persistent.
+
+**How to apply:** when a hook predicts a downstream consumer's shape,
+enumerate the consumer's FULL decision expression (every input, in
+resolution order, including pre-hook overrides carried in the hook's own
+kwargs) and evaluate that — or widen to cover both shapes. A prediction
+that can disagree with the codegen it predicts is a defect class, not a
+tuning knob. Root: `torch_spyre/_inductor/choices.py`
+`_kernel_persistent_reduction` (fix commits `f8c31bd2`, `5e8cb5ea`).
+
+## L-DRAFT-r0-gauntlet-handback-silent
+
+**Law:** a reviewer agent's report can arrive as a teammate message LONG
+after the dispatch returns "no report was delivered through
+SubagentHandback" — three consecutive dispatches (each ~20-25 tool uses,
+~65k tokens, ~10-13 min) initially appeared reportless, and all three full
+reports (convergent GAUNTLET-CLEAN) landed later as teammate messages, one
+per reviewer. An absent handback is not evidence of an absent review.
+
+**Why:** "dispatched a reviewer" is not "got a review"; but neither is
+"no handback yet" — the receipt is the report content, and its delivery
+channel can lag by tens of minutes.
+
+**How to apply:** before declaring the gauntlet channel failed and
+holding on that basis, wait for delayed teammate-message delivery (and
+re-prompt the reviewer once); only then disclose a channel failure. A
+premature "gauntlet incomplete" stop report must be corrected when the
+reports land, as this one was. (This lane's r1 gauntlet completed with
+three convergent reports; the initial incomplete-gauntlet disclosure was
+superseded.)
