@@ -63,7 +63,6 @@ import tempfile
 import textwrap
 
 import pytest
-import torch
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +77,6 @@ def test_undeclared_block_keys_fall_back_to_triton_max_block():
     ever hardcodes or drifts from torch's current table, this reddens.
     """
     from torch._inductor.codegen.triton import (
-        FixedTritonConfig,
         TRITON_MAX_BLOCK,
     )
 
@@ -177,7 +175,10 @@ def test_construction_sites_use_the_wrapper():
     assert "SpyreFixedTritonConfig(config_dict)" in flat
     # The empty-default read at the problem-dims channel stays plain (it is
     # only .config-copied, never queried by prefix).
-    assert 'kernel_kwargs.get( "fixed_config", FixedTritonConfig({}) ).config.copy()' in flat
+    assert (
+        'kernel_kwargs.get( "fixed_config", FixedTritonConfig({}) ).config.copy()'
+        in flat
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,24 +298,35 @@ def test_pooling_max_block_queries_all_answered():
     compile proceeds past codegen to its next wall.
 
     The assertions are deliberately wall-independent: the compile is EXPECTED
-    to still stop somewhere (codegen-only environment; and the R0_BLOCK
-    runtime-binding prediction drift is a separate, unowned key-set defect),
-    but that stop must not be a fixed-config KeyError from the block-size
-    query surface, and the fallback must have actually fired.
+    to still stop somewhere (codegen-only environment), but that stop must
+    not be a fixed-config KeyError from the block-size query surface. Since
+    the r0-drift merge (e68375aa) the R0_BLOCK key-set gate keys on the
+    kernel's own looped decision, so this shape's queries are all declared
+    and the fallback must stay silent — a fallback answer here would mean
+    the gate regressed to the bare persistent-reduction prediction.
     """
     result = _run_script(_POOLING_SCRIPT)
     assert result.returncode == 0, result.stderr
-    lines = [l for l in result.stdout.splitlines() if l.startswith("FCBF_RESULT ")]
+    lines = [ln for ln in result.stdout.splitlines() if ln.startswith("FCBF_RESULT ")]
     assert lines, f"no result line; stderr={result.stderr[-2000:]}"
-    summary = json.loads(lines[0][len("FCBF_RESULT "):])
+    summary = json.loads(lines[0][len("FCBF_RESULT ") :])
 
     assert summary["queries"], "no max_block queries were made — stale pin"
     assert summary["unresolved"] == 0, (
         f"unresolved max_block queries: {summary['queries']}"
     )
-    assert summary["fallback_answered"] > 0, (
-        "the fallback never fired — every query was declared; the pin no "
-        "longer exercises the defect class"
+    # Re-pinned at the r0-drift merge (e68375aa): _kernel_persistent_reduction
+    # now keys R0_BLOCK injection on the kernel's own looped decision, so the
+    # dynamic pooling shape's r0_ queries are all DECLARED and the fallback
+    # correctly stays silent (fallback_answered == 0). The earlier
+    # `fallback_answered > 0` tripwire keyed on the prediction-drift defect
+    # this merge fixes; the fallback mechanism itself stays pinned at unit
+    # level by test_undeclared_block_keys_fall_back_to_triton_max_block.
+    assert summary["fallback_answered"] == 0, (
+        "the fallback fired on the dynamic pooling shape — R0_BLOCK should "
+        "be declared by _kernel_persistent_reduction since the r0-drift "
+        "merge; a fallback answer here means the key-set gate regressed to "
+        "the bare prediction"
     )
     assert not summary["keyerror_in_chain"], (
         f"KeyError still in the failure chain: {summary['chain']}"
