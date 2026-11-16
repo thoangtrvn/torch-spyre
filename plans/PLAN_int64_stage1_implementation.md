@@ -8,9 +8,9 @@ Lane `torchspyre-int64-graph-policy` (repo `torch-spyre-thoangtrvn`, base `b413c
 CSRC change → **rebuild on the box under the hardware claim protocol**.
 
 **Lane scope at this revision (after review round 1):**
-- **Slice 1 — split (do not conflate): S1.a sendnn removal is LIVE and unblocked;
-  S1.b one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
-  concerns **S1.b only**; dispatch is USER-only and this lane creates no branch.
+- **Slice 1 — split (do not conflate): S1.b sendnn removal is LIVE and implementable;
+  S1.a one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
+  concerns **S1.a only**; dispatch is USER-only and this lane creates no branch.
 - **Slice 2 — live** (owner table is documentation + tests; no build dependency).
 - **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a
   classifies by **exception class first** (§3a); the named candidate is the
@@ -46,13 +46,13 @@ the values.
 ## 1. Slice 1 — two independent items
 
 > **Status split (do not conflate them):**
-> - **S1.a — sendnn removal: LIVE, unblocked.** Pure type swap + libs-list edit, full
+> - **S1.b — sendnn removal: LIVE, implementable.** Pure type swap + libs-list edit, full
 >   build only; can proceed now, independent of the carve.
-> - **S1.b — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
+> - **S1.a — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
 >   precondition. This is the piece that needs the USER's carve call, and it is what
 >   gates T-DC-121 *if* the geometry-split candidate holds (§3a).
 >
-> Sequence: **S1.a now, as its own commit; S1.b after the precondition is chosen.**
+> Sequence: **S1.b now, as its own commit; S1.a after the precondition is chosen.**
 > Different review surfaces — never one commit.
 
 **Defect (verified):**
@@ -68,7 +68,7 @@ the live one.** In a real codegen-only build `_C.py:137` is the *no-backend fall
 the accessor on the path is `codegen_backend.cpp:145-167`. "Delete the `_C.py` map" is
 therefore a **no-op against the live path**.
 
-### S1.b — one-owner reconciliation: BLOCKED (P-a / P-b)
+### S1.a — one-owner reconciliation: BLOCKED (P-a / P-b)
 
 **BLOCKED — precondition before the reconciliation (verified).** Routing
 `codegen_backend.cpp` through the C++ pair cannot be done as written:
@@ -96,7 +96,7 @@ single owner of the physical/compute format, and have every accessor — runtime
 `codegen_backend.cpp`, and `_C.py` if it survives — answer from it. The accessors must
 not carry independent maps/switches.
 
-### S1.a — sendnn removal (USER-directed; **LIVE and unblocked**)
+### S1.b — sendnn removal (USER-directed; **LIVE, implementable**)
 
 The USER has directed that `sendnn` be removed, adopting the necessary piece from
 upstream. It lands here because `types_mapping.h` is already on the int64 critical
@@ -105,36 +105,48 @@ path. **Scoped against the canonical tree** (`torch-spyre-thoangtrvn` @ `new-run
 sendnn-free); re-verified in this lane:
 
 **Signal (verified):** sendnn appears in exactly two places —
-`torch_spyre/csrc/types_mapping.h:24` (`#include <sendnn/tensor/sendatatype.hpp>`) plus
-**136** uses of `sendnn::sen_datatype_enum` (the scoping note said 137; the tree counts
-136 — a one-off, recorded rather than smoothed) — and `setup.py:96`
-`LIBRARIES = ["sendnn", "sendnn_interface", "flex"]`. **No `sendnn::` symbol other than
-the enum type is used**, so it is a pure *type* dependency: `LIBRARIES` can drop to
-`["flex"]` with no unresolved-symbol risk from the enum.
+`torch_spyre/csrc/types_mapping.h:24` (`#include <sendnn/tensor/sendatatype.hpp>`) and
+`setup.py:96` (`LIBRARIES = ["sendnn", "sendnn_interface", "flex"]`). The enum appears
+**138 times on 136 lines** (lines 110 and 117 carry two each: both are
+`std::pair<sendnn::sen_datatype_enum, sendnn::sen_datatype_enum>`), and **all 138 are
+inside one function**, `stringToSenDatatypePair` (`types_mapping.h:110-348`). No other
+`sendnn::` symbol is used, so it is a pure *type* dependency and `LIBRARIES` drops to
+`["flex"]` with no unresolved-symbol risk.
 
-**The substitution, with its traps:**
-1. `sendnn::sen_datatype_enum` → `DataFormats`. `DataFormats` is an
-   `enum class` in `util/sendefs.h`, and `types_mapping.h:22` **already includes**
-   `<util/sendefs.h>` — the type is in scope; delete only the `:24` include.
-2. **Do not copy upstream's include line.** Upstream includes
-   `<util/sendefs/sendefs.h>` (a `sendefs/` subdir absent from this install). Keep the
-   local `<util/sendefs.h>`; take only upstream's *pair table*.
-3. **Do not hand-rename the 136 members** — the vocabularies differ (`boolean→BOOL`,
-   `sen_fp16→SEN169_FP16`, …). **Adopt upstream's `stringToDTDataFormatPair` body
-   wholesale** (upstream `types_mapping.h:57-108`), which is the same mapping already
-   expressed in `DataFormats`.
-4. **Cross-check the two Stage-1 rows survive identically** (verified in upstream
-   `:69-70`): `"int32" → {IEEE_INT32, IEEE_INT32}` and
-   `"int64" → {IEEE_INT64, IEEE_INT32}`. These are the geometry pair; their semantics
-   must not change.
-5. **Verify, do not assume, the dropped entries.** Upstream's table omits some entries
-   the sendnn map carried (`float64`/`float128`/`float256`, `decimal*`, `string`).
-   Enumerate every caller of `stringToDTDataFormatPair` / `torchScalarToString` and
-   confirm those dtypes are unreachable (rejected by `is_supported_dtype` upstream of
-   the mapping). **If any is reachable, keep it and map it explicitly** — do not
-   silently drop a reachable dtype.
+**This is a DELETION, not a substitution — verified, and it simplifies the brief.**
+- `stringToSenDatatypePair` has **zero callers** in the tree (repo-wide grep: the
+  definition at `:111` and stale `.worktrees/` copies only). Everything calls
+  `stringToDTDataFormatPair` (`:58`), which is **already `DataFormats`-based and
+  sendnn-free** and already used by `module.cpp:194,201`, `spyre_tensor_impl.cpp:143`
+  and `spyre_mem.cpp:366`.
+- So the change is: **delete `types_mapping.h:110-348` and the `:24` include; change
+  nothing in `stringToDTDataFormatPair`.** No member renaming, no adopted table.
 
-**Relation to S1.b — none, and that is the correction.** This removal is **standalone
+**Why NOT adopt upstream's `stringToDTDataFormatPair` body (the brief's step 3)** —
+two independent reasons, both verified:
+1. **It would not compile here.** Upstream maps `uint8 → SNUINT8`-style
+   `DataFormats::SENUINT8`, and the installed `deeptools/util/sendefs.h:30-54`
+   `enum class DataFormats` has **no `SENUINT8`** (it jumps `SENUINT32`, `SENUINT2`).
+2. **Even if it compiled it would change behaviour silently.** The only content
+   difference between the local and upstream tables is exactly that row: local
+   `uint8 → {SENUINT32, SENUINT32}`, upstream `uint8 → {SENUINT8, SENUINT32}`. Adopting
+   upstream would alter the host-side uint8 format — a change with nothing to do with
+   removing sendnn, in a lane whose subject is int64.
+
+**The dropped-dtype risk therefore evaporates.** `float64`/`float128`/`float256`/
+`decimal*`/`string` exist only in the *dead* sendnn function; deleting it removes them
+from the header, and nothing that reaches `stringToDTDataFormatPair` loses a mapping.
+Keep the check anyway as a bar: confirm no caller passes one of those spellings
+(`torchScalarToString` maps `kDouble → "float64"`, so a caller could in principle ask;
+the live table has no `float64` row and today's code already behaves that way, so this
+bar guards against *introducing* a reachable path, not against S1.b).
+
+**Cross-check that does still matter:** the two Stage-1 rows must be unchanged after
+the deletion — `"int32" → {IEEE_INT32, IEEE_INT32}`, `"int64" → {IEEE_INT64,
+IEEE_INT32}` (`types_mapping.h:71` region). Deletion touches neither, and the int64 test
+in §1's test list pins it.
+
+**Relation to S1.a — none, and that is the correction.** This removal is **standalone
 and unblocked**: it touches only the **full build** (`module.cpp` → `types_mapping.h`);
 the codegen-only build never includes `types_mapping.h`, so it is unaffected, and no
 P-a/P-b decision is needed. The full build already has `DataFormats` via
@@ -143,7 +155,7 @@ P-a/P-b decision is needed. The full build already has `DataFormats` via
 It is **not** the same thing as P-a for the reconciliation: making `types_mapping.h`
 sendnn-free does not by itself let `codegen_backend.cpp` include it, because the
 codegen-only include path would still need `<module.h>` and `<util/sendefs.h>`.
-**S1.b's precondition is a separate decision and stays open.** (If, once S1.a lands,
+**S1.a's precondition is a separate decision and stays open.** (If, once S1.b lands,
 someone wants to test whether the reconciliation became easier, that check is: does
 the codegen-only build resolve both headers? — but it is not required by S1.a.)
 
@@ -154,7 +166,10 @@ Removing sendnn does **not** fix the two-answer split; that remains S1's separat
 **Verification bars:** (a) full build compiles with `LIBRARIES=["flex"]` and no sendnn
 header on the include path; (b) int64 still maps to `{IEEE_INT64, IEEE_INT32}` with
 16/32 elem-per-stick semantics preserved; (c) the codegen-only build compiles unchanged;
-(d) `grep -rn sendnn torch_spyre/csrc setup.py` is empty.
+(d) `grep -rn sendnn torch_spyre/csrc setup.py` is empty; **(e) `stringToDTDataFormatPair`
+is byte-identical before and after** — the deletion must not touch the live table, and a
+diff of that function's body is the mechanical proof; **(f) `uint8` still maps to
+`{SENUINT32, SENUINT32}`** (the local row that upstream would have changed).
 
 **Two commits, not one:** sendnn removal and the two-answer fix have different review
 surfaces (build/type vocabulary vs accessor semantics) and must land separately.
