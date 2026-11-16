@@ -197,7 +197,8 @@ anchor a bound on.**
   `SFP_SELECT`. The only 32-bit rows are **conversions** through the rfp32
   container — `F2I32`/`R2I32`/`I2F32` (`codegen/sentient_codegen/gen/rcudd1a/opcodes.py:745-749`,
   `ICVTMode`) — not arithmetic. PT integer is int8/int4 -> **int24 accumulate** via
-  ARF (`sentient-isa-1p0.md:80,1635`).
+  ARF (`sentient-isa-1p0.md:1655-1656` — `pt.ima8`/`pt.ima4`, INT24 accumulation;
+  format statement at `:1633`).
 - **E2 — codegen static classification** (`codegen/sentient_codegen/backend/ttir_to_schedule.py:4222`):
   `_AUXILIARY_DTYPES = frozenset({"i1","i32","i64"})` — i32/i64 are **auxiliary
   structural** dtypes; "a kernel whose dtypes are ALL auxiliary has no compute dtype

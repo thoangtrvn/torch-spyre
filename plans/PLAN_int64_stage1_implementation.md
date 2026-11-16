@@ -122,12 +122,22 @@ path** (`copy_from = &self; copy_to = &dst`; `copyAsync` at `:608`).
 
 **Consequence: the overrun's branch is not established.** It is either (a) the fast
 dense path, where host `dst` is int64-sized (4096 B) against 2048 B of device storage,
-or (b) the staging branch for a non-dense/sliced view. **Slice 3 opens with a
-site-establishment step**: reproduce the failure with the exact triggering tensor and
-capture which branch ran (the allocation size at the throw, or a temporary
-`DEBUGINFO`) before writing any fix. The fix goes where the failure is. Confinement to
-`:575-601` is **conditional** on that step; if the site is the fast path, the slice
-moves there and the "other dtypes unchanged" tests still apply.
+or (b) the staging branch for a non-dense/sliced view. **The measured `[1,512]` is
+therefore a sliced view, not the dense tensor** — a dense one takes the fast path.
+
+**The trigger is the density clause, not the size clause.** The defect is reachable
+through `!is_non_overlapping_and_dense_default()`. The size clause
+(`physical_exceeds_logical`, `512 > 512` = false) is genuinely blind to this case, but
+it is **not** the clause that fires here. **If a fix touches `physical_exceeds_logical`,
+it is fixing the wrong predicate** and must be rejected in review.
+
+**Slice 3 opens with a site-establishment step whose output NAMES THE BRANCH** — not
+"reproduced". Capture, for **both** a dense `[1,512]` int64 and its sliced
+counterpart, a logged evaluation of `is_non_overlapping_and_dense_default()`,
+`dma_numel`, `self.numel()` and `physical_exceeds_logical`, and the branch taken.
+The fix target is then chosen by observation. Confinement to `:575-601` is
+**conditional** on that; if the site is the fast path, the slice moves there and the
+"other dtypes unchanged" tests still apply.
 
 **Site as previously assumed (confirm in 3a):** `spyre_mem.cpp:575-601` (D2H staging
 branch), copy at `:608` (`stream.copyAsync(*copy_from, *copy_to)`), logical view applied
@@ -163,9 +173,15 @@ Confine the change to the staging branch of `spyre_mem.cpp:575-601`; do not touc
 dense fast path in this slice.
 
 **Tests:**
-- `test_d2h_staging_int64_1x512`: the `[1,512]` case allocates 2048 B of staging, not
-  4096, and round-trips values correctly. Fails today (T-DC-121). *(Site per 3a; if
-  3a finds the fast path, the assertion moves to that path's allocation.)*
+- **`test_d2h_dense_int64_1x512_control` — a PASSING control, required.** A **dense**
+  `[1,512]` int64 D2H round-trip that works today. Without it, a fix that also changes
+  the dense path's behaviour cannot be distinguished from one that repairs only the
+  sliced path — this is the "regression bar with no passing control" version of the
+  empty-set problem, and it is non-negotiable alongside the enumeration.
+- `test_d2h_sliced_int64_1x512`: the **sliced** `[1,512]` view (the actual T-DC-121
+  trigger per 3a) allocates 2048 B of staging, not 4096, and round-trips values
+  correctly. Fails today. *(Site per 3a; if 3a finds a different path, the assertion
+  moves with it and the control above stays.)*
 - `test_d2h_staging_float16_unchanged` / `test_d2h_staging_int32_unchanged`: for a
   DL16 / int32 tensor the staging byte size is **unchanged**. **What this pair cannot
   catch, stated so no reader over-reads a green:** a change that alters **only the
