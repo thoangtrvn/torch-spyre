@@ -99,6 +99,15 @@ def enable_spyre_compile_fx_wrapper():
                 if not torch.spyre.codegen_only_available():
                     torch.spyre._impl._lazy_init()
 
+                # int64 is metadata-only on 1p0: no i64 data dtype exists and the
+                # H2D boundary already stores int64 as int32 (csrc/types_mapping.h).
+                # Re-declare the graph's int64 device-metadata tensors as int32 so
+                # sentient_codegen emits i32 pointers instead of refusing the graph
+                # with I64PointerDataError. Fail-loud on an int64 graph output.
+                from .int64_policy import apply_int64_metadata_policy
+
+                example_inputs = apply_int64_metadata_policy(gm, example_inputs)
+
                 with enable_spyre_context(
                     example_inputs, decomps=decomps
                 ) as spyre_context_decompositions:
