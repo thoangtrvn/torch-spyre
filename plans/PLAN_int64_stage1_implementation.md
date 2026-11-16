@@ -8,9 +8,9 @@ Lane `torchspyre-int64-graph-policy` (repo `torch-spyre-thoangtrvn`, base `b413c
 CSRC change → **rebuild on the box under the hardware claim protocol**.
 
 **Lane scope at this revision (after review round 1):**
-- **Slice 1 — split (do not conflate): S1.b sendnn removal is LIVE and implementable;
-  S1.a one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
-  concerns **S1.a only**; dispatch is USER-only and this lane creates no branch.
+- **Slice 1 — split (do not conflate): S1.a sendnn removal is LIVE and implementable;
+  S1.b one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
+  concerns **S1.b only**; dispatch is USER-only and this lane creates no branch.
 - **Slice 2 — live** (owner table is documentation + tests; no build dependency).
 - **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a
   classifies by **exception class first** (§3a); the named candidate is the
@@ -46,13 +46,13 @@ the values.
 ## 1. Slice 1 — two independent items
 
 > **Status split (do not conflate them):**
-> - **S1.b — sendnn removal: LIVE, implementable.** Pure type swap + libs-list edit, full
+> - **S1.a — sendnn removal: LIVE, implementable.** Pure type swap + libs-list edit, full
 >   build only; can proceed now, independent of the carve.
-> - **S1.a — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
+> - **S1.b — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
 >   precondition. This is the piece that needs the USER's carve call, and it is what
 >   gates T-DC-121 *if* the geometry-split candidate holds (§3a).
 >
-> Sequence: **S1.b now, as its own commit; S1.a after the precondition is chosen.**
+> Sequence: **S1.a now, as its own commit; S1.b after the precondition is chosen.**
 > Different review surfaces — never one commit.
 
 **Defect (verified):**
@@ -68,7 +68,7 @@ the live one.** In a real codegen-only build `_C.py:137` is the *no-backend fall
 the accessor on the path is `codegen_backend.cpp:145-167`. "Delete the `_C.py` map" is
 therefore a **no-op against the live path**.
 
-### S1.a — one-owner reconciliation: BLOCKED (P-a / P-b)
+### S1.b — one-owner reconciliation: BLOCKED (P-a / P-b)
 
 **BLOCKED — precondition before the reconciliation (verified).** Routing
 `codegen_backend.cpp` through the C++ pair cannot be done as written:
@@ -88,7 +88,7 @@ silently:
   Smaller diff, larger blast radius: it changes what the codegen-only build can pull
   in, and that is a build-system change the USER should see.
 
-**This slice is BLOCKED until one precondition is chosen.** No worktree or branch is
+**S1.b is BLOCKED until one precondition is chosen.** No worktree or branch is
 created for it (dispatch is USER-only); the carve-out recommendation is with the USER.
 
 **After the precondition, the change is:** make the extracted/shared pair table the
@@ -96,7 +96,7 @@ single owner of the physical/compute format, and have every accessor — runtime
 `codegen_backend.cpp`, and `_C.py` if it survives — answer from it. The accessors must
 not carry independent maps/switches.
 
-### S1.b — sendnn removal (USER-directed; **LIVE, implementable**)
+### S1.a — sendnn removal (USER-directed; **LIVE, implementable**)
 
 The USER has directed that `sendnn` be removed, adopting the necessary piece from
 upstream. It lands here because `types_mapping.h` is already on the int64 critical
@@ -107,7 +107,7 @@ sendnn-free); re-verified in this lane:
 **Signal (verified):** sendnn appears in exactly two places —
 `torch_spyre/csrc/types_mapping.h:24` (`#include <sendnn/tensor/sendatatype.hpp>`) and
 `setup.py:96` (`LIBRARIES = ["sendnn", "sendnn_interface", "flex"]`). The enum appears
-**138 times on 136 lines** (lines 110 and 117 carry two each: both are
+**138 tokens on 136 lines** (lines 110 and 117 carry two each: both are
 `std::pair<sendnn::sen_datatype_enum, sendnn::sen_datatype_enum>`), and **all 138 are
 inside one function**, `stringToSenDatatypePair` (`types_mapping.h:110-348`). No other
 `sendnn::` symbol is used, so it is a pure *type* dependency and `LIBRARIES` drops to
@@ -139,14 +139,14 @@ from the header, and nothing that reaches `stringToDTDataFormatPair` loses a map
 Keep the check anyway as a bar: confirm no caller passes one of those spellings
 (`torchScalarToString` maps `kDouble → "float64"`, so a caller could in principle ask;
 the live table has no `float64` row and today's code already behaves that way, so this
-bar guards against *introducing* a reachable path, not against S1.b).
+bar guards against *introducing* a reachable path, not against S1.a).
 
 **Cross-check that does still matter:** the two Stage-1 rows must be unchanged after
 the deletion — `"int32" → {IEEE_INT32, IEEE_INT32}`, `"int64" → {IEEE_INT64,
 IEEE_INT32}` (`types_mapping.h:71` region). Deletion touches neither, and the int64 test
 in §1's test list pins it.
 
-**Relation to S1.a — none, and that is the correction.** This removal is **standalone
+**Relation to S1.b — none, and that is the correction.** This removal is **standalone
 and unblocked**: it touches only the **full build** (`module.cpp` → `types_mapping.h`);
 the codegen-only build never includes `types_mapping.h`, so it is unaffected, and no
 P-a/P-b decision is needed. The full build already has `DataFormats` via
@@ -155,7 +155,7 @@ P-a/P-b decision is needed. The full build already has `DataFormats` via
 It is **not** the same thing as P-a for the reconciliation: making `types_mapping.h`
 sendnn-free does not by itself let `codegen_backend.cpp` include it, because the
 codegen-only include path would still need `<module.h>` and `<util/sendefs.h>`.
-**S1.a's precondition is a separate decision and stays open.** (If, once S1.b lands,
+**S1.b's precondition is a separate decision and stays open.** (If, once S1.a lands,
 someone wants to test whether the reconciliation became easier, that check is: does
 the codegen-only build resolve both headers? — but it is not required by S1.a.)
 
