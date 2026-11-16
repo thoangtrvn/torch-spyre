@@ -55,6 +55,12 @@ Two acceptable implementations, in preference order:
 **Do not** change the *logical* dtype: `torch.int64` stays int64 at the eager
 `.to("spyre")` boundary (Ruling 2; `tests/test_spyre.py:236`).
 
+**Blast radius before the change:** enumerate every caller of `get_device_dtype` and
+`get_elem_in_stick` (host Python and C++) and list them in the commit. This is a
+behaviour change to a shared accessor: each caller that sizes an allocation from it
+is a latent half-size bug today and a changed number tomorrow. The list is produced
+by search, not by memory, and an empty list means the accessor is dead (say so).
+
 **Tests (red-first):**
 - `test_device_dtype_one_answer`: `get_device_dtype(torch.int64) == IEEE_INT32` and
   `get_elem_in_stick(torch.int64) == 32` in **both** build modes. Fails today in
@@ -82,6 +88,19 @@ owner; a row that consults two is the defect class.
 **Deliverable:** this table committed with, per row, the `file:line` of the call site
 that implements it and the test that pins it. A row whose call site cannot be named
 is an open defect, not a complete row.
+
+**How this table fails, stated so the reviewer can check it:**
+- **Column headings are not a population.** A row filled with "storage_dtype" but no
+  `file:line` is a plan, not a Stage-1 artefact. Every row needs a real call site.
+- **`compute_dtype` may have no caller at all.** It is the format the kernel executes
+  in; on the host side the readback might legitimately consult only
+  `storage_dtype`. If the `compute_dtype` column comes back empty, that is a
+  **finding to record** (which accessor, if any, answers the compute question), not a
+  row to fill by analogy.
+- **The set of callers of `get_device_dtype` / `get_elem_in_stick` must be an
+  enumeration, not an example.** Slice 1 changes what those functions answer, so
+  every caller's sizing decision changes with it; the enumeration is the blast
+  radius and is produced by search, then listed.
 
 **Tests:** one per row (six). The view/`as_strided` and host-transfer rows are the
 ones that currently fail or are unexercised; the stride and storage-size rows are the
@@ -114,6 +133,15 @@ moves there and the "other dtypes unchanged" tests still apply.
 branch), copy at `:608` (`stream.copyAsync(*copy_from, *copy_to)`), logical view applied
 at `:611-614` (`cpu_alloc.as_strided(...)` → `dst.copy_(cpu_view)`).
 
+**Framing: this site is the odd one out, not a new capability.** Within the same
+file, the staging path is the **one allocation site that does not derive its byte
+size from `get_device_size_in_bytes`**. That helper is declared at
+`spyre_tensor_impl.h:149`, defined at `spyre_tensor_impl.cpp:286`, and already used
+at `spyre_mem.cpp:449`, `:493`, `:526` and `:652`. So the change is **"join the
+convention that already exists four times in this file"**, not "introduce a sizing
+rule": the implementer should mimic those four call sites and the reviewer can check
+conformance by comparison rather than by argument.
+
 The staging branch builds `alloc_view = at::as_strided(self, dma_sizes, dma_strides)`
 and then
 
@@ -136,14 +164,19 @@ dense fast path in this slice.
 
 **Tests:**
 - `test_d2h_staging_int64_1x512`: the `[1,512]` case allocates 2048 B of staging, not
-  4096, and round-trips values correctly. Fails today (T-DC-121).
-- `test_d2h_staging_float16_unchanged`: for a DL16 tensor the staging byte size is
-  **unchanged** (byte-identical allocation size) — the fix must not perturb the
-  currently-passing dtypes.
-- `test_d2h_staging_int32_unchanged`: same for int32.
-- **Regression:** every currently-passing int64 path stays byte-identical (the
-  reviewer's bar). Enumerate those paths first — if the enumeration finds none, say
-  so; "byte-identical" over an empty set is not evidence.
+  4096, and round-trips values correctly. Fails today (T-DC-121). *(Site per 3a; if
+  3a finds the fast path, the assertion moves to that path's allocation.)*
+- `test_d2h_staging_float16_unchanged` / `test_d2h_staging_int32_unchanged`: for a
+  DL16 / int32 tensor the staging byte size is **unchanged**. **What this pair cannot
+  catch, stated so no reader over-reads a green:** a change that alters **only the
+  int64 staging bytes** passes both by construction. Their green covers fp16 and
+  int32 only; the int64 path's coverage comes from the `[1,512]` test and the
+  regression enumeration, never from these two.
+- **Regression bar (non-negotiable):** every currently-passing int64 path stays
+  byte-identical. **The report must include the enumerated list of those paths.** An
+  empty enumeration is a **STOP**, not a pass: *"byte-identical over an empty set is
+  not evidence"* — the bar is met only by a non-empty list of named paths and their
+  before/after sizes.
 
 ---
 
@@ -155,12 +188,14 @@ dense fast path in this slice.
 tensor) → `dtype_cpu` (IEEE_INT64) inside the transfer. **That conversion is
 runtime-claimed with no committed witness.**
 
-**Why it blocks Slice 3:** whether the widening happens in the DMA engine or must
-happen on the host decides which side of the staging buffer is mis-sized. If the DMA
-widens, the host destination must be int64-sized and the *device read* is what needs
-the device-size bound; if it does not, the host buffer must be int32 and the widening
-must be a host `copy_`. Guessing produces a fix that passes one shape and overruns
-another.
+**Why it blocks Slice 3 — a hard dependency, not a hedge (non-negotiable ordering):**
+whether the widening happens in the DMA engine or must happen on the host decides
+which side of the staging buffer is mis-sized. If the DMA widens, the host destination
+must be int64-sized and the *device read* is what needs the device-size bound; if it
+does not, the host buffer must be int32 and the widening must be a host `copy_`.
+Guessing produces a fix that passes one shape and overruns another — and the failure
+would surface only after the fix was written. **Slice 4's witness lands before Slice 3
+is called done.**
 
 **Witness required (device, claim protocol):** an int64 tensor with values that
 distinguish int32 from int64 width and sign (e.g. `[-3, -1, 0, 1, 2^20]` on device),
@@ -206,6 +241,11 @@ planning artefacts, not code:
    the named `InstructionTemplate` and the pass/route point where an int32-arith TTIR
    op becomes an rfp32 SFP sequence. If no point exists without new codegen
    structure, say so — that is an architecture cost, and it is the decision input.
+   **Stop rule:** the artefact must contain either a named `InstructionTemplate`
+   plus the pass/route point, or an explicit "no attachment point exists; new
+   structure required" with that structure named. A verb ("identify where it
+   attaches") with neither output is an undischarged condition — it pushes the hard
+   question into code, which is what the entry condition exists to prevent.
 2. **The per-tensor-class 2^24 bound proof**, written separately for:
    - **accumulation** (`cumsum`, `sum`, `prod`): `N · max|term| < 2^24`;
    - **`i·stride + j`**: the *product* and the *sum* both `< 2^24`, distinguishing
