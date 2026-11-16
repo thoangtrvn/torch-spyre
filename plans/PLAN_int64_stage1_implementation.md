@@ -7,6 +7,17 @@ Stage 1 under **Ruling 3 (USER, 2026-11-16): Stage 1 first, then Branch E.**
 Lane `torchspyre-int64-graph-policy` (repo `torch-spyre-thoangtrvn`, base `b413c3e3`).
 CSRC change → **rebuild on the box under the hardware claim protocol**.
 
+**Lane scope at this revision (after review round 1):**
+- **Slice 1 — BLOCKED** on a precondition (§1: `sendnn`-free extraction, or a
+  codegen-only include change). Recommendation to carve it into its own lane is with
+  the USER; dispatch is USER-only and this lane does not create a branch for it.
+- **Slice 2 — live** (owner table is documentation + tests; no build dependency).
+- **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a must
+  produce a receipt or report "not established" (§3.0/§3a).
+- **Slice 4 — live scope and now load-bearing**: its witness chooses Slice 3's
+  mechanism, and the witness must drive the **staging** branch (§4).
+- **E entry conditions — planning artefacts only** (§6).
+
 Every `file:line` below was read in this lane's worktree at plan time.
 
 ---
@@ -37,20 +48,39 @@ the values.
 | side | site | int64 answer | elems/stick |
 |---|---|---|---|
 | C++ runtime | `torch_spyre/csrc/module.cpp:190-195` (`get_elem_in_stick`), `:198-202` (`get_device_dtype`) — both `stringToDTDataFormatPair(str_type).second` | `IEEE_INT32` (`csrc/types_mapping.h:71`, `{"int64", {IEEE_INT64, IEEE_INT32}}`) | **32** |
-| codegen-only Python | `torch_spyre/_C.py:137` `get_device_dtype` → `_get_dtype_map()[dtype]`, map built at `:116-121` with `torch.int64: DataFormats.IEEE_INT64` | `IEEE_INT64` | **16** (`_C.py:99-100`) |
+| **codegen backend (LIVE)** | `torch_spyre/csrc/codegen_backend.cpp:145-167` `spyre::codegen::get_device_dtype` — **its own switch**, `Long → DataFormats::IEEE_INT64`, with its own `enum class DataFormats` at `:52-72`; bound to Python at `:935` | `IEEE_INT64` | **16** (`elems_per_stick_for_format`) |
+| codegen-only Python fallback (**dead in a real install**) | `torch_spyre/_C.py:137` → `_get_dtype_map()[dtype]`, map at `:116-121` | `IEEE_INT64` | **16** (`_C.py:99-100`) |
 
-**Change:** make the C++ pair's `.second` the single owner of the physical/compute
-format. The Python codegen-only accessor must **delegate to the same truth or be
-deleted**; it must not carry its own logical→device map (`_C.py:119`).
+**Three answer-sites, not two — and the one this slice first proposed to edit is not
+the live one.** In a real codegen-only build `_C.py:137` is the *no-backend fallback*;
+the accessor on the path is `codegen_backend.cpp:145-167`. "Delete the `_C.py` map" is
+therefore a **no-op against the live path**.
 
-Two acceptable implementations, in preference order:
+**BLOCKED — precondition before any Slice-1 change (verified).** Routing
+`codegen_backend.cpp` through the C++ pair cannot be done as written:
+`csrc/types_mapping.h:24` does `#include <sendnn/tensor/sendatatype.hpp>`, and
+`setup.py` adds `SEN_COMMON_HEADERS` (the dir holding it) **only inside
+`if not CODEGEN_ONLY:`** (`setup.py:98` guards the block; `INCLUDE_DIRS +=
+[os.environ["SEN_COMMON_HEADERS"]]` is inside it). In the codegen-only build that
+header is off the include path, so `codegen_backend.cpp` **cannot** include
+`types_mapping.h`.
 
-1. **Delete the Python map and route the codegen-only accessor through the C++
-   definition** (generate or bind it), so there is literally one table. Preferred —
-   it makes the two-answer class unrepresentable rather than merely equal today.
-2. If binding is impractical in codegen-only mode (no extension loaded), keep
-   `_C.py` but derive its int64 entry from the pair (int32/32) with a comment naming
-   `types_mapping.h:71` as the owner, and add the equality test below as the guard.
+One owner therefore requires **one of two preconditions**, and the plan must not pick
+silently:
+- **(P-a) Extract a `sendnn`-free header** holding the logical→device pair table and a
+  shared `DataFormats` enum, included by both `codegen_backend.cpp` and the runtime.
+  Preferred (no build-surface change), but it is a refactor with its own review.
+- **(P-b) Add `SEN_COMMON_HEADERS` to the codegen-only include set** in `setup.py`.
+  Smaller diff, larger blast radius: it changes what the codegen-only build can pull
+  in, and that is a build-system change the USER should see.
+
+**This slice is BLOCKED until one precondition is chosen.** No worktree or branch is
+created for it (dispatch is USER-only); the carve-out recommendation is with the USER.
+
+**After the precondition, the change is:** make the extracted/shared pair table the
+single owner of the physical/compute format, and have every accessor — runtime,
+`codegen_backend.cpp`, and `_C.py` if it survives — answer from it. The accessors must
+not carry independent maps/switches.
 
 **Do not** change the *logical* dtype: `torch.int64` stays int64 at the eager
 `.to("spyre")` boundary (Ruling 2; `tests/test_spyre.py:236`).
@@ -60,14 +90,21 @@ Two acceptable implementations, in preference order:
 behaviour change to a shared accessor: each caller that sizes an allocation from it
 is a latent half-size bug today and a changed number tomorrow. The list is produced
 by search, not by memory, and an empty list means the accessor is dead (say so).
+**Already known to be on the list: `torch_spyre/_inductor/choices.py:333` —
+`elements_per_stick = get_elem_in_stick(self._kernel_dtype(features))` sizes the tiling
+blocks, so an int64 kernel currently tiles at 16 elem/stick instead of 32 (verified).**
 
-**Tests (red-first):**
+**Tests (red-first), including the pin that must flip in the SAME commit:**
 - `test_device_dtype_one_answer`: `get_device_dtype(torch.int64) == IEEE_INT32` and
   `get_elem_in_stick(torch.int64) == 32` in **both** build modes. Fails today in
   codegen-only (returns `IEEE_INT64` / 16) — that failure is the proof of C1.
+- **`tests/test_choices_eps_dtype.py:49` pins `(torch.int64, 16)`** (verified). The
+  correct fix makes it 32, so it turns red. It must be flipped `16 → 32` **in the same
+  commit** that fixes the accessor (same-commit red-first), not surface at gate time.
 - `test_device_dtype_matches_cpp_pair`: for every dtype in
-  `torchScalarToString`/`stringToDTDataFormatPair`, the Python answer equals the
-  C++ `.second`. This is the anti-drift guard, not just an int64 special case.
+  `torchScalarToString`/`stringToDTDataFormatPair`, every accessor answer equals the
+  shared pair's `.second`. This is the anti-drift guard, not just an int64 special
+  case.
 
 ---
 
@@ -223,10 +260,18 @@ is correctness, not heap. **The witness lands before Slice 3's mechanism is chos
 all** — not merely before it is called done.
 
 **Witness required (device, claim protocol):** an int64 tensor with values that
-distinguish int32 from int64 width and sign (e.g. `[-3, -1, 0, 1, 2^20]` on device),
-copied D2H through the **non-staging** path, asserting exact values. It must be a
-committed receipt, not a verbal result. This is the "runtime-claimed, no committed
-witness" the reviewer flagged.
+distinguish int32 from int64 width **and sign** — at least one **negative** (`-3` reads
+`-3` if the converter sign-extends; huge/garbage if it raw-packs) and one **≥ 2^31**
+(width) — e.g. `[-3, -1, 0, 1, 2^20, 2^31 + 5]` on device — copied D2H and asserted
+exactly. It must be a committed receipt, not a verbal result.
+
+**The witness must drive the STAGING branch, not the fast path.** A dense tensor never
+enters staging (§3a predicate), so a non-staging witness proves only that the fast path
+converts — it cannot observe how the staging branch sizes or fills its buffer. The
+witness tensor must be **non-dense or `physical_exceeds_logical`** (e.g. a strided /
+sliced view) so the staging code at `:588-614` actually runs. If the same tensor is
+also copied through the fast path, record both and compare — that pair is what
+distinguishes "the converter widens" from "the two paths size differently".
 
 ---
 
