@@ -24,6 +24,24 @@ emitted Triton signature turns `*i64,*i64` -> `*i32,*i32` under that approach.
 
 ---
 
+## 0.5 Rulings applied (2026-11-16)
+
+- **Ruling 2 — logical dtype is preserved at every user-visible boundary.**
+  `logical_dtype` stays `torch.int64` at the eager `.to("spyre")` boundary
+  (`tests/test_spyre.py:236` dtype-preserved). **Normalization is an in-graph
+  transformation** (torch-spyre Inductor boundary, USER Stage-2). **Storage width
+  is the runtime's business and must be consistent** — that third clause is C1 and
+  T-DC-121. Stage 2 therefore never changes the eager tensor dtype; it changes only
+  what the *compiled graph* declares/executes.
+
+- **Ruling 1 — P0 (exactness bound) answered from the lowering, not hardware
+  first.** See §4. Result: **there is no native int32 *data*-arithmetic path; the
+  exact native integer bound is int16.** This is a conflict with the USER Stage-2
+  premise ("INT32 execution preferred provided range and arithmetic are safe") and
+  requires a USER ruling before Stage-2 code — reported, not reconciled.
+
+---
+
 ## 1. Conflicts between the spec / external cites and this tree (verified)
 
 These are the highest-value findings: places where the framing did not match the code.
@@ -141,36 +159,77 @@ An unproven origin refuses (never a silent cast).
 
 ## 4. Value-range and intermediate-overflow contract (Stage 2)
 
-**Exactness bound `E`** = the largest magnitude the backend preserves exactly for
-integer add/mul:
-`E = INT32_INT_EXACT` (2^31) if the §7-P0 probe shows true-integer execution, else
-`E = FP32_MANTISSA_EXACT` (2^24) if it shows an fp32 pivot. **`E` is a single named
-constant derived from the probe, not baked in.** Condition 2 is checked against the
-running intermediate, not only endpoints.
+**Exactness bound `E` — P0 ANSWERED from the lowering (codegen + ISA), device KAT
+still owed.**
 
-Value evidence (upstream #1547): embedding ~200K, RoPE position >=128K context,
-KV-cache = addressable space (an address, not a value — §5), MoE ~16 experts. Every
-**value** carrier is ~4 orders below 2^31 (and below 2^24), so the cited carriers are
-safe under either `E`; the contract must still prove it per origin.
+Finding: **the AIU has no native int32 *data* arithmetic, so `E = 2^31` does not
+hold.** Evidence, two independent classes:
 
-Per op class (check the running intermediate):
+- **ISA instruction set** (`wiki/specs/isa/sentient-isa-1p0.md:2231-2262`): every
+  multiply is floating — `SFP_FMUL` (0x00), `SFP_FMA` (0x04), `SFP_FNMS` (0x06);
+  there is **no integer multiply**. Integer handling is `SFP_ICVT` (convert),
+  `SFP_IME` (Insert/Modify Exponent — *not* multiply; the doc's "integer
+  multiply-extend" label at `:2239` is disputed by `opcodes.py:759-762`), `SFP_SHR`,
+  `SFP_LOGICAL`, `SFP_SELECT`. The only 32-bit rows are **conversions** through the
+  rfp32 container — `F2I32`/`I2F32`/`R2I32` (`opcodes.py:766-772`) — not arithmetic.
+  PE "integer arithmetic" is the **int16 FMA lane** (`core-functional-units.md:112`
+  lists int16/int8/int4/int2, all sub-32-bit); PT integer is int8/int4 -> **int24
+  accumulate** via ARF (`sentient-isa-1p0.md:80,1635`).
+- **Codegen classification** (`backend/ttir_to_schedule.py:4222`):
+  `_AUXILIARY_DTYPES = {"i1","i32","i64"}` — i32/i64 are **auxiliary structural**
+  dtypes; "a kernel whose dtypes are ALL auxiliary has no compute dtype to resolve."
+  `backend/ttir_analyzer.py:90` calls `addi/subi/muli/divsi/remsi` **"INFRASTRUCTURE:
+  integer index/pointer math"**, not compute. The pointwise compute set keys on
+  float ops only (`_FLOAT_COMPUTE_ARITH_OPS`, `ttir_analyzer.py:98`). So a
+  materialized int32 *data* result of arithmetic has no supported exact device
+  lowering.
 
-- **accumulation** (`cumsum`, `sum`, `prod`): bound `N * max|term| <= E`. Attention
-  -mask cumsum (terms in {0,1}) <= seq_len: safe. A general int32 accumulation can
-  exceed `E` mid-chain with in-range inputs and outputs -> **refuse typed unless
-  `N * max|term| <= E` is proven.**
-- **product** (`mul`; fused address expressions): `a*b <= E` even when a,b fit. The
-  affine-index form `i*stride+j` is the canonical case — a large `stride` overflows
-  the product with in-range `i,j,result`. Bound the **product**, not the factors.
-- **elementwise** (`add`, `sub`, `eq`, `lt`, `clamp`): operand bounds; safe for the
-  cited carriers, but must be proven per origin.
-- **op classes that can overflow mid-chain while inputs/outputs fit, and therefore
-  need explicit rules:** accumulation, product, and affine index computation
-  (`i*stride+j`). A final-tensor-only check passes these incorrectly (USER condition 2).
+Therefore the exact-integer possibilities are, per op class:
+- **int16 lane** (PE FMA integer / `F2I`->int16): exact to **2^15 = 32768**.
+- **int8/int4 -> int24** (PT IMA): int24 accumulate, inputs <= int8/int4.
+- **float pivot**, if any: native pointwise is **DL16** (fp32 upcast disabled —
+  `patches.py` `triton.codegen_upcast_to_fp32=False`) => exact only ~**2^10**; an
+  rfp32-container pivot would give 2^24 but there is **no evidenced rfp32
+  multiply** (FMA is 16-bit).
+
+**Consequence — conflict with the USER Stage-2 premise, for a ruling.** The value
+carriers (upstream #1547: RoPE >=128K, embedding ~200K; MoE ~16) **exceed the only
+exact native integer lane (int16, 2^15)** and the DL16 native pivot (~2^10). INT32
+*data* arithmetic is neither performable nor exact on this hardware. `E` is not a
+single 2^31 constant; it is per-op and ≤ 2^15 for the only exact integer path.
+
+**Design implication (proposed, needs ruling):** the sound route is not "normalize
+data arithmetic to INT32" but:
+1. **keep position/index values in the address path** — they are consumed only as
+   gather indices / addresses (embedding `weight[pos]`, addresses), and integer
+   add/mul execute natively in LX/DIU *address generation* (the "infrastructure"
+   role), never materialized as data; and
+2. **keep materialized position *data* (OPT's stored `(cumsum*mask-1).long()+2`) on
+   the CPU fallback** (Stage 3, explicit — the current #4317 behaviour, correct but
+   slow), because no exact device integer path covers 128K-scale values.
+   (`cumsum*mask` with mask in {0,1} is a **select** `SFP_SELECT` 0x0E, exact at any
+   width, so the mask-multiply itself is not the problem; the accumulation range is.)
+
+`E` remains a single named constant per op class, derived from the P0 reading; the
+device KAT (§7 P0-confirm) is owed to confirm it.
+
+Per op class (check the running intermediate, condition 2):
+
+- **accumulation** (`cumsum`, `sum`, `prod`): bound `N * max|term| <= E_op`. Attention
+  -mask cumsum (terms in {0,1}) <= seq_len: safe **only** if seq_len <= `E_op`; at
+  RoPE 128K it is NOT safe under int16/DL16 -> CPU fallback.
+- **product** (`mul`; fused address expressions): `a*b <= E_op` even when a,b fit.
+  The affine-index form `i*stride+j` overflows the product with in-range `i,j,result`
+  — but this is **address math** (§5), executed natively in the address path; bound
+  the product against the *address* width, not the element width.
+- **elementwise** (`add`, `sub`, `eq`, `lt`, `clamp`): operand bounds; int16/DL16
+  range for data, address width for index.
+- **op classes where mid-chain overflow can occur with in-range endpoints:**
+  accumulation, product, and affine index computation (`i*stride+j`) — a
+  final-tensor-only check passes them incorrectly (condition 2).
 
 **Placement:** the bound is a symbolic claim discharged at the Inductor boundary from
-the §3 origin taxonomy; undischarged -> Stage-3 refusal. It is **not** a runtime
-clamp.
+the §3 origin taxonomy; undischarged -> Stage-3 refusal. Never a runtime clamp.
 
 ---
 
@@ -214,10 +273,11 @@ defense-in-depth only, never the primary user-facing refusal.
 
 ## 7. Falsification plan (plan-first; no code)
 
-- **P0 (first, Stage 2 gate): exactness probe.** Determine whether
-  `arith.muli : tensor<32xi32>` and i32 add execute as true integer or via an fp32
-  pivot in this backend; fix `E` (§4) from the result. Everything in §4 depends on it.
-  Until P0 answers, `E` is treated as the conservative `FP32_MANTISSA_EXACT`.
+- **P0 (ANSWERED from lowering; device KAT owed):** §4 establishes from ISA + codegen
+  that there is **no native int32 data arithmetic**; exact native integer bound is
+  int16 (2^15), DL16 pivot ~2^10, rfp32 pivot 2^24 conversion-only. A device KAT must
+  confirm the *refusal/behaviour* of an i32 data `muli`/`addi` (does it refuse, or
+  lower via a float pivot?) — that is the second, independent evidence class.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
   (currently **16 vs 32** — fails today, proving C1). Add: storage size = `numel*4`;
@@ -247,3 +307,37 @@ defense-in-depth only, never the primary user-facing refusal.
 - Do not widen codegen: `I64PointerDataError` is the law Stage 2 respects.
 - Do not conflate the embedding-table span wall (§5) with the element-width problem.
 - 1.5 (`SEN1P5`) encoding is out of scope.
+
+---
+
+## 9. Trial-merge vs staging `7fff29f42` (f32-pointer refusal)
+
+`7fff29f42` merges `f32-pointer-element-grain-refusal` and puts the f32 refusal
+**above every route**: `ttir_to_schedule._refuse_compute_only_pointer_pointees`
+(`ttir_to_schedule.py:4283`, called at `:5571`) is declared "the ONE owner of the
+pointer-grain law", keyed on pointer **pointee spellings** in `kernel_info.args`;
+`_resolve_element_bits` skips `_AUXILIARY_DTYPES` (`:4222`).
+
+**Textual conflict: none.** The f32 law edits the codegen repo
+(`codegen/sentient_codegen/backend/ttir_to_schedule.py`); this plan's Stage-1/2/3
+edits live in the torch-spyre repo (`torch_spyre/_C.py`, `csrc/module.cpp`,
+`csrc/types_mapping.h`, `torch_spyre/_inductor/`, `ops/`). C5 *reads*
+`generated_inventory.py:172`, it does not edit it.
+
+**Semantic conflict: none, provided the boundary is respected — and it constrains us.**
+- int64 normalization is **upstream in torch-spyre** (USER Stage-2), so codegen sees
+  i32 pointees and never interacts with the f32 grain law (different dtype; i32 is
+  auxiliary, skipped by `_resolve_element_bits`). The i64 and f32 laws are parallel
+  single-owner guards at different points (i64 at descriptor parse
+  `_descriptor.py:502-522`; f32 at `compile_ttir_to_spyre` route entry `:5571`).
+- **Hard constraint (the seam the lead flagged):** any int64 normalization that tried
+  to rewrite `!tt.ptr<i64>` -> `!tt.ptr<i32>` *inside codegen* would contend with
+  `_refuse_compute_only_pointer_pointees`'s "ONE owner of the pointer-grain law" on
+  the same `kernel_info.args` pointees. This is forbidden by the design: int64
+  normalization stays in torch-spyre; codegen keeps both guards untouched.
+- Watch item: the f32 law keys on `_COMPUTE_ONLY_16_BIT_DTYPES` and does not consider
+  i64; `_AUXILIARY_DTYPES` includes i32/i64. Confirm at merge time that no codegen
+  change reclassifies i32/i64 pointees.
+
+**Result: trial-merge clean (no textual, no semantic conflict) under the
+"normalization stays upstream" rule.**
