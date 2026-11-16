@@ -91,9 +91,28 @@ T-DC-121 neighbourhood.
 
 ## 3. Slice 3 — T-DC-121: derive the staging buffer from the device size
 
-**Site (verified):** `torch_spyre/csrc/spyre_mem.cpp:575-601` (D2H staging branch),
-copy at `:608` (`stream.copyAsync(*copy_from, *copy_to)`), logical view applied at
-`:611-614` (`cpu_alloc.as_strided(...)` → `dst.copy_(cpu_view)`).
+### 3a. Establish the failing site FIRST — do not presume the branch
+
+The staging branch at `spyre_mem.cpp:575-601` is entered only when
+`!is_non_overlapping_and_dense_default() || dma_numel > self.numel()` (`:594-595`).
+For a **dense** `[1,512]` int64 tensor `dma_sizes == [1,512]` (set at allocation,
+`spyre_mem.cpp:462,512,543`; `codegen_backend.cpp:559`), so `dma_numel == 512 ==
+numel`: `physical_exceeds_logical` is **false** and the tensor **is** dense — so the
+staging branch is **not taken**, and the `[1,512]` case goes through the **fast dense
+path** (`copy_from = &self; copy_to = &dst`; `copyAsync` at `:608`).
+
+**Consequence: the overrun's branch is not established.** It is either (a) the fast
+dense path, where host `dst` is int64-sized (4096 B) against 2048 B of device storage,
+or (b) the staging branch for a non-dense/sliced view. **Slice 3 opens with a
+site-establishment step**: reproduce the failure with the exact triggering tensor and
+capture which branch ran (the allocation size at the throw, or a temporary
+`DEBUGINFO`) before writing any fix. The fix goes where the failure is. Confinement to
+`:575-601` is **conditional** on that step; if the site is the fast path, the slice
+moves there and the "other dtypes unchanged" tests still apply.
+
+**Site as previously assumed (confirm in 3a):** `spyre_mem.cpp:575-601` (D2H staging
+branch), copy at `:608` (`stream.copyAsync(*copy_from, *copy_to)`), logical view applied
+at `:611-614` (`cpu_alloc.as_strided(...)` → `dst.copy_(cpu_view)`).
 
 The staging branch builds `alloc_view = at::as_strided(self, dma_sizes, dma_strides)`
 and then

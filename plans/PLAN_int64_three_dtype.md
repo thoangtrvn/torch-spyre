@@ -249,12 +249,12 @@ row of this table is not a safe enumeration of arithmetic capability.
 containment, D is parked, B/c remain written for the record. The branch text below is
 retained because it records the evidence and the costs that produced the ruling.
 
-**E3 selects Branch A** (no exact integer *data* datapath). Branches A–E are all
-written; each carries its **falsifier**. A is the current position; **D and E are the
-two branches that could preserve on-device exactness**, each written with its cost
-and **neither recommended**; C stays a written option, **not a recommendation**. E is
-the leading exact alternative because its core premise is silicon-witnessed and it is
-1 FMA per op versus D's 9 MACs; D does not depend on any mode bit but is heavier.
+**E3 selected Branch A** (no exact integer *data* datapath), and **Ruling 3 then
+chose the route**: E is the destination, D is parked, A is typed interim containment,
+C stays a written option. Branches A–E are retained below with their costs and
+falsifiers because that comparison is the **rationale for the ruling**, not an open
+question. E won on coverage with one mechanism (1 FMA per op versus D's 9 MACs) and a
+silicon-witnessed width premise; D's premise is mode-independent but heavier.
 
 **Branch A — SELECTED by E3: no exact integer *data* datapath.**
 - Condition (met): no exact integer multiply/ALU on the vector data path; integer
@@ -406,12 +406,11 @@ Evidence tags are per claim and must not be compressed: `[1p5 RTL]`,
 
 **E3 (RTL) selected Branch A; E4 (device KAT) is owed** to confirm on 1p0 silicon
 that an i32 data `muli`/`addi` on the emitted route refuses or is inexact — E3 is
-1p5 source, E4 is the 1p0 witness. **Branches D and E are the open alternatives** and
-are not decided by E3: D by a device probe of the limb-convolution cost plus PT
-reachability; **E's core premise is already answered — `m1-arith-width`/`p1-fmul`/
-`p1-arith` ran on silicon 2026-11-07 and read rfp32 — so what remains for E is the
-per-class 2^24 proof, the residual rounding/sign/exponent scope, and i32→rfp32
-lowering reachability.**
+1p5 source, E4 is the 1p0 witness. **The D-vs-E question is closed by Ruling 3: E is
+the route, D is parked.** E's core premise is silicon-witnessed (`m1-arith-width`/
+`p1-fmul`/`p1-arith`, 2026-11-07, rfp32); what remains for E is the per-class 2^24
+proof, the residual rounding/sign/exponent scope, and i32→rfp32 lowering
+reachability — the §6 entry conditions of `PLAN_int64_stage1_implementation.md`.
 
 ### 4.2 Per-op bound under Branch A (and the bound law under B / C / D)
 
@@ -539,8 +538,8 @@ defense-in-depth only, never the primary user-facing refusal.
 - Do not conflate the embedding-table span wall (§5) with the element-width problem.
 - Do not reintroduce the refuted int16 premise (§4.0 corrections); int8/int4→int24
   is the only exact integer arithmetic.
-- Do not recommend Branch D — it is written with its cost so the A-vs-D choice is
-  explicit; the USER rules.
+- Do not work Branch D — it is **parked by Ruling 3** (the path if integer-heavy
+  workloads later justify it). Its cost stays recorded, not acted on.
 - **Do not cite the threefry oracle's 120,900-vector bit-identity as hardware
   evidence** — it is the *emulator* and validates the Threefry algebra. **Cite the
   census instead** for the M=1 width question:
