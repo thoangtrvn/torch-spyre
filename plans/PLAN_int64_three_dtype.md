@@ -35,10 +35,13 @@ emitted Triton signature turns `*i64,*i64` -> `*i32,*i32` under that approach.
   what the *compiled graph* declares/executes.
 
 - **Ruling 1 — P0 (exactness bound) answered from the lowering, not hardware
-  first.** See §4. Result: **there is no native int32 *data*-arithmetic path; the
-  exact native integer bound is int16.** This is a conflict with the USER Stage-2
-  premise ("INT32 execution preferred provided range and arithmetic are safe") and
-  requires a USER ruling before Stage-2 code — reported, not reconciled.
+  first.** See §4. Provisional result: **no native int32 *data*-arithmetic path; the
+  exact native integer bound is int16**, from E1 (ISA doc) + E2 (codegen static
+  classification) — **documentary/static only**. This is a conflict with the USER
+  Stage-2 premise ("INT32 execution preferred provided range and arithmetic are
+  safe") and is **not settled**: the USER directed an RTL check as the class that can
+  refute a document, and §4 is written as a three-branch fork on that answer. No
+  Stage-2 code until the branch is chosen.
 
 ---
 
@@ -159,61 +162,111 @@ An unproven origin refuses (never a silent cast).
 
 ## 4. Value-range and intermediate-overflow contract (Stage 2)
 
-**Exactness bound `E` — P0 ANSWERED from the lowering (codegen + ISA), device KAT
-still owed.**
+### 4.0 P0 result and its **evidence class**
 
-Finding: **the AIU has no native int32 *data* arithmetic, so `E = 2^31` does not
-hold.** Evidence, two independent classes:
+Finding (provisional): **the AIU appears to have no native int32 *data* arithmetic,
+so `E = 2^31` does not hold**; the widest *exact* native integer path is int16.
 
-- **ISA instruction set** (`wiki/specs/isa/sentient-isa-1p0.md:2231-2262`): every
-  multiply is floating — `SFP_FMUL` (0x00), `SFP_FMA` (0x04), `SFP_FNMS` (0x06);
-  there is **no integer multiply**. Integer handling is `SFP_ICVT` (convert),
-  `SFP_IME` (Insert/Modify Exponent — *not* multiply; the doc's "integer
-  multiply-extend" label at `:2239` is disputed by `opcodes.py:759-762`), `SFP_SHR`,
-  `SFP_LOGICAL`, `SFP_SELECT`. The only 32-bit rows are **conversions** through the
-  rfp32 container — `F2I32`/`I2F32`/`R2I32` (`opcodes.py:766-772`) — not arithmetic.
-  PE "integer arithmetic" is the **int16 FMA lane** (`core-functional-units.md:112`
-  lists int16/int8/int4/int2, all sub-32-bit); PT integer is int8/int4 -> **int24
-  accumulate** via ARF (`sentient-isa-1p0.md:80,1635`).
-- **Codegen classification** (`backend/ttir_to_schedule.py:4222`):
-  `_AUXILIARY_DTYPES = {"i1","i32","i64"}` — i32/i64 are **auxiliary structural**
-  dtypes; "a kernel whose dtypes are ALL auxiliary has no compute dtype to resolve."
-  `backend/ttir_analyzer.py:90` calls `addi/subi/muli/divsi/remsi` **"INFRASTRUCTURE:
-  integer index/pointer math"**, not compute. The pointwise compute set keys on
-  float ops only (`_FLOAT_COMPUTE_ARITH_OPS`, `ttir_analyzer.py:98`). So a
-  materialized int32 *data* result of arithmetic has no supported exact device
-  lowering.
+**Evidence class: documentary/static — two artifact classes, zero silicon, zero RTL.
+This is deliberately not yet a settled fact.**
 
-Therefore the exact-integer possibilities are, per op class:
-- **int16 lane** (PE FMA integer / `F2I`->int16): exact to **2^15 = 32768**.
-- **int8/int4 -> int24** (PT IMA): int24 accumulate, inputs <= int8/int4.
-- **float pivot**, if any: native pointwise is **DL16** (fp32 upcast disabled —
-  `patches.py` `triton.codegen_upcast_to_fp32=False`) => exact only ~**2^10**; an
-  rfp32-container pivot would give 2^24 but there is **no evidenced rfp32
-  multiply** (FMA is 16-bit).
+- **E1 — ISA document** (`wiki/specs/isa/sentient-isa-1p0.md:2231-2262`): every
+  multiply is floating — `SFP_FMUL` (0x00, `:2235`), `SFP_FMA` (0x04),
+  `SFP_FNMS` (0x06, `:2237`); the enumerated table has **no integer multiply**.
+  Integer handling is `SFP_ICVT` (convert), `SFP_IME`, `SFP_SHR`, `SFP_LOGICAL`,
+  `SFP_SELECT`. The only 32-bit rows are **conversions** through the rfp32
+  container — `F2I32`/`R2I32`/`I2F32` (`codegen/sentient_codegen/gen/rcudd1a/opcodes.py:745-749`,
+  `ICVTMode`) — not arithmetic. PE "integer arithmetic" is the **int16 FMA lane**
+  (`wiki/concepts/core-functional-units.md:112` lists int16/int8/int4/int2, all
+  sub-32-bit); PT integer is int8/int4 -> **int24 accumulate** via ARF
+  (`sentient-isa-1p0.md:80,1635`).
+- **E2 — codegen static classification** (`codegen/sentient_codegen/backend/ttir_to_schedule.py:4222`):
+  `_AUXILIARY_DTYPES = frozenset({"i1","i32","i64"})` — i32/i64 are **auxiliary
+  structural** dtypes; "a kernel whose dtypes are ALL auxiliary has no compute dtype
+  to resolve" (`:4219-4221`). `codegen/sentient_codegen/backend/ttir_analyzer.py:90`
+  calls `addi/subi/muli/divsi/remsi` **"INFRASTRUCTURE: integer index/pointer
+  math"**, not compute; the pointwise compute set is float-only
+  (`_FLOAT_COMPUTE_ARITH_OPS`, `ttir_analyzer.py:98`). A materialized int32 *data*
+  result of arithmetic therefore has no supported exact device lowering.
 
-**Consequence — conflict with the USER Stage-2 premise, for a ruling.** The value
-carriers (upstream #1547: RoPE >=128K, embedding ~200K; MoE ~16) **exceed the only
-exact native integer lane (int16, 2^15)** and the DL16 native pivot (~2^10). INT32
-*data* arithmetic is neither performable nor exact on this hardware. `E` is not a
-single 2^31 constant; it is per-op and ≤ 2^15 for the only exact integer path.
+**E1 and E2 agree, but both are documents/static tables. Two documentary classes
+agreeing is not the standard the USER set — silicon is, and RTL is the class that can
+refute a document. This is why the decision below forks instead of settling.**
 
-**Design implication (proposed, needs ruling):** the sound route is not "normalize
-data arithmetic to INT32" but:
-1. **keep position/index values in the address path** — they are consumed only as
-   gather indices / addresses (embedding `weight[pos]`, addresses), and integer
-   add/mul execute natively in LX/DIU *address generation* (the "infrastructure"
-   role), never materialized as data; and
-2. **keep materialized position *data* (OPT's stored `(cumsum*mask-1).long()+2`) on
-   the CPU fallback** (Stage 3, explicit — the current #4317 behaviour, correct but
-   slow), because no exact device integer path covers 128K-scale values.
-   (`cumsum*mask` with mask in {0,1} is a **select** `SFP_SELECT` 0x0E, exact at any
-   width, so the mask-multiply itself is not the problem; the accumulation range is.)
+The RTL check is load-bearing precisely because **the ISA document is demonstrably
+unreliable adjacent to this exact question**: `sentient-isa-1p0.md:2239` labels
+`SFP_IME` **"Integer multiply-extend"**, while
+`codegen/sentient_codegen/gen/rcudd1a/opcodes.py:759` (`class IMEMode`) defines it
+as **Insert / Modify Exponent** (INSERT/ADD/SUBTRACT on the S2 exponent), and the
+same document itself says **"Insert/merge element"** at `:1427`. A document that
+mislabels one row of this table is not a safe enumeration of arithmetic capability;
+E1 is a hint, not proof. A read-only RTL investigation against `../RTL/hw1p5/logic/`
+is dispatched. **There is no 1p0 RTL source in the tree, so any RTL conclusion is an
+inference about 1p0 from 1p5 and must be labelled as such.**
 
-`E` remains a single named constant per op class, derived from the P0 reading; the
-device KAT (§7 P0-confirm) is owed to confirm it.
+### 4.1 Decision fork on the RTL answer (all branches written now)
 
-Per op class (check the running intermediate, condition 2):
+The fork decides §4, not this plan's section numbering. Each branch carries its
+**falsifier** — the observation that would move the decision to another branch.
+
+**Branch A — RTL confirms no exact integer *data* datapath (current expectation).**
+- Condition: no exact integer multiply/ALU feeding the vector data path; integer only
+  as address-generation (LX/DIU) and as int16/int24 sub-word lanes.
+- Consequence: carriers split, exactly as proposed in §4.2:
+  1. position/index values **stay in the address-generation path** — consumed only as
+     gather indices / addresses (embedding `weight[pos]`), executed natively as
+     "infrastructure" math, never materialized as data;
+  2. materialized position **data** (OPT's stored `(cumsum*mask-1).long()+2`) runs on
+     the **CPU fallback** (Stage 3 explicit — today's #4317 behaviour: correct,
+     slow). `cumsum*mask` with mask in {0,1} is a **select** `SFP_SELECT` (0x0E),
+     exact at any width, so the mask-multiply is not the problem — the accumulation
+     range is.
+- **Cost (must be stated, not hidden):** a host round trip **per call** for every
+  encoder that materializes position embeddings — a D2H sync on the decode hot path,
+  plus a CPU-side cumsum over `seq_len`, plus an H2D back. For a batch-1 decode step
+  that is a fixed per-step latency add on top of the whole graph, and it defeats
+  graph capture. This is the price of exactness; it is not free.
+- **Falsifier:** any exact integer multiply/ALU ≥32 bits on the vector data path in
+  the RTL (moves to Branch B), or evidence that materialized positions never reach
+  the device as data in any in-scope model (weakens to "branch A unnecessary").
+
+**Branch B — RTL finds an exact integer datapath of width W (unlikely; the point of
+checking).**
+- Condition: an integer multiply/ALU of width W >= 16 on the data path (not just the
+  address path).
+- Consequence: USER Stage 2 becomes performable as originally specified, and the
+  exactness bound comes from that datapath: `E = 2^(W-1)` (signed) **for that
+  datapath's op set**. If W = 32, `E = 2^31` and RoPE(128K)/embedding(200K) fit; if
+  W = 16, it lands back on Branch A for those carriers.
+- **Falsifier:** the datapath is conversion-only (FP↔int via rfp32), or present but
+  not reachable from the pointwise/elementwise route this backend emits.
+
+**Branch C — no exact path AND no acceptable fallback for performance reasons.**
+This is the branch nobody wants written down; record it so the choice is explicit,
+**as an option with its consequences, not a recommendation.**
+- Condition: Branch A holds, and the per-call host round trip is judged unacceptable
+  on the decode hot path (or the model cannot afford a CPU partition).
+- Consequence: an **explicit, typed narrow contract** — "int64 data arithmetic is
+  supported only within ±2^15 (int16); values above are refused typed at the
+  Inductor boundary (`UnsupportedInt64RangeError`)". This **satisfies** the USER's
+  "do not silently cast" rule (it refuses, it does not truncate) **while conceding
+  the capability** — RoPE/embedding-scale position arithmetic is simply unsupported
+  on device under this contract. It is honest, it is fast, and it does not work for
+  the models in upstream #1547.
+- **Falsifier:** a carrier whose bound is provably ≤2^15 (e.g. a model with
+  seq_len ≤ 32768 and no embedding-table accumulation) — for that carrier the
+  contract is sufficient; a u16/u15 interpretation extends it if RTL shows unsigned
+  lanes.
+
+**E3 (RTL) and E4 (device KAT) are the two classes that can settle this.** Until E3
+lands, §4.2's per-op bound is written per branch; the branch is chosen when E3
+reports, and E4 (§7 P0-confirm) confirms on silicon.
+
+### 4.2 Per-op bound under Branch A (and the bound law under Branch B)
+
+`E` is a single named constant **per op class**, derived from the chosen branch,
+never a baked-in 2^31. Check the running intermediate, not just the final tensor
+(USER condition 2):
 
 - **accumulation** (`cumsum`, `sum`, `prod`): bound `N * max|term| <= E_op`. Attention
   -mask cumsum (terms in {0,1}) <= seq_len: safe **only** if seq_len <= `E_op`; at
@@ -227,6 +280,11 @@ Per op class (check the running intermediate, condition 2):
 - **op classes where mid-chain overflow can occur with in-range endpoints:**
   accumulation, product, and affine index computation (`i*stride+j`) — a
   final-tensor-only check passes them incorrectly (condition 2).
+
+Under **Branch B** this list is unchanged in form; only `E_op` is re-derived from the
+RTL datapath width `W` (`E = 2^(W-1)` for signed, `2^W - 1` if unsigned) instead of
+from the int16/DL16 lanes. Under **Branch C** there is no per-op derivation: a single
+constant `E = 2^15` gates every carrier and the rest refuse typed.
 
 **Placement:** the bound is a symbolic claim discharged at the Inductor boundary from
 the §3 origin taxonomy; undischarged -> Stage-3 refusal. Never a runtime clamp.
@@ -260,8 +318,8 @@ silent INT32 cast.
 | condition | layer | error |
 |---|---|---|
 | value/expression exceeds, or cannot be proven within, `E` (§4) | torch-spyre Inductor boundary (`_inductor/`) | `UnsupportedInt64RangeError` (this lane) |
-| int64 data reaches a kernel arg after Stage 2 (defense in depth) | codegen descriptor | `I64PointerDataError` (`_descriptor.py:502-522`) |
-| int64 tensor-descriptor element type | codegen descriptor | `I64DescriptorDataError` (`_descriptor.py:444-496`) |
+| int64 data reaches a kernel arg after Stage 2 (defense in depth) | codegen descriptor | `I64PointerDataError` (`backend/ttir_parser/_descriptor.py:502`) |
+| int64 tensor-descriptor element type | codegen descriptor | `I64DescriptorDataError` (`backend/ttir_parser/_descriptor.py:444`) |
 | unsupported int64 op, fallback chosen | supported partition, CPU fallback + `FallbackWarning` (today's #4317 path, `fallbacks.py:304`) | warning + CPU partition |
 | fallback attempted with a CPU-resident intermediate | `spyre::to_dtype_cpu` (PrivateUse1-only, #5070) | `NotImplementedError` |
 | no host data channel (codegen-only) | runtime | `SpyreRuntimeUnavailableError` (`torch_spyre/_runtime.py:27`) |
@@ -273,11 +331,13 @@ defense-in-depth only, never the primary user-facing refusal.
 
 ## 7. Falsification plan (plan-first; no code)
 
-- **P0 (ANSWERED from lowering; device KAT owed):** §4 establishes from ISA + codegen
-  that there is **no native int32 data arithmetic**; exact native integer bound is
-  int16 (2^15), DL16 pivot ~2^10, rfp32 pivot 2^24 conversion-only. A device KAT must
-  confirm the *refusal/behaviour* of an i32 data `muli`/`addi` (does it refuse, or
-  lower via a float pivot?) — that is the second, independent evidence class.
+- **P0 (provisional, from lowering; RTL + device KAT owed):** §4.0 records E1 (ISA
+  doc) + E2 (codegen classification) agreeing that there is **no native int32 data
+  arithmetic** — but both are documentary/static. **E3 (RTL, dispatched against
+  `../RTL/hw1p5/logic/`, labelled as a 1p5->1p0 inference) decides the §4.1 branch;
+  E4 (device KAT) confirms on silicon.** E4: run an i32 data `muli`/`addi` and record
+  whether it refuses or lowers via a float pivot — that is the class that bounds `E`
+  for real. Do not write Stage-2 code on E1+E2 alone.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
   (currently **16 vs 32** — fails today, proving C1). Add: storage size = `numel*4`;
@@ -314,9 +374,10 @@ defense-in-depth only, never the primary user-facing refusal.
 
 `7fff29f42` merges `f32-pointer-element-grain-refusal` and puts the f32 refusal
 **above every route**: `ttir_to_schedule._refuse_compute_only_pointer_pointees`
-(`ttir_to_schedule.py:4283`, called at `:5571`) is declared "the ONE owner of the
-pointer-grain law", keyed on pointer **pointee spellings** in `kernel_info.args`;
-`_resolve_element_bits` skips `_AUXILIARY_DTYPES` (`:4222`).
+(`codegen/sentient_codegen/backend/ttir_to_schedule.py:4283`, called at `:5571`) is
+declared "the ONE owner of the pointer-grain law", keyed on pointer **pointee
+spellings** in `kernel_info.args`; `_resolve_element_bits` skips `_AUXILIARY_DTYPES`
+(`:4222`).
 
 **Textual conflict: none.** The f32 law edits the codegen repo
 (`codegen/sentient_codegen/backend/ttir_to_schedule.py`); this plan's Stage-1/2/3
