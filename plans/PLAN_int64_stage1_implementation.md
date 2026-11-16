@@ -108,115 +108,96 @@ T-DC-121 neighbourhood.
 
 ---
 
-## 3. Slice 3 — T-DC-121: derive the staging buffer from the device size
+## 3. Slice 3 — T-DC-121: **diagnosis NOT established; do not implement a sizing change**
 
-### 3a. Establish the failing site FIRST — do not presume the branch
+### 3.0 What the code says, and why the previous diagnosis is refuted
 
-The staging branch at `spyre_mem.cpp:575-601` is entered only when
-`!is_non_overlapping_and_dense_default() || dma_numel > self.numel()` (`:594-595`).
-For a **dense** `[1,512]` int64 tensor `dma_sizes == [1,512]` (set at allocation,
-`spyre_mem.cpp:462,512,543`; `codegen_backend.cpp:559`), so `dma_numel == 512 ==
-numel`: `physical_exceeds_logical` is **false** and the tensor **is** dense — so the
-staging branch is **not taken**, and the `[1,512]` case goes through the **fast dense
-path** (`copy_from = &self; copy_to = &dst`; `copyAsync` at `:608`).
+The previous version of this slice asserted a 2× overrun: "`[1,512]` int64 needs
+4096 B of host staging from 2048 B of device storage", with the fix "size staging to
+device bytes". **That diagnosis is refuted by the code**, for three reasons read at
+this tip:
 
-**Consequence: the overrun's branch is not established — and neither is the dense
-path's safety.** Two candidate overrun sites remain:
-- **(a) the fast dense path**, where host `dst` is int64-sized (4096 B) against
-  2048 B of device storage — a real 2× mismatch if the DMA does not widen;
-- **(b) the staging branch**, for a non-dense/sliced view.
+1. **The D2H copy widens int32→int64 on the way out.**
+   `generate_dci` (`spyre_mem.cpp:362-372`) sets, for `host2device == false`,
+   `dataformat_src_ = dtype_dev` (**INT32** for an int64 tensor,
+   `types_mapping.h:71`) and `dataformat_dst_ = dtype_cpu` (**INT64**).
+2. **The converter's *output* is int64 elements.**
+   `spyre_mem.cpp:418-419`: `input_shape_ = host2device ? cpu_shape : dev_shape`,
+   `output_shape_ = host2device ? dev_shape : cpu_shape` — so a D2H emits `numel`
+   int64 elements to the host.
+3. **The staging buffer is sized for exactly that output.**
+   `cpu_alloc = at::empty(dma_sizes, dst.options())` (`:601`) is `dma_numel`
+   elements × **int64** itemsize = `numel × 8` = 4096 B for `[1,512]` — the widened
+   output size. **It is correctly sized.**
 
-Knowing a dense tensor *takes* the fast path says nothing about whether that path is
-*safe*. **3a decides which of (i)-(ii) holds**, and the plan does not assert either:
-- **(i)** the dense case passes today → it is a valid **passing control** (see the
-  test list), and the defect is confined to (b);
-- **(ii)** the dense case **also overruns** → it is a **second defect**, the
-  "control" becomes a **failing test** (not a control), and the fix must cover both
-  paths.
+So 2048 B is the correct device **read** size and 4096 B is the correct host **write**
+size. They are not two claims about one buffer; they are the two ends of a widening
+conversion. **Sizing the staging buffer to `get_device_size_in_bytes`
+(2048 B) would under-size the widening destination and manufacture the heap overrun
+this slice claims to fix.** Do not make that change.
 
-**The measured `[1,512]` trigger is a sliced view** (a dense one cannot enter the
-staging branch), which is consistent with (i) or (ii) — it does not choose between
-them.
+**Retraction of my own earlier framing.** The "odd one out — join the convention"
+argument is a **category error for this site** and is withdrawn. It is true as a
+census fact that the staging allocation is the only one in the file not using
+`get_device_size_in_bytes` (four neighbours at `:449,:493,:526,:652`, verified). But
+those four allocate **device storage**, whose byte size is device geometry; this one
+allocates a **host buffer**, whose byte size is the converter's *output* geometry.
+Sameness of the helper would be a false analogy here. The census stands; the
+conclusion drawn from it does not.
 
-**The trigger is the density clause, not the size clause.** The defect is reachable
-through `!is_non_overlapping_and_dense_default()`. The size clause
-(`physical_exceeds_logical`, `512 > 512` = false) is genuinely blind to this case, but
-it is **not** the clause that fires here. **If a fix touches `physical_exceeds_logical`,
-it is fixing the wrong predicate** and must be rejected in review.
+### 3a. Establish the failure before any fix — the output must name the mechanism
 
-**Slice 3 opens with a site-establishment step whose output NAMES THE BRANCH** — not
-"reproduced". Capture, for **both** a dense `[1,512]` int64 and its sliced
-counterpart, a logged evaluation of `is_non_overlapping_and_dense_default()`,
-`dma_numel`, `self.numel()` and `physical_exceeds_logical`, and the branch taken.
-The fix target is then chosen by observation. Confinement to `:575-601` is
-**conditional** on that; if the site is the fast path, the slice moves there and the
-"other dtypes unchanged" tests still apply.
+**T-DC-121's mechanism is not established.** No receipt in this lane pins a failing
+operation to a branch of this D2H path. Until one does, this slice carries **no
+mechanism and no fix**, only the measurement plan.
 
-**Site as previously assumed (confirm in 3a):** `spyre_mem.cpp:575-601` (D2H staging
-branch), copy at `:608` (`stream.copyAsync(*copy_from, *copy_to)`), logical view applied
-at `:611-614` (`cpu_alloc.as_strided(...)` → `dst.copy_(cpu_view)`).
+Candidate mechanisms, none asserted:
+- **(a) Converter ignores `dtype_dev` and copies raw bytes.** Then a D2H writes 2048 B
+  into a 4096 B host buffer — under-filled, not an overrun, wrong values. A
+  *correctness* bug, not a heap bug.
+- **(b) Over-READ from a device buffer sized in int32 units.** The device storage is
+  `get_device_size_in_bytes` = 2048 B; if anything asks the converter for 4096 B of
+  input, that is a read past the allocation. This is the only overrun-shaped candidate
+  consistent with a widening converter.
+- **(c) The defect is not on this path at all** — the failing site is elsewhere
+  (allocation, view, or `dst.copy_(cpu_view)` at `:611-614`).
 
-**Framing: this site is the odd one out, not a new capability.** Within the same
-file, the staging path is the **one allocation site that does not derive its byte
-size from `get_device_size_in_bytes`**. That helper is declared at
-`spyre_tensor_impl.h:149`, defined at `spyre_tensor_impl.cpp:286`, and already used
-at `spyre_mem.cpp:449`, `:493`, `:526` and `:652`. So the change is **"join the
-convention that already exists four times in this file"**, not "introduce a sizing
-rule": the implementer should mimic those four call sites and the reviewer can check
-conformance by comparison rather than by argument.
+**3a deliverable:** reproduce the exact reported failure and record — command, tensor
+(shape, dtype, whether dense or a slice, `storage_offset`), exception text, and a
+logged evaluation of `is_non_overlapping_and_dense_default()`, `dma_numel`,
+`self.numel()`, `physical_exceeds_logical`, the branch taken, and the byte size of
+each buffer at the point of failure. **If no such receipt can be produced, the slice
+reports "T-DC-121 not established" and no code is written.** A plausible mechanism
+that the code contradicts is worse than an open question.
 
-The staging branch builds `alloc_view = at::as_strided(self, dma_sizes, dma_strides)`
-and then
+**Predicate note (unchanged, and still correct):** the staging branch is entered by
+`!is_non_overlapping_and_dense_default() || dma_numel > self.numel()`
+(`:594-595`). For a **dense** `[1,512]`, `dma_sizes == [1,512]` (`:462,512,543`;
+`codegen_backend.cpp:559`) so `dma_numel == numel` and the tensor is dense — **the
+staging branch is not taken**; it runs the fast dense path. The size clause
+(`512 > 512` = false) is blind to this case but is **not the operative clause**. **If a
+fix touches `physical_exceeds_logical`, it is fixing the wrong predicate** and must be
+rejected in review.
 
-```cpp
-cpu_alloc = at::empty(alloc_sizes, dst.options());   // alloc_sizes = dma_sizes
-```
-
-`dst.options()` carries the **logical** dtype (int64 = 8B), while the device
-allocation is `get_device_size_in_bytes(spyre_layout)` bytes
-(`spyre_tensor_impl.cpp:286`; declared `spyre_tensor_impl.h:149`; same helper already
-used at `spyre_mem.cpp:449,493,526,652`). For an int64 tensor the two disagree by 2×:
-`[1,512]` logical = 4096 B of host staging against 2048 B of device storage.
-
-**Change:** size the staging allocation from the **device** geometry, not from the
-logical element count × logical itemsize. Concretely, allocate the staging buffer
-with the **device element width** and let the CPU-side view/copy perform the widening,
-i.e. the allocation's byte size must equal `get_device_size_in_bytes(spyre_layout)`.
-Scope follows 3a: if the dense case passes (case i), confine the change to the
-staging branch of `spyre_mem.cpp:575-601` and do not touch the fast path; if the
-dense case also overruns (case ii), the fast path is **in scope** as a second defect
-and cannot be excluded to keep the diff small.
-
-**Tests:**
-- **`test_d2h_dense_int64_1x512_control` — required, but its STATUS IS AN OUTPUT OF
-  3a, not an input to this plan.** A **dense** `[1,512]` int64 D2H round-trip. The
-  test exists either way; 3a decides which it is:
-  - if the dense case passes today (3a case i) it is a **passing control** — without
-    it, a fix that also changes the dense path cannot be told apart from one that
-    repairs only the sliced path;
-  - if the dense case overruns (3a case ii) it is a **failing test = second defect**,
-    and the plan's premise that the control passes is false.
-  Writing "works today" into the plan before 3a measures it is the
-  assert-the-green-without-measuring class; it is deliberately not asserted here.
-- `test_d2h_sliced_int64_1x512`: the **sliced** `[1,512]` view (the actual T-DC-121
-  trigger per 3a) allocates 2048 B of staging, not 4096, and round-trips values
-  correctly. Fails today. *(Site per 3a; if 3a finds a different path, the assertion
-  moves with it and the control above stays.)*
-- `test_d2h_staging_float16_unchanged` / `test_d2h_staging_int32_unchanged`: for a
-  DL16 / int32 tensor the staging byte size is **unchanged**. **What this pair cannot
-  catch, stated so no reader over-reads a green:** a change that alters **only the
-  int64 staging bytes** passes both by construction. Their green covers fp16 and
-  int32 only; the int64 path's coverage comes from the `[1,512]` test and the
-  regression enumeration, never from these two.
+**Tests (all diagnostic until 3a reports):**
+- **`test_d2h_dense_int64_1x512`** — required; its **status is an output of 3a**, not
+  an input here. Passes → valid passing control for later work. Overruns → a second
+  defect, and the "control" is a failing test.
+- `test_d2h_sliced_int64_1x512` — the sliced trigger, same status rule.
+- `test_d2h_staging_float16_unchanged` / `test_d2h_staging_int32_unchanged` —
+  byte-identity for the non-int64 dtypes. **What this pair cannot catch, stated so no
+  reader over-reads a green:** a change that alters **only the int64 path** passes
+  both by construction; their green covers fp16 and int32 only.
 - **Regression bar (non-negotiable):** every currently-passing int64 path stays
-  byte-identical. **The report must include the enumerated list of those paths.** An
-  empty enumeration is a **STOP**, not a pass: *"byte-identical over an empty set is
-  not evidence"* — the bar is met only by a non-empty list of named paths and their
-  before/after sizes.
+  byte-identical, **with the enumerated path list in the report**. An empty
+  enumeration is a **STOP** — byte-identical over an empty set is not evidence.
+
+**No change is specified here.** The fix follows 3a's mechanism, and Slice 4's witness
+is a precondition for choosing between (a) and (b).
 
 ---
 
-## 4. Slice 4 — witness the int32→int64 D2H conversion (owed before Slice 3 is "done")
+## 4. Slice 4 — witness the int32→int64 D2H conversion (now the load-bearing question)
 
 **The claim:** `generate_dci` sets
 `dci.dataformat_src_ = host2device ? dtype_cpu : dtype_dev`
@@ -224,14 +205,22 @@ and cannot be excluded to keep the diff small.
 tensor) → `dtype_cpu` (IEEE_INT64) inside the transfer. **That conversion is
 runtime-claimed with no committed witness.**
 
-**Why it blocks Slice 3 — a hard dependency, not a hedge (non-negotiable ordering):**
-whether the widening happens in the DMA engine or must happen on the host decides
-which side of the staging buffer is mis-sized. If the DMA widens, the host destination
-must be int64-sized and the *device read* is what needs the device-size bound; if it
-does not, the host buffer must be int32 and the widening must be a host `copy_`.
-Guessing produces a fix that passes one shape and overruns another — and the failure
-would surface only after the fix was written. **Slice 4's witness lands before Slice 3
-is called done.**
+**Important precision the code adds:** `SpyreStream::copyAsync` refuses a copy whose
+two tensors have **different torch scalar types**
+(`spyre_stream.cpp:199-203`: `TORCH_CHECK(src.scalar_type() == dst.scalar_type(),
+"Spyre backend does not support type conversion yet during copy.")`). Both ends of a
+D2H are therefore declared `torch.int64`; the `INT32 → INT64` step is a **physical
+format** widening driven by `dataformat_src_/dst_`, not a torch-dtype conversion. The
+witness must distinguish "the converter widened the physical format" from "it copied
+raw bytes and the host reinterpreted".
+
+**Why it is now load-bearing for Slice 3:** Slice 3's candidates (a) converter copies
+raw bytes and under-fills, and (b) the converter is asked to read more device bytes
+than exist, are **indistinguishable without this witness**. If the DMA widens, the
+host destination must be int64-sized (it is, `:601`) and any overrun would be a device
+over-read; if it does not widen, the host buffer is merely under-filled and the defect
+is correctness, not heap. **The witness lands before Slice 3's mechanism is chosen at
+all** — not merely before it is called done.
 
 **Witness required (device, claim protocol):** an int64 tensor with values that
 distinguish int32 from int64 width and sign (e.g. `[-3, -1, 0, 1, 2^20]` on device),
@@ -299,5 +288,11 @@ planning artefacts, not code:
 - No Stage-2/E code before Stage 1 lands and §6 is discharged.
 - Do not widen codegen: `I64PointerDataError` is the law Stage 2 respects.
 - Do not change the logical dtype at the eager boundary (Ruling 2).
-- Do not "fix" the staging size by clamping or by a try/except — the size derives
-  from the device geometry or the bug stands.
+- **Do not size the staging buffer to `get_device_size_in_bytes`.** The host buffer is
+  the *output* of an int32→int64 widening copy (`generate_dci` `:362-372`,
+  `:418-419`); sizing it to device bytes (2048) under-sizes the 4096-byte destination
+  and manufactures the overrun. The earlier "odd one out" framing is withdrawn (§3.0).
+- **Do not carry a T-DC-121 mechanism that the code contradicts.** If 3a cannot
+  produce a receipt pinning the failure, the slice reports "not established" and
+  writes no code.
+- Do not "fix" a size by clamping or by a try/except.
