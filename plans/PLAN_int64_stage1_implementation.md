@@ -12,8 +12,10 @@ CSRC change → **rebuild on the box under the hardware claim protocol**.
   codegen-only include change). Recommendation to carve it into its own lane is with
   the USER; dispatch is USER-only and this lane does not create a branch for it.
 - **Slice 2 — live** (owner table is documentation + tests; no build dependency).
-- **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a must
-  produce a receipt or report "not established" (§3.0/§3a).
+- **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a
+  classifies by **exception class first** (§3a); the named candidate is the
+  **storage-geometry split**, in which case T-DC-121 and Slice 1 are the same defect
+  and Slice 3 **dissolves into the (blocked) Slice 1**.
 - **Slice 4 — live scope and now load-bearing**: its witness chooses Slice 3's
   mechanism, and the witness must drive the **staging** branch (§4).
 - **E entry conditions — planning artefacts only** (§6).
@@ -188,24 +190,44 @@ conclusion drawn from it does not.
 operation to a branch of this D2H path. Until one does, this slice carries **no
 mechanism and no fix**, only the measurement plan.
 
-Candidate mechanisms, none asserted:
-- **(a) Converter ignores `dtype_dev` and copies raw bytes.** Then a D2H writes 2048 B
-  into a 4096 B host buffer — under-filled, not an overrun, wrong values. A
-  *correctness* bug, not a heap bug.
-- **(b) Over-READ from a device buffer sized in int32 units.** The device storage is
-  `get_device_size_in_bytes` = 2048 B; if anything asks the converter for 4096 B of
-  input, that is a read past the allocation. This is the only overrun-shaped candidate
-  consistent with a widening converter.
-- **(c) The defect is not on this path at all** — the failing site is elsewhere
-  (allocation, view, or `dst.copy_(cpu_view)` at `:611-614`).
+**Classify by EXCEPTION CLASS FIRST — before any branch reasoning.** The recorded
+T-DC-121 symptom is `setStorage` / `RecursionError`, and neither is a copy-path
+signature. The exception identifies the layer, and it may localize the defect **without
+the box**:
 
-**3a deliverable:** reproduce the exact reported failure and record — command, tensor
-(shape, dtype, whether dense or a slice, `storage_offset`), exception text, and a
-logged evaluation of `is_non_overlapping_and_dense_default()`, `dma_numel`,
-`self.numel()`, `physical_exceeds_logical`, the branch taken, and the byte size of
-each buffer at the point of failure. **If no such receipt can be produced, the slice
-reports "T-DC-121 not established" and no code is written.** A plausible mechanism
-that the code contradicts is worse than an open question.
+| recorded exception | what it is | points at |
+|---|---|---|
+| `TORCH_CHECK ... setStorage ... sizes/strides/storage_offset must be within bounds` | a **view-bounds** check | an over-declared logical int64 view over storage sized in int32 units — the **dtype/storage-width split (Slice 1)**, not staging |
+| `std::bad_array_new_length` | an **allocation-size** throw | a size expression computed negative/huge — also geometry; trace the expression |
+| a copy-path `TORCH_CHECK`, or wrong values with no throw | the copy itself | then (a)/(b) below apply |
+
+**Named candidate (INFERENCE, not established): (c) the storage-geometry split.** If
+device storage is sized in int32 units (`module.cpp:198` answer, 32 elem/stick ⇒
+`[1,512]` = 2048 B) while `self`'s logical int64 sizes/strides imply 4096 B, then any
+view / `as_strided` / `set_storage` over that storage throws exactly what `setStorage`
+reports — an over-declared view over under-sized storage. **If this holds, T-DC-121 and
+the `get_device_dtype` two-answer split are the same defect, the fix is consistent
+storage geometry (Slice 1), and Slice 3 dissolves into it** — staging sizing would be a
+red herring against the wrong symptom.
+
+Remaining candidates, none asserted:
+- **(a) Converter ignores `dtype_dev` and copies raw bytes** → host buffer under-filled,
+  wrong values, no throw. A correctness bug, not a heap bug.
+- **(b) Over-READ from a device buffer sized in int32 units** → the only overrun-shaped
+  candidate consistent with a widening converter.
+
+**3a deliverable, in this order:**
+1. **Reproduce host-side / compile-only first** if the exception is reproducible without
+   the device — that is the cheaper move, and a view-bounds throw may be reachable that
+   way. The box witness is the fallback, not the first step.
+2. Record **the exception class and its throw site** before anything else, then the
+   command, tensor (shape, dtype, dense-or-slice, `storage_offset`), and a logged
+   evaluation of `is_non_overlapping_and_dense_default()`, `dma_numel`, `self.numel()`,
+   `physical_exceeds_logical`, the branch taken, and each buffer's byte size.
+
+**If no such receipt can be produced, the slice reports "T-DC-121 not established" and
+no code is written.** A plausible mechanism the code contradicts is worse than an open
+question.
 
 **Predicate note (unchanged, and still correct):** the staging branch is entered by
 `!is_non_overlapping_and_dense_default() || dma_numel > self.numel()`
