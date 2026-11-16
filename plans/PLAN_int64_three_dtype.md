@@ -225,7 +225,7 @@ row of this table is not a safe enumeration of arithmetic capability.
 | "PE integer arithmetic is the int16 FMA lane, exact to 2^15" | **REFUTED.** `in_ctrl_x_int16` forces a fixed exponent into the **floating** FMA and is tied off in the PE top; it is not an integer multiplier. Exact only to ~2^10 — the ISA doc's own "first inexact integer is 1025". | `rpd_pesfp_fp16_top.vhdl:247` |
 | "the widest exact native integer path is int16 (2^15)" | **REFUTED.** The widest exact integer is PT's **int24 accumulator** (`\|acc\| ≤ 2^23`), fed by int8 (int4 in 1p0) operands. No 2^15 lane exists. | `rpd_pt_fx_engine.vhdl:111-140` |
 | "Branch C anchors on ±2^15 (int16)" | **RESTATED.** There is no 2^15 lane. Any narrow contract must be expressed against int8/int4 operands and the int24 accumulator, not int16. | as above |
-| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED — M=1 width is silicon-witnessed.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width` = rfp32 on 32/32 lanes, `p1-fmul`, `p1-arith`), bit 44 decoded. The `M1ArithWidth = M1_EXECUTES_AS_DL16` value I first read is the classifier's *undecided default*, and the `threefry_recipe_model.py` "spec self-conflict" is a *model* limitation the census resolved in favour of rfp32 three days later. What the 120,900-vector result does NOT witness is the hardware — it is the emulator. | `receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md`; `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
+| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED — M=1 width is silicon-witnessed and accepted on both sides.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width` = rfp32 on 32/32 lanes, `p1-fmul`, `p1-arith` = single/fused, +0), bit 44 decoded. This lane and a6 independently re-read the verdict receipt and agree. The `M1ArithWidth = M1_EXECUTES_AS_DL16` value I first read is the classifier's *undecided default*; the `threefry_recipe_model.py` "spec self-conflict" is a *model* limitation the census resolved in favour of rfp32. What the 120,900-vector result does NOT witness is the hardware — it is the emulator. | `receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md:14,16,21,34`; `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
 | "the M=1 probes are designed and not yet run" (my earlier relay of the box-runner note) | **CORRECTED — I was wrong.** The box-runner note concerned a *later re-run* gated on a runner fix; the **2026-11-07 census already ran** and answered M=1 = rfp32. My "unverified in silicon" wording was a stale read of the migration note against the design docs. | `wiki/design/43-device-side-rng.md:459-467` |
 
 ### 4.1 Decision fork — E3 selects Branch A; D and E are the open alternatives
@@ -306,6 +306,10 @@ recommended; recorded with its cost.**
   pointwise path to a PT limb-convolution sequence — an **architecture cost**, stated
   as such, not a small patch. If no PT route is reachable from pointwise, D is not
   implementable without new codegen structure.
+- **Owes the same bound as E.** D's exactness ceiling is the **int24 accumulator
+  (`|acc| ≤ 2^23`)**, so D owes a **per-tensor-class intermediate bound** exactly as
+  E owes its 2^24 bound — **the bound is owed for both routes, not just rfp32** —
+  with accumulation and `i·stride+j` proven separately.
 - **Falsifier:** PT unreachable from the pointwise route (⇒ D needs new lowering, may
   be judged out of scope), or the carry chain + 9× instruction count dominating to
   the point where the Branch-A CPU fallback is cheaper (⇒ D loses on its own merits).
@@ -355,22 +359,30 @@ Evidence tags are per claim and must not be compressed: `[1p5 RTL]`,
   register-immediate add/sub) and the LX DIU address arithmetic. Branch A already
   relies on this; E does not replace it — index/address values stay in that path
   regardless.
-- **Route cost** `[1p0 codegen table]`. No route emits `mode_bit=1` today: the emitter
-  and lowering accept it (`scheduler/emitter.py:840`, `mlir/lowering.py:1693,1812,2412`
-  default 0) but no `InstructionTemplate` sets it, and `_AUXILIARY_DTYPES` (§4.0 E2)
-  means i32 *data* has no compute dtype. So E, like D, needs a **new i32→rfp32
-  lowering** — architecture cost, not a patch. It is **cheaper per element than D**
-  (1 FMA vs 9 int8 MACs + carry); the M=1 throughput penalty versus DL16 is
-  undocumented and must be measured.
+- **Route cost** `[1p0 codegen table]`. **No production lowering sets `mode_bit=1`
+  today**; the only `mode_bit=1` assignments are in the emulator model
+  (`codegen/sentient_codegen/emulator/threefry_recipe_model.py:1123,1131,1136`,
+  verified). The emitter and lowering accept the bit
+  (`scheduler/emitter.py:840`, `mlir/lowering.py:1693,1812,2412` default 0), and
+  `_AUXILIARY_DTYPES` (§4.0 E2) means i32 *data* has no compute dtype. (Reference
+  counts differ by search root — a6 counted 76 across `sentient_codegen`, my
+  `grep --include=*.py` counts 72; the load-bearing finding is the assignment set,
+  not the count.) So E, like D, needs a **new i32→rfp32 lowering** — architecture
+  cost, not a patch. It is **cheaper per element than D** (1 FMA vs 9 int8 MACs +
+  carry); the M=1 throughput penalty versus DL16 is undocumented and must be
+  measured.
 - **Falsifier:** an fp32-mode witness showing rfp32 arithmetic is not exact at the
   required bound (e.g. sign or exponent-range failure for negative/≥2^24 values), or
   a per-class proof that an intermediate exceeds 2^24 — either moves the carrier back
   to Branch A (CPU fallback) or Branch D (PT limbs).
 
-**Branch ranking, stated plainly:** E **dominates D** on op count (1 FMA vs 9 MACs)
-and its core premise is silicon-witnessed, where D's is not mode-dependent at all; A
-is the selected position. **E and D both require new lowerings; neither is
-recommended — the USER rules on A vs D vs E.**
+**Branch ranking, stated plainly — two architecture-cost routes:**
+- **E (rfp32):** width **witnessed** (silicon 2026-11-07); needs an **i32→rfp32
+  lowering**; **owes the per-class 2^24 intermediate bound**.
+- **D (PT int8 limbs):** premise **independent of bit 44**; needs a **pointwise→PT
+  lowering**; **owes the same per-class bound at int24 (`2^23`)**.
+- E is 1 FMA vs D's 9 int8 MACs + carry. A is the selected position. **Neither D nor
+  E is recommended — the USER rules on A vs D vs E**, and both owe the bound.
 
 **E3 (RTL) selected Branch A; E4 (device KAT) is owed** to confirm on 1p0 silicon
 that an i32 data `muli`/`addi` on the emitted route refuses or is inexact — E3 is
@@ -468,11 +480,13 @@ defense-in-depth only, never the primary user-facing refusal.
   is already answered:** the census read rfp32 on 2026-11-07
   (`receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md`;
   `wiki/design/43-device-side-rng.md:459-467`). E's real gaps are **(a) the route
-  cost — no `InstructionTemplate` sets `mode_bit=1`, so E needs a new i32→rfp32
+  cost — no production lowering sets `mode_bit=1` (only the emulator model
+  `threefry_recipe_model.py:1123,1131,1136`), so E needs a new i32→rfp32
   lowering exactly as D needs a pointwise→PT one** — and (b) a **per-class 2^24
   intermediate proof**, with accumulation and `i·stride+j` proven separately, plus
-  (c) the residual rounding/sign/exponent scope the census did not cover. E and D are
-  both architecture-cost routes; E is 1 FMA vs D's 9 int8 MACs + carry. Do not write
+  (c) the residual rounding/sign/exponent scope the census did not cover. **D owes the
+  same bound at int24 (`|acc| ≤ 2^23`), not just E at 2^24.** E and D are both
+  architecture-cost routes; E is 1 FMA vs D's 9 int8 MACs + carry. Do not write
   Stage-2 code until the USER rules on **A vs D vs E**.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
