@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Build torch-spyre on macOS without the Spyre runtime (flex/sendnn/senlib):
+# Build torch-spyre on macOS without the Spyre runtime (flex/senlib):
 # codegen-only mode compiles just the self-contained _codegen_backend
 # extension (pure torch/ATen headers, no runtime symbols to stub).
 # The flag matches setup.py's TORCH_SPYRE_CODEGEN_ONLY.

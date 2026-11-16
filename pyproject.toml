@@ -1,7 +1,7 @@
 [build-system]
 requires = [
     # any change here should be reflected in the build dependencies below
-    "build",  # only required to build torch_sendnn
+    "build",  # no in-repo consumer (was documented as only for torch_sendnn); retained pending verification
     "cmake>=3.27,<4.0.0",
     "expecttest>=0.3.0", # imported by torch.testing._internal.common_utils
     "jinja2",
@@ -35,7 +35,7 @@ dynamic = ["version", "entry-points"]
 [project.optional-dependencies]
 build = [ # no-isolation build 
     # any change here should be reflected in the build system above
-    "build",  # only required to build torch_sendnn
+    "build",  # no in-repo consumer (was documented as only for torch_sendnn); retained pending verification
     "cmake>=3.27,<4.0.0",
     "expecttest>=0.3.0", # imported by torch.testing._internal.common_utils
     "jinja2",
@@ -52,7 +52,6 @@ test = [
     "pytest~=9.0.0",
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
-#    "torch_sendnn",        # must be installed manually
     "transformers~=4.57.1"
 ]
 lint = [
