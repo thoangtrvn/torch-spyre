@@ -122,6 +122,18 @@ inside one function**, `stringToSenDatatypePair` (`types_mapping.h:110-348`). No
 - So the change is: **delete `types_mapping.h:110-348` and the `:24` include; change
   nothing in `stringToDTDataFormatPair`.** No member renaming, no adopted table.
 
+**Pre-delete check (required, and verified at plan time):** an inline header function
+can only be called by a translation unit that includes the header, so the closure is
+small and enumerable.
+- `types_mapping.h` is included by exactly three TUs: `module.cpp:50`,
+  `spyre_mem.cpp:43`, `spyre_tensor_impl.cpp:27`.
+- **None of them references `stringToSenDatatypePair`** (grep shows only the
+  definition).
+- **It is not pybind-exposed**: the three `PYBIND11_MODULE`s are
+  `codegen_backend.cpp:861`, `module.cpp:345`, `spyre_hooks.cpp:55`, and no `m.def`
+  names it (nor is there a binding for it anywhere in `csrc`).
+Re-run all three checks immediately before deleting; if any gains a caller, stop.
+
 **Why NOT adopt upstream's `stringToDTDataFormatPair` body (the brief's step 3)** —
 two independent reasons, both verified:
 1. **It would not compile here.** Upstream maps `uint8 → SNUINT8`-style
