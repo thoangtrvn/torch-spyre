@@ -120,10 +120,23 @@ numel`: `physical_exceeds_logical` is **false** and the tensor **is** dense — 
 staging branch is **not taken**, and the `[1,512]` case goes through the **fast dense
 path** (`copy_from = &self; copy_to = &dst`; `copyAsync` at `:608`).
 
-**Consequence: the overrun's branch is not established.** It is either (a) the fast
-dense path, where host `dst` is int64-sized (4096 B) against 2048 B of device storage,
-or (b) the staging branch for a non-dense/sliced view. **The measured `[1,512]` is
-therefore a sliced view, not the dense tensor** — a dense one takes the fast path.
+**Consequence: the overrun's branch is not established — and neither is the dense
+path's safety.** Two candidate overrun sites remain:
+- **(a) the fast dense path**, where host `dst` is int64-sized (4096 B) against
+  2048 B of device storage — a real 2× mismatch if the DMA does not widen;
+- **(b) the staging branch**, for a non-dense/sliced view.
+
+Knowing a dense tensor *takes* the fast path says nothing about whether that path is
+*safe*. **3a decides which of (i)-(ii) holds**, and the plan does not assert either:
+- **(i)** the dense case passes today → it is a valid **passing control** (see the
+  test list), and the defect is confined to (b);
+- **(ii)** the dense case **also overruns** → it is a **second defect**, the
+  "control" becomes a **failing test** (not a control), and the fix must cover both
+  paths.
+
+**The measured `[1,512]` trigger is a sliced view** (a dense one cannot enter the
+staging branch), which is consistent with (i) or (ii) — it does not choose between
+them.
 
 **The trigger is the density clause, not the size clause.** The defect is reachable
 through `!is_non_overlapping_and_dense_default()`. The size clause
@@ -169,15 +182,22 @@ used at `spyre_mem.cpp:449,493,526,652`). For an int64 tensor the two disagree b
 logical element count × logical itemsize. Concretely, allocate the staging buffer
 with the **device element width** and let the CPU-side view/copy perform the widening,
 i.e. the allocation's byte size must equal `get_device_size_in_bytes(spyre_layout)`.
-Confine the change to the staging branch of `spyre_mem.cpp:575-601`; do not touch the
-dense fast path in this slice.
+Scope follows 3a: if the dense case passes (case i), confine the change to the
+staging branch of `spyre_mem.cpp:575-601` and do not touch the fast path; if the
+dense case also overruns (case ii), the fast path is **in scope** as a second defect
+and cannot be excluded to keep the diff small.
 
 **Tests:**
-- **`test_d2h_dense_int64_1x512_control` — a PASSING control, required.** A **dense**
-  `[1,512]` int64 D2H round-trip that works today. Without it, a fix that also changes
-  the dense path's behaviour cannot be distinguished from one that repairs only the
-  sliced path — this is the "regression bar with no passing control" version of the
-  empty-set problem, and it is non-negotiable alongside the enumeration.
+- **`test_d2h_dense_int64_1x512_control` — required, but its STATUS IS AN OUTPUT OF
+  3a, not an input to this plan.** A **dense** `[1,512]` int64 D2H round-trip. The
+  test exists either way; 3a decides which it is:
+  - if the dense case passes today (3a case i) it is a **passing control** — without
+    it, a fix that also changes the dense path cannot be told apart from one that
+    repairs only the sliced path;
+  - if the dense case overruns (3a case ii) it is a **failing test = second defect**,
+    and the plan's premise that the control passes is false.
+  Writing "works today" into the plan before 3a measures it is the
+  assert-the-green-without-measuring class; it is deliberately not asserted here.
 - `test_d2h_sliced_int64_1x512`: the **sliced** `[1,512]` view (the actual T-DC-121
   trigger per 3a) allocates 2048 B of staging, not 4096, and round-trips values
   correctly. Fails today. *(Site per 3a; if 3a finds a different path, the assertion
