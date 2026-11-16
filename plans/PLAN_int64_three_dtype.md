@@ -43,9 +43,9 @@ emitted Triton signature turns `*i64,*i64` -> `*i32,*i32` under that approach.
   USER Stage-2 premise ("INT32 execution preferred provided range and arithmetic are
   safe"); §4 now carries five branches (A selected, B kept for E4, C written option,
   **D = PT limb decomposition**, and **E = rfp32 direct (2^24 exactness), whose M=1
-  premise is a spec self-conflict pending the `m1-arith-width` probe**). D and E both
-  need new lowerings and neither is recommended. No Stage-2 code until the branch is
-  chosen.
+  rfp32 premise is silicon-witnessed 2026-11-07** but which still owes a per-class
+  2^24 proof and a new lowering). D and E both need new lowerings and neither is
+  recommended. No Stage-2 code until the USER rules on A vs D vs E.
 
 ---
 
@@ -225,14 +225,17 @@ row of this table is not a safe enumeration of arithmetic capability.
 | "PE integer arithmetic is the int16 FMA lane, exact to 2^15" | **REFUTED.** `in_ctrl_x_int16` forces a fixed exponent into the **floating** FMA and is tied off in the PE top; it is not an integer multiplier. Exact only to ~2^10 — the ISA doc's own "first inexact integer is 1025". | `rpd_pesfp_fp16_top.vhdl:247` |
 | "the widest exact native integer path is int16 (2^15)" | **REFUTED.** The widest exact integer is PT's **int24 accumulator** (`\|acc\| ≤ 2^23`), fed by int8 (int4 in 1p0) operands. No 2^15 lane exists. | `rpd_pt_fx_engine.vhdl:111-140` |
 | "Branch C anchors on ±2^15 (int16)" | **RESTATED.** There is no 2^15 lane. Any narrow contract must be expressed against int8/int4 operands and the int24 accumulator, not int16. | as above |
-| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFINED.** rfp32 FMA/FMUL at M=1 is *prose-supported* and the format is 1-8-23, but **M=1 arithmetic semantics is a spec self-conflict** (Alg. 146 = two DL16 half-products) and the deciding probe is designed, not run. So "no rfp32 multiply" overstates what the tree says; "rfp32 multiply exists in prose, unverified in silicon" is the accurate statement. | `threefry_recipe_model.py:339-355`, `rng_probe_readings.py:136-148`, `precision-formats.md:15` |
+| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width`, `p1-fmul`, `p1-arith`). The earlier "spec self-conflict" was resolved in favour of rfp32 by that census, not left open. | `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
+| "the M=1 probes are designed and not yet run" (my earlier relay of the box-runner note) | **CORRECTED — I was wrong.** The box-runner note concerned a *later re-run* gated on a runner fix; the **2026-11-07 census already ran** and answered M=1 = rfp32. My "unverified in silicon" wording was a stale read of the migration note against the design docs. | `wiki/design/43-device-side-rng.md:459-467` |
 
-### 4.1 Decision fork — E3 selects Branch A; D is the open alternative
+### 4.1 Decision fork — E3 selects Branch A; D and E are the open alternatives
 
 **E3 selects Branch A** (no exact integer *data* datapath). Branches A–E are all
-written; each carries its **falsifier**. A is the current expectation; D is the one
-branch that could preserve on-device exactness and is written with its cost, **not
-recommended**; C stays a written option, **not a recommendation**.
+written; each carries its **falsifier**. A is the current position; **D and E are the
+two branches that could preserve on-device exactness**, each written with its cost
+and **neither recommended**; C stays a written option, **not a recommendation**. E is
+the leading exact alternative because its core premise is silicon-witnessed and it is
+1 FMA per op versus D's 9 MACs; D does not depend on any mode bit but is heavier.
 
 **Branch A — SELECTED by E3: no exact integer *data* datapath.**
 - Condition (met): no exact integer multiply/ALU on the vector data path; integer
@@ -307,67 +310,76 @@ recommended; recorded with its cost.**
   be judged out of scope), or the carry chain + 9× instruction count dominating to
   the point where the Branch-A CPU fallback is cheaper (⇒ D loses on its own merits).
 
-**Branch E — rfp32 direct; 16-bit halves only above the 2^24 bound. Newly derived
-from the RNG design record; premise partially unverified. Not recommended yet.**
-- **Source (re-derived from the tree, not taken on trust):**
-  `spyre-workspaces/rng-design-handoff/rng-program-problem-and-hurdles.md:46`
-  (mirror `wiki/design/45-device-rng-problem-and-hurdles.md:51`) records that SFP
-  FMA/FMUL/FNMS run "in DL16 (M=0) or **rfp32** (M=1: 24-bit significand, no
-  denormals)", and that "32-bit integer arithmetic is done as exact float arithmetic
-  on 16-bit halves, because every half-word sum stays below 2^24". The format fact is
-  independently confirmed: `wiki/foundations/hardware/precision-formats.md:15` gives
-  rfp32 as **1-8-23** (24-bit significand) and `:126` "no denormal representations";
-  the SFP M bit is documented at `sentient-isa-1p0.md:2359` ("0=16-bit (DL16),
-  1=32-bit (rfp32)").
-- **Exactness law.** A rfp32 word holds an integer exactly iff it needs ≤24
-  significant bits ⇒ exact on `[0, 2^24]`. So **RoPE (≥2^17) and embedding (~2^18)
-  values fit a single rfp32 word exactly.** `a + b` is exact iff the *sum* stays
-  below 2^24; `i·stride + j` is exact iff the *product and sum* stay below 2^24 —
-  **that is USER Stage-2 condition 2 written as a checkable bound**, and it is a much
-  stronger regime than DL16's 2^10 (`sentient-isa-1p0.md:75`, first inexact integer
-  1025). 16-bit halves are needed only where an intermediate can exceed 2^24 or a
-  32-bit bitwise op is required (the RNG case), not for the carriers themselves.
-- **The premise that is NOT verified — and the repo already says so.** "M=1 executes
-  as a true 32-bit rfp32 FMA" is **a spec self-conflict, not a settled fact**:
-  `codegen/sentient_codegen/emulator/threefry_recipe_model.py:339-355` records
-  `FmulM1`: "the prose says M=1 selects rfp32; Alg. 146 and the mnemonic are 16-bit
-  only, which on a 32-bit word is two DL16 products. A spec self-conflict.
-  `DL16_HALVES` is not modelled: it refuses", and
-  `emulator/rng_probe_readings.py:136-148` records `M1ArithWidth =
-  M1_EXECUTES_AS_DL16` — "silicon cannot tell 'bit 44 ignored' from 'bit 44 honoured
-  as half-wise DL16 math'" — with **whether bit 44 is read at all** answered by the
-  `p1-icvt-m0` / `p1-icvt-m1` probe pair (`emulator/rng_probe_catalog.py:115-116`)
-  and the `m1-arith-width` probe (`:1277`). Those probes are **designed and not yet
-  run** (`receipts/box-runner-sync-fix/migration-note-rng-silicon-probes.md` says the
-  run sheet is prepared, the fix must land first). **So the RNG recipe's 120,900-
-  vector bit-identity is bit-exact under the *model's* RFP32 assumption — it
-  validates the algebra, not the silicon's M=1 semantics.** Do not cite it as proof
-  that rfp32 FMA is real.
-- **Route cost.** No route emits `mode_bit=1` today: the emitter and lowering accept
-  it (`scheduler/emitter.py:840`, `mlir/lowering.py:1693,1812,2412` default 0), but
-  no `InstructionTemplate` sets it (grep: no `mode_bit=1` call site outside the
-  emitter's validation), and `_AUXILIARY_DTYPES` (§4.0 E2) means i32 *data* has no
-  compute dtype today. So E, like D, needs a **new lowering** from i32 data to an
-  rfp32 SFP op sequence — architecture cost, not a patch. It is **cheaper per element
-  than D** (1 FMA vs 9 int8 MACs + carry) *if* the premise holds; the M=1 throughput
-  penalty versus DL16 is undocumented and must be measured.
-- **Falsifier (cheap, and already designed):** if `m1-arith-width` / `p1-icvt-m1`
-  shows M=1 arithmetic is half-wise DL16 (or bit 44 ignored), E is refuted and D (or
-  A) stands. Secondary falsifier: the new i32→rfp32 lowering cannot be emitted on the
-  pointwise route, or M=1 halves throughput enough that A's fallback wins.
+**Branch E — rfp32 direct; 16-bit halves only above the 2^24 bound. The most likely
+route to satisfy Stage 2 without a host round trip; not recommended (USER rules).**
+Evidence tags are per claim and must not be compressed: `[1p5 RTL]`,
+`[1p0 codegen table]`, `[silicon 2026-11-07]` (the M=1 rfp32 census), and
+`[unverified]` for what that census did not cover.
 
-**Branch ranking, stated plainly:** E **dominates D** on op count *if* the M=1
-premise holds (1 FMA vs 9 MACs); D does not depend on an unverified mode bit. A is
-the current position. **E and D both require new lowerings; neither is recommended
-until the `m1-arith-width` probe and the USER's decision.**
+- **Format and exactness law.** rfp32 is **1-8-23** — a 24-bit significand — with no
+  denormal representations `[1p0 codegen table: wiki/foundations/hardware/precision-formats.md:15,126]`;
+  the SFP M bit is "0=16-bit (DL16), 1=32-bit (rfp32)"
+  `[1p0 codegen table: sentient-isa-1p0.md:2359]`. A rfp32 word holds an integer
+  **exactly iff it needs ≤24 significant bits ⇒ exact on `[0, 2^24]`**. So RoPE
+  (≥2^17) and embedding (~2^18) values fit one word exactly, and `a + b` is exact iff
+  the *sum* stays below 2^24 — USER Stage-2 condition 2 as a checkable bound, and a
+  far stronger regime than DL16's 2^10 (first inexact integer 1025,
+  `sentient-isa-1p0.md:75`). 16-bit halves (the RNG per-primitive recipe:
+  `add32` = 13 SFP ops with floor-pair carry extraction, `rotl` = 22, `xor` = 10,
+  `rng-program-problem-and-hurdles.md:46` and §2.1) are needed only above 2^24 or for
+  32-bit bitwise ops — **not for the carriers themselves**.
+- **M=1 arithmetic is rfp32 — SILICON-WITNESSED 2026-11-07** `[silicon 2026-11-07]`.
+  The 12-probe census on `tmhoangt-spyre-dev-4spyres` (artifact digest
+  `3f65def505c2`) answered: **M=1 FMA/FNMS = rfp32, not DL16 halves**
+  (`m1-arith-width`, readings differ 32/32 lanes); **M=1 FMUL = rfp32**
+  (`p1-fmul`); **rfp32 FMA rounding = single (fused)** and **FNMS exact-cancel
+  zero = +0** (`p1-arith`); **bit 44 is decoded** (`p1-icvt-m0/m1`). Sources:
+  `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135` and
+  `wiki/design/43-device-side-rng.md:464-467`. **This supersedes the earlier
+  "spec self-conflict" reading** (`threefry_recipe_model.py:339-355`) — that conflict
+  is now resolved in favour of rfp32 by silicon.
+- **Residual unverified scope** `[unverified]` — the census did **not** witness full
+  rounding behaviour (rounding ties, spec RNA vs senulator RNE, are still open;
+  `p1-arith` deliberately avoids ties), sign handling across the container, or the
+  exponent range of rfp32 arithmetic. For int64 the load-bearing ones are sign
+  handling (negative positions/indices) and exponent range (large magnitudes) — those
+  need a per-class check, not an assumption.
+- **The value-range bound is owed, not assumed** `[unverified]`. "RoPE ≥128K,
+  embedding ~200K ⇒ ≤2^21" is upstream #1547's *table*, not a per-tensor-class proof.
+  Under Stage 2 it must be **proven per class**, with **accumulation** and
+  **`i·stride + j`** proven separately — exactly the classes where an intermediate
+  leaves 2^24 while the endpoints look safe (§4.2).
+- **Address path is a different capability** `[1p0 codegen table]`. Native integer add
+  on the address/control path is real and separate from element-wise math:
+  `gen/rcudd1a/opcodes.py:37-40` (`L3Opcode.ADDLARIMM`/`SUBLARIMM`/`ADDEARIMM`,
+  register-immediate add/sub) and the LX DIU address arithmetic. Branch A already
+  relies on this; E does not replace it — index/address values stay in that path
+  regardless.
+- **Route cost** `[1p0 codegen table]`. No route emits `mode_bit=1` today: the emitter
+  and lowering accept it (`scheduler/emitter.py:840`, `mlir/lowering.py:1693,1812,2412`
+  default 0) but no `InstructionTemplate` sets it, and `_AUXILIARY_DTYPES` (§4.0 E2)
+  means i32 *data* has no compute dtype. So E, like D, needs a **new i32→rfp32
+  lowering** — architecture cost, not a patch. It is **cheaper per element than D**
+  (1 FMA vs 9 int8 MACs + carry); the M=1 throughput penalty versus DL16 is
+  undocumented and must be measured.
+- **Falsifier:** an fp32-mode witness showing rfp32 arithmetic is not exact at the
+  required bound (e.g. sign or exponent-range failure for negative/≥2^24 values), or
+  a per-class proof that an intermediate exceeds 2^24 — either moves the carrier back
+  to Branch A (CPU fallback) or Branch D (PT limbs).
+
+**Branch ranking, stated plainly:** E **dominates D** on op count (1 FMA vs 9 MACs)
+and its core premise is silicon-witnessed, where D's is not mode-dependent at all; A
+is the selected position. **E and D both require new lowerings; neither is
+recommended — the USER rules on A vs D vs E.**
 
 **E3 (RTL) selected Branch A; E4 (device KAT) is owed** to confirm on 1p0 silicon
 that an i32 data `muli`/`addi` on the emitted route refuses or is inexact — E3 is
 1p5 source, E4 is the 1p0 witness. **Branches D and E are the open alternatives** and
 are not decided by E3: D by a device probe of the limb-convolution cost plus PT
-reachability; **E by the already-designed `m1-arith-width` / `p1-icvt-m1` probe
-(whether M=1 FMA executes as rfp32 or as half-wise DL16) plus i32→rfp32 lowering
-reachability.**
+reachability; **E's core premise is already answered — `m1-arith-width`/`p1-fmul`/
+`p1-arith` ran on silicon 2026-11-07 and read rfp32 — so what remains for E is the
+per-class 2^24 proof, the residual rounding/sign/exponent scope, and i32→rfp32
+lowering reachability.**
 
 ### 4.2 Per-op bound under Branch A (and the bound law under B / C / D)
 
@@ -395,8 +407,9 @@ every carrier (not 2^15 — no int16 lane); rest refuse typed. **D** — `E_op` 
 limb-decomposition bound: exact for any `R` with `k = ceil(log2(R+1)/8)` limbs, at
 `k²` int8 products + carry chain per element. **E** — `E_op = 2^24` per rfp32 word
 (24-bit significand), exact iff every intermediate stays below it; 16-bit halves only
-where the bound fails or a 32-bit bitwise op is needed — **but E's premise (M=1
-executes as rfp32) is unverified pending `m1-arith-width`.**
+where the bound fails or a 32-bit bitwise op is needed — **E's core premise (M=1
+FMA/FMUL/FNMS = rfp32) is silicon-witnessed 2026-11-07; residual unverified scope is
+rounding ties, sign handling and exponent range, plus the per-class 2^24 proof.**
 
 **Placement:** the bound is a symbolic claim discharged at the Inductor boundary from
 the §3 origin taxonomy; undischarged -> Stage-3 refusal. Never a runtime clamp.
@@ -451,12 +464,14 @@ defense-in-depth only, never the primary user-facing refusal.
   inexactly — the 1p0 silicon witness E3 cannot be. **Branch D is decided
   separately:** a device probe of the PT limb-convolution (9 int8 MACs + carry per
   logical multiply) versus the Branch-A host round trip, plus a reachability check
-  of PT from the pointwise route. **Branch E is decided by the already-designed
-  `m1-arith-width` / `p1-icvt-m1` probe** (`emulator/rng_probe_catalog.py:115-116,1277`;
-  run sheet prepared, not yet run) — does M=1 FMA execute as rfp32 or as half-wise
-  DL16? If rfp32, E dominates D (1 FMA vs 9 MACs) and becomes the candidate; if
-  half-wise DL16, E is refuted. Do not write Stage-2 code until the USER rules on
-  A vs D vs E.
+  of PT from the pointwise route. **Branch E's core premise is silicon-witnessed:**
+  `m1-arith-width` (FMA/FNMS), `p1-fmul`, `p1-arith` read **rfp32** on 2026-11-07
+  (`wiki/design/43-device-side-rng.md:459-467`). E is therefore the leading candidate
+  on exactness and op count (1 FMA vs D's 9 MACs), and what it still owes is (a) a
+  **per-class proof that every intermediate < 2^24**, with accumulation and
+  `i·stride+j` proven separately, (b) the residual rounding/sign/exponent scope the
+  census did not cover, and (c) an i32→rfp32 lowering reachable from the pointwise
+  route. Do not write Stage-2 code until the USER rules on **A vs D vs E**.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
   (currently **16 vs 32** — fails today, proving C1). Add: storage size = `numel*4`;
@@ -489,10 +504,10 @@ defense-in-depth only, never the primary user-facing refusal.
   is the only exact integer arithmetic.
 - Do not recommend Branch D — it is written with its cost so the A-vs-D choice is
   explicit; the USER rules.
-- Do not cite the RNG recipe's 120,900-vector bit-identity as proof that rfp32 M=1
-  FMA is real on silicon. It is bit-exact under the *model's* RFP32 assumption; the
-  M=1 semantics is a spec self-conflict settled only by the `m1-arith-width` probe
-  (Branch E's premise).
+- Do not conflate the two RNG evidence classes: the **threefry oracle's
+  120,900-vector bit-identity is the *emulator*** (it validates the algebra), while
+  **rfp32 M=1 arithmetic is a *silicon* fact** from the 2026-11-07 census
+  (`m1-arith-width`/`p1-fmul`/`p1-arith`). Cite each for what it proves.
 - 1.5 (`SEN1P5`) encoding is out of scope (E3 RTL facts are used only as a labelled
   inference about 1p0).
 
