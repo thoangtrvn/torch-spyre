@@ -225,7 +225,7 @@ row of this table is not a safe enumeration of arithmetic capability.
 | "PE integer arithmetic is the int16 FMA lane, exact to 2^15" | **REFUTED.** `in_ctrl_x_int16` forces a fixed exponent into the **floating** FMA and is tied off in the PE top; it is not an integer multiplier. Exact only to ~2^10 — the ISA doc's own "first inexact integer is 1025". | `rpd_pesfp_fp16_top.vhdl:247` |
 | "the widest exact native integer path is int16 (2^15)" | **REFUTED.** The widest exact integer is PT's **int24 accumulator** (`\|acc\| ≤ 2^23`), fed by int8 (int4 in 1p0) operands. No 2^15 lane exists. | `rpd_pt_fx_engine.vhdl:111-140` |
 | "Branch C anchors on ±2^15 (int16)" | **RESTATED.** There is no 2^15 lane. Any narrow contract must be expressed against int8/int4 operands and the int24 accumulator, not int16. | as above |
-| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width`, `p1-fmul`, `p1-arith`). The earlier "spec self-conflict" was resolved in favour of rfp32 by that census, not left open. | `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
+| "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED — M=1 width is silicon-witnessed.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width` = rfp32 on 32/32 lanes, `p1-fmul`, `p1-arith`), bit 44 decoded. The `M1ArithWidth = M1_EXECUTES_AS_DL16` value I first read is the classifier's *undecided default*, and the `threefry_recipe_model.py` "spec self-conflict" is a *model* limitation the census resolved in favour of rfp32 three days later. What the 120,900-vector result does NOT witness is the hardware — it is the emulator. | `receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md`; `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
 | "the M=1 probes are designed and not yet run" (my earlier relay of the box-runner note) | **CORRECTED — I was wrong.** The box-runner note concerned a *later re-run* gated on a runner fix; the **2026-11-07 census already ran** and answered M=1 = rfp32. My "unverified in silicon" wording was a stale read of the migration note against the design docs. | `wiki/design/43-device-side-rng.md:459-467` |
 
 ### 4.1 Decision fork — E3 selects Branch A; D and E are the open alternatives
@@ -464,14 +464,16 @@ defense-in-depth only, never the primary user-facing refusal.
   inexactly — the 1p0 silicon witness E3 cannot be. **Branch D is decided
   separately:** a device probe of the PT limb-convolution (9 int8 MACs + carry per
   logical multiply) versus the Branch-A host round trip, plus a reachability check
-  of PT from the pointwise route. **Branch E's core premise is silicon-witnessed:**
-  `m1-arith-width` (FMA/FNMS), `p1-fmul`, `p1-arith` read **rfp32** on 2026-11-07
-  (`wiki/design/43-device-side-rng.md:459-467`). E is therefore the leading candidate
-  on exactness and op count (1 FMA vs D's 9 MACs), and what it still owes is (a) a
-  **per-class proof that every intermediate < 2^24**, with accumulation and
-  `i·stride+j` proven separately, (b) the residual rounding/sign/exponent scope the
-  census did not cover, and (c) an i32→rfp32 lowering reachable from the pointwise
-  route. Do not write Stage-2 code until the USER rules on **A vs D vs E**.
+  of PT from the pointwise route. **Branch E is NOT decided by `m1-arith-width` — that
+  is already answered:** the census read rfp32 on 2026-11-07
+  (`receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md`;
+  `wiki/design/43-device-side-rng.md:459-467`). E's real gaps are **(a) the route
+  cost — no `InstructionTemplate` sets `mode_bit=1`, so E needs a new i32→rfp32
+  lowering exactly as D needs a pointwise→PT one** — and (b) a **per-class 2^24
+  intermediate proof**, with accumulation and `i·stride+j` proven separately, plus
+  (c) the residual rounding/sign/exponent scope the census did not cover. E and D are
+  both architecture-cost routes; E is 1 FMA vs D's 9 int8 MACs + carry. Do not write
+  Stage-2 code until the USER rules on **A vs D vs E**.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
   (currently **16 vs 32** — fails today, proving C1). Add: storage size = `numel*4`;
@@ -504,10 +506,16 @@ defense-in-depth only, never the primary user-facing refusal.
   is the only exact integer arithmetic.
 - Do not recommend Branch D — it is written with its cost so the A-vs-D choice is
   explicit; the USER rules.
-- Do not conflate the two RNG evidence classes: the **threefry oracle's
-  120,900-vector bit-identity is the *emulator*** (it validates the algebra), while
-  **rfp32 M=1 arithmetic is a *silicon* fact** from the 2026-11-07 census
-  (`m1-arith-width`/`p1-fmul`/`p1-arith`). Cite each for what it proves.
+- **Do not cite the threefry oracle's 120,900-vector bit-identity as hardware
+  evidence** — it is the *emulator* and validates the Threefry algebra. **Cite the
+  census instead** for the M=1 width question:
+  `receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md` (2026-11-07,
+  12/12 probes, 0 faults) — `m1-arith-width` = rfp32 (32/32 lanes), `p1-fmul` =
+  rfp32, `p1-arith` = single rounding / +0 / bit 44 decoded. Otherwise a reader
+  concludes M=1 width is unknown, which it is not.
+- **Do not describe Branch E as "unverified" on the width question.** The width is
+  witnessed; what is unverified is the per-tensor-class 2^24 intermediate bound and
+  the missing i32→rfp32 lowering.
 - 1.5 (`SEN1P5`) encoding is out of scope (E3 RTL facts are used only as a labelled
   inference about 1p0).
 
