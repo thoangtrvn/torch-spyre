@@ -8,9 +8,9 @@ Lane `torchspyre-int64-graph-policy` (repo `torch-spyre-thoangtrvn`, base `b413c
 CSRC change → **rebuild on the box under the hardware claim protocol**.
 
 **Lane scope at this revision (after review round 1):**
-- **Slice 1 — BLOCKED** on a precondition (§1: `sendnn`-free extraction, or a
-  codegen-only include change). Recommendation to carve it into its own lane is with
-  the USER; dispatch is USER-only and this lane does not create a branch for it.
+- **Slice 1 — split (do not conflate): S1.a sendnn removal is LIVE and unblocked;
+  S1.b one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
+  concerns **S1.b only**; dispatch is USER-only and this lane creates no branch.
 - **Slice 2 — live** (owner table is documentation + tests; no build dependency).
 - **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a
   classifies by **exception class first** (§3a); the named candidate is the
@@ -43,7 +43,17 @@ the values.
 
 ---
 
-## 1. Slice 1 — one owner for `get_device_dtype`
+## 1. Slice 1 — two independent items
+
+> **Status split (do not conflate them):**
+> - **S1.a — sendnn removal: LIVE, unblocked.** Pure type swap + libs-list edit, full
+>   build only; can proceed now, independent of the carve.
+> - **S1.b — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
+>   precondition. This is the piece that needs the USER's carve call, and it is what
+>   gates T-DC-121 *if* the geometry-split candidate holds (§3a).
+>
+> Sequence: **S1.a now, as its own commit; S1.b after the precondition is chosen.**
+> Different review surfaces — never one commit.
 
 **Defect (verified):**
 
@@ -58,7 +68,9 @@ the live one.** In a real codegen-only build `_C.py:137` is the *no-backend fall
 the accessor on the path is `codegen_backend.cpp:145-167`. "Delete the `_C.py` map" is
 therefore a **no-op against the live path**.
 
-**BLOCKED — precondition before any Slice-1 change (verified).** Routing
+### S1.b — one-owner reconciliation: BLOCKED (P-a / P-b)
+
+**BLOCKED — precondition before the reconciliation (verified).** Routing
 `codegen_backend.cpp` through the C++ pair cannot be done as written:
 `csrc/types_mapping.h:24` does `#include <sendnn/tensor/sendatatype.hpp>`, and
 `setup.py` adds `SEN_COMMON_HEADERS` (the dir holding it) **only inside
@@ -84,7 +96,7 @@ single owner of the physical/compute format, and have every accessor — runtime
 `codegen_backend.cpp`, and `_C.py` if it survives — answer from it. The accessors must
 not carry independent maps/switches.
 
-### S1.b — sendnn removal (USER-directed; scoped, implement when S1 is unblocked)
+### S1.a — sendnn removal (USER-directed; **LIVE and unblocked**)
 
 The USER has directed that `sendnn` be removed, adopting the necessary piece from
 upstream. It lands here because `types_mapping.h` is already on the int64 critical
@@ -122,11 +134,18 @@ the enum type is used**, so it is a pure *type* dependency: `LIBRARIES` can drop
    the mapping). **If any is reachable, keep it and map it explicitly** — do not
    silently drop a reachable dtype.
 
-**Relation to the precondition above:** this removal *is* form (P-a) — it makes
-`types_mapping.h` sendnn-free — but it is **not sufficient on its own** to let
-`codegen_backend.cpp` include it: the codegen-only include path must also carry
-`<module.h>` and `<util/sendefs.h>`. **Check that before claiming S1 unblocked**; if
-those are absent, a small include-path addition is still needed (P-b territory).
+**Relation to S1.b — none, and that is the correction.** This removal is **standalone
+and unblocked**: it touches only the **full build** (`module.cpp` → `types_mapping.h`);
+the codegen-only build never includes `types_mapping.h`, so it is unaffected, and no
+P-a/P-b decision is needed. The full build already has `DataFormats` via
+`types_mapping.h:22`'s `<util/sendefs.h>`.
+
+It is **not** the same thing as P-a for the reconciliation: making `types_mapping.h`
+sendnn-free does not by itself let `codegen_backend.cpp` include it, because the
+codegen-only include path would still need `<module.h>` and `<util/sendefs.h>`.
+**S1.b's precondition is a separate decision and stays open.** (If, once S1.a lands,
+someone wants to test whether the reconciliation became easier, that check is: does
+the codegen-only build resolve both headers? — but it is not required by S1.a.)
 
 **Codegen-only build:** unaffected and must stay green — `codegen_backend.cpp` does not
 include `types_mapping.h` and keeps its own local `enum class DataFormats` (`:52-72`).
