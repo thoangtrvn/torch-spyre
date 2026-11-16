@@ -1,6 +1,8 @@
 # PLAN — Stage 1 implementation (int64 three-dtype, AIU 1.0)
 
-Status: **PLAN ONLY. No code until reviewed.** Companion to
+Status: **PLAN. Only S1.a has landed** (`af9a6d66` deletion, `3c6aba97` comments); S1.b
+and Slices 2-4 are unimplemented. See §1.0 for S1.a's closure record and its bar-b
+caveat. Companion to
 `plans/PLAN_int64_three_dtype.md` (the design plan); this file is the work plan for
 Stage 1 under **Ruling 3 (USER, 2026-11-16): Stage 1 first, then Branch E.**
 
@@ -8,8 +10,9 @@ Lane `torchspyre-int64-graph-policy` (repo `torch-spyre-thoangtrvn`, base `b413c
 CSRC change → **rebuild on the box under the hardware claim protocol**.
 
 **Lane scope at this revision (after review round 1):**
-- **Slice 1 — split (do not conflate): S1.a sendnn removal is LIVE and implementable;
-  S1.b one-owner reconciliation is BLOCKED** on P-a/P-b (§1). The carve recommendation
+- **Slice 1 — split (do not conflate): S1.a sendnn removal LANDED and BUILD-VERIFIED
+  (`af9a6d66`, `3c6aba97`; §1.0); S1.b one-owner reconciliation is BLOCKED** on
+  P-a/P-b (§1). The carve recommendation
   concerns **S1.b only**; dispatch is USER-only and this lane creates no branch.
 - **Slice 2 — live** (owner table is documentation + tests; no build dependency).
 - **Slice 3 — live scope, diagnosis NOT established**: no mechanism, no fix. 3a
@@ -46,14 +49,55 @@ the values.
 ## 1. Slice 1 — two independent items
 
 > **Status split (do not conflate them):**
-> - **S1.a — sendnn removal: LIVE, implementable.** Pure type swap + libs-list edit, full
->   build only; can proceed now, independent of the carve.
+> - **S1.a — sendnn removal: LANDED + BUILD-VERIFIED (2026-11-16).** Commits
+>   `af9a6d66` (deletion) and `3c6aba97` (residual comment refs). Full non-codegen-only
+>   build on the box: exit 0, three includers compiled, `-lflex` only. See §1.0 for the
+>   witness set and its **bar-b caveat** (compile/link, not runtime).
 > - **S1.b — two-answer one-owner reconciliation: BLOCKED** behind the P-a/P-b
 >   precondition. This is the piece that needs the USER's carve call, and it is what
->   gates T-DC-121 *if* the geometry-split candidate holds (§3a).
+>   gates T-DC-121 *if* the geometry-split candidate holds (§3a). **S1.a's landing does
+>   not advance it.**
 >
 > Sequence: **S1.a now, as its own commit; S1.b after the precondition is chosen.**
 > Different review surfaces — never one commit.
+
+### 1.0 S1.a closure record
+
+**What landed.** Deletion only, no upstream adoption: `types_mapping.h` loses the
+`#include <sendnn/tensor/sendatatype.hpp>` (`:24`) and the dead
+`stringToSenDatatypePair` (`:110-348`), 241 lines; `setup.py:96` `LIBRARIES` →
+`["flex"]`. The live `stringToDTDataFormatPair` is byte-identical to base (extraction
+sha256 `943a9d0b66a0b3a6bb04afde9b9b51a71b50ce30b3784bc3b500abfb46812e06`), and the two
+Stage-1 rows are unchanged: `int32 → {IEEE_INT32, IEEE_INT32}`, `int64 →
+{IEEE_INT64, IEEE_INT32}`. Residual comment refs cleaned in `3c6aba97`
+(`build-macos.sh:2`, `pyproject.toml:4,38,55`); the `build` package was **not**
+removed — no in-repo consumer was found, so only the misleading comment was retitled.
+
+**Build witness (box, tree = `3c6aba97`, fresh `git archive` extract + grafted the
+untracked vendored `external/nlohmann`; canonical checkout untouched).**
+- exit 0; `_C`, `_hooks` both built; include line identical to the canonical build
+  minus the sendnn dir.
+- `module.cpp`, `spyre_mem.cpp`, `spyre_tensor_impl.cpp` — all three `types_mapping.h`
+  includers compiled.
+- Log grep for `error:`/`fatal error`/`undefined reference`/`-lsendnn`/`sendnn/` — zero
+  hits; link line `-lflex` only.
+- `_C.so` `f391661a726b2bed678fd6a587c375746d0e14b242cf1e6284179a834997ac8e`,
+  `_hooks.so` `8f6d1ac2e47176a5a5b9c84eea4e111543ad873e28fb0a80c4b097503c36ff8f`.
+
+**Bar-b caveat (state this wherever "build green" is quoted).** This witnesses
+**compile + link** of the removal. It does **not** witness the int64 runtime row, which
+is unchanged by S1.a, and it does **not** discharge T-DC-121 — that remains *not
+established*. Build green ≠ runtime green.
+
+**Build-command record** (for repeatability): `build_ext --inplace`, never
+`pip install -e .` (that repoints the venv's editable install). Env is the env.sh
+prefixes — `RUNTIME_INSTALL_DIR`/`SENLIB_INSTALL_DIR`/`DEEPTOOLS_INSTALL_DIR` =
+`/home/tmhoangt/AIU/sentient/*` — plus `SEN_COMMON_HEADERS=/home/tmhoangt/AIU/flex`.
+If `RUNTIME_INSTALL_DIR` is set, all three must be (`setup.py:111-113` indexes them
+unguarded). `LD_LIBRARY_PATH` is not needed: `check_libflex()` (`setup.py:54-59`) has
+zero callers. A hardlink-clone staging dir (`cp -al`) requires deleting `*.so` and
+`build/` first — `build_ext --inplace` truncates its destination in place and would
+write through the link into the canonical tree.
 
 **Defect (verified):**
 
