@@ -44,8 +44,23 @@ emitted Triton signature turns `*i64,*i64` -> `*i32,*i32` under that approach.
   safe"); §4 now carries five branches (A selected, B kept for E4, C written option,
   **D = PT limb decomposition**, and **E = rfp32 direct (2^24 exactness), whose M=1
   rfp32 premise is silicon-witnessed 2026-11-07** but which still owes a per-class
-  2^24 proof and a new lowering). D and E both need new lowerings and neither is
-  recommended. No Stage-2 code until the USER rules on A vs D vs E.
+  2^24 proof and a new lowering).
+
+- **Ruling 3 (USER, 2026-11-16) — sequencing: Stage 1 first, then Branch E.**
+  - **Stage 1 is mandatory under every route** — it is C1 (`get_device_dtype`
+    two-answer split) and T-DC-121 (staging overrun), both live defects, and no
+    route's correctness is safe until they are fixed. **It is the immediate work.**
+  - **Branch E is the strategic route** — one mechanism over the whole range
+    (1 FMA where every intermediate ≤ 2^24; exact 16-bit halves above), width
+    premise silicon-witnessed. **E's entry conditions are a lowering attachment
+    point and the per-class 2^24 bound proof** (see the Stage-1/E plan).
+  - **Branch D is PARKED** — the path if integer-heavy workloads make real integer
+    hardware worth the plumbing. Do not work on D.
+  - **Branch A is interim containment only, and must be typed, not silent** — a
+    caller on a non-E route gets an explicit `UnsupportedInt64RangeError`, never a
+    silent cast.
+  - **Order: Stage 1 → (E entry conditions) → E.** No Stage-2 code before Stage 1
+    lands and the E entry conditions are discharged.
 
 ---
 
@@ -228,7 +243,11 @@ row of this table is not a safe enumeration of arithmetic capability.
 | "there is no evidenced rfp32 multiply (FMA is 16-bit only)" (my §4.2 wording) | **REFUTED — M=1 width is silicon-witnessed and accepted on both sides.** rfp32 is 1-8-23 with no denormals, and **silicon witnessed M=1 FMA/FNMS/FMUL = rfp32 on 2026-11-07** (`m1-arith-width` = rfp32 on 32/32 lanes, `p1-fmul`, `p1-arith` = single/fused, +0), bit 44 decoded. This lane and a6 independently re-read the verdict receipt and agree. The `M1ArithWidth = M1_EXECUTES_AS_DL16` value I first read is the classifier's *undecided default*; the `threefry_recipe_model.py` "spec self-conflict" is a *model* limitation the census resolved in favour of rfp32. What the 120,900-vector result does NOT witness is the hardware — it is the emulator. | `receipts/rng-silicon-probes/silicon-3f65def505c2/SILICON-VERDICT.md:14,16,21,34`; `precision-formats.md:15`; `wiki/design/44-sfp-mode1-capability-1p0.md:18-21,135`; `wiki/design/43-device-side-rng.md:464-467` |
 | "the M=1 probes are designed and not yet run" (my earlier relay of the box-runner note) | **CORRECTED — I was wrong.** The box-runner note concerned a *later re-run* gated on a runner fix; the **2026-11-07 census already ran** and answered M=1 = rfp32. My "unverified in silicon" wording was a stale read of the migration note against the design docs. | `wiki/design/43-device-side-rng.md:459-467` |
 
-### 4.1 Decision fork — E3 selects Branch A; D and E are the open alternatives
+### 4.1 Decision fork — USER sequencer (Ruling 3): Stage 1 → E; A interim-typed; D parked
+
+**The fork is closed by Ruling 3.** E is the destination, A is typed interim
+containment, D is parked, B/c remain written for the record. The branch text below is
+retained because it records the evidence and the costs that produced the ruling.
 
 **E3 selects Branch A** (no exact integer *data* datapath). Branches A–E are all
 written; each carries its **falsifier**. A is the current position; **D and E are the
@@ -376,13 +395,14 @@ Evidence tags are per claim and must not be compressed: `[1p5 RTL]`,
   a per-class proof that an intermediate exceeds 2^24 — either moves the carrier back
   to Branch A (CPU fallback) or Branch D (PT limbs).
 
-**Branch ranking, stated plainly — two architecture-cost routes:**
-- **E (rfp32):** width **witnessed** (silicon 2026-11-07); needs an **i32→rfp32
-  lowering**; **owes the per-class 2^24 intermediate bound**.
-- **D (PT int8 limbs):** premise **independent of bit 44**; needs a **pointwise→PT
-  lowering**; **owes the same per-class bound at int24 (`2^23`)**.
-- E is 1 FMA vs D's 9 int8 MACs + carry. A is the selected position. **Neither D nor
-  E is recommended — the USER rules on A vs D vs E**, and both owe the bound.
+**Branch ranking after Ruling 3 (recorded, not a recommendation of our own):**
+- **E (rfp32) — DESTINATION.** Width witnessed (silicon 2026-11-07); needs an
+  **i32→rfp32 lowering**; owes the per-class 2^24 intermediate bound.
+- **D (PT int8 limbs) — PARKED.** Premise independent of bit 44; needs a
+  pointwise→PT lowering; owes the same bound at int24 (`2^23`). Not worked.
+- **A — INTERIM CONTAINMENT, TYPED.** Refuses `UnsupportedInt64RangeError` outside
+  the proven range; never a silent cast.
+- **Order: Stage 1 → E entry conditions → E** (§0.5 Ruling 3).
 
 **E3 (RTL) selected Branch A; E4 (device KAT) is owed** to confirm on 1p0 silicon
 that an i32 data `muli`/`addi` on the emitted route refuses or is inexact — E3 is
@@ -485,9 +505,10 @@ defense-in-depth only, never the primary user-facing refusal.
   lowering exactly as D needs a pointwise→PT one** — and (b) a **per-class 2^24
   intermediate proof**, with accumulation and `i·stride+j` proven separately, plus
   (c) the residual rounding/sign/exponent scope the census did not cover. **D owes the
-  same bound at int24 (`|acc| ≤ 2^23`), not just E at 2^24.** E and D are both
-  architecture-cost routes; E is 1 FMA vs D's 9 int8 MACs + carry. Do not write
-  Stage-2 code until the USER rules on **A vs D vs E**.
+  same bound at int24 (`|acc| ≤ 2^23`), not just E at 2^24** (D is parked by Ruling
+  3). **Sequencing: Stage 1 lands first; then E's entry conditions (lowering
+  attachment point + per-class 2^24 bound) are discharged; only then E code.** Do not
+  write Stage-2 code before that.
 - **P1 (Stage 1 geometry):** assert one `get_device_dtype(int64)` answer across
   codegen-only and runtime, and `elems_per_stick(int64)` identical in both build modes
   (currently **16 vs 32** — fails today, proving C1). Add: storage size = `numel*4`;
