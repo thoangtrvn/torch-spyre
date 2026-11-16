@@ -84,6 +84,62 @@ single owner of the physical/compute format, and have every accessor — runtime
 `codegen_backend.cpp`, and `_C.py` if it survives — answer from it. The accessors must
 not carry independent maps/switches.
 
+### S1.b — sendnn removal (USER-directed; scoped, implement when S1 is unblocked)
+
+The USER has directed that `sendnn` be removed, adopting the necessary piece from
+upstream. It lands here because `types_mapping.h` is already on the int64 critical
+path. **Scoped against the canonical tree** (`torch-spyre-thoangtrvn` @ `new-runtime`
+`b413c3e3`) **and upstream** (`torch-spyre-upstream` @ `main` `52aeb859`,
+sendnn-free); re-verified in this lane:
+
+**Signal (verified):** sendnn appears in exactly two places —
+`torch_spyre/csrc/types_mapping.h:24` (`#include <sendnn/tensor/sendatatype.hpp>`) plus
+**136** uses of `sendnn::sen_datatype_enum` (the scoping note said 137; the tree counts
+136 — a one-off, recorded rather than smoothed) — and `setup.py:96`
+`LIBRARIES = ["sendnn", "sendnn_interface", "flex"]`. **No `sendnn::` symbol other than
+the enum type is used**, so it is a pure *type* dependency: `LIBRARIES` can drop to
+`["flex"]` with no unresolved-symbol risk from the enum.
+
+**The substitution, with its traps:**
+1. `sendnn::sen_datatype_enum` → `DataFormats`. `DataFormats` is an
+   `enum class` in `util/sendefs.h`, and `types_mapping.h:22` **already includes**
+   `<util/sendefs.h>` — the type is in scope; delete only the `:24` include.
+2. **Do not copy upstream's include line.** Upstream includes
+   `<util/sendefs/sendefs.h>` (a `sendefs/` subdir absent from this install). Keep the
+   local `<util/sendefs.h>`; take only upstream's *pair table*.
+3. **Do not hand-rename the 136 members** — the vocabularies differ (`boolean→BOOL`,
+   `sen_fp16→SEN169_FP16`, …). **Adopt upstream's `stringToDTDataFormatPair` body
+   wholesale** (upstream `types_mapping.h:57-108`), which is the same mapping already
+   expressed in `DataFormats`.
+4. **Cross-check the two Stage-1 rows survive identically** (verified in upstream
+   `:69-70`): `"int32" → {IEEE_INT32, IEEE_INT32}` and
+   `"int64" → {IEEE_INT64, IEEE_INT32}`. These are the geometry pair; their semantics
+   must not change.
+5. **Verify, do not assume, the dropped entries.** Upstream's table omits some entries
+   the sendnn map carried (`float64`/`float128`/`float256`, `decimal*`, `string`).
+   Enumerate every caller of `stringToDTDataFormatPair` / `torchScalarToString` and
+   confirm those dtypes are unreachable (rejected by `is_supported_dtype` upstream of
+   the mapping). **If any is reachable, keep it and map it explicitly** — do not
+   silently drop a reachable dtype.
+
+**Relation to the precondition above:** this removal *is* form (P-a) — it makes
+`types_mapping.h` sendnn-free — but it is **not sufficient on its own** to let
+`codegen_backend.cpp` include it: the codegen-only include path must also carry
+`<module.h>` and `<util/sendefs.h>`. **Check that before claiming S1 unblocked**; if
+those are absent, a small include-path addition is still needed (P-b territory).
+
+**Codegen-only build:** unaffected and must stay green — `codegen_backend.cpp` does not
+include `types_mapping.h` and keeps its own local `enum class DataFormats` (`:52-72`).
+Removing sendnn does **not** fix the two-answer split; that remains S1's separate work.
+
+**Verification bars:** (a) full build compiles with `LIBRARIES=["flex"]` and no sendnn
+header on the include path; (b) int64 still maps to `{IEEE_INT64, IEEE_INT32}` with
+16/32 elem-per-stick semantics preserved; (c) the codegen-only build compiles unchanged;
+(d) `grep -rn sendnn torch_spyre/csrc setup.py` is empty.
+
+**Two commits, not one:** sendnn removal and the two-answer fix have different review
+surfaces (build/type vocabulary vs accessor semantics) and must land separately.
+
 **Do not** change the *logical* dtype: `torch.int64` stays int64 at the eager
 `.to("spyre")` boundary (Ruling 2; `tests/test_spyre.py:236`).
 
