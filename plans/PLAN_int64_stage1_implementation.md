@@ -98,11 +98,13 @@ not carry independent maps/switches.
 
 ### S1.a — sendnn removal (USER-directed; **LIVE, implementable**)
 
-The USER has directed that `sendnn` be removed, adopting the necessary piece from
-upstream. It lands here because `types_mapping.h` is already on the int64 critical
-path. **Scoped against the canonical tree** (`torch-spyre-thoangtrvn` @ `new-runtime`
-`b413c3e3`) **and upstream** (`torch-spyre-upstream` @ `main` `52aeb859`,
-sendnn-free); re-verified in this lane:
+The USER has directed that `sendnn` be removed. It lands here because
+`types_mapping.h` is already on the int64 critical path. **Scope (final): a deletion
+only — no upstream code is adopted.** Upstream is cited below solely as the reference
+that was checked and rejected; the live local table stays byte-identical. Scoped
+against the canonical tree (`torch-spyre-thoangtrvn` @ `new-runtime` `b413c3e3`) and
+upstream (`torch-spyre-upstream` @ `main` `52aeb859`, sendnn-free); re-verified in this
+lane:
 
 **Signal (verified):** sendnn appears in exactly two places —
 `torch_spyre/csrc/types_mapping.h:24` (`#include <sendnn/tensor/sendatatype.hpp>`) and
