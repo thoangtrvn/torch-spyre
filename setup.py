@@ -93,7 +93,7 @@ LIBRARY_DIRS = []
 # stub-dylib emission) is RETIRED: kernel-generation-only environments use
 # the codegen-only build (TORCH_SPYRE_CODEGEN_ONLY), which ships
 # _codegen_backend.so + the pure-Python _C and never links the runtime.
-LIBRARIES = ["sendnn", "sendnn_interface", "flex"]
+LIBRARIES = ["flex"]
 
 if not CODEGEN_ONLY:
     INCLUDE_DIRS += [maybe_download_nlohmann_json()]
