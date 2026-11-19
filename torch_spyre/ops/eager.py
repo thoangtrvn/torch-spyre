@@ -174,14 +174,18 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Default (switch OFF): the documented host-CPU offload — draw on CPU, copy
     # to device. Reproducible only via the CPU stream; this is NOT device RNG.
     #
-    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route is attempted, and it
-    # REFUSES TYPED for every current case (T>=2 unbuilt, uniform fp32 grid
-    # unwitnessed, pattern unregistered until lane B). A caller who opted into
-    # device RNG must never get a silent host substitute.
+    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route fills from DEVICE
+    # random bits (the silicon-witnessed T=1 raw-state kernel), mapping the raw
+    # words to [from_, to) on the host. It REFUSES TYPED for anything beyond one
+    # T=1 tile (numel > 64, T-DV-34 unbuilt) or when the pattern is not
+    # registered. A caller who opted into device RNG never gets a host draw.
     from torch_spyre.rng import device_rng_enabled, route_uniform_draw
 
     if device_rng_enabled():
-        route_uniform_draw(from_, to, self.numel())  # raises SpyreRngError
+        values = route_uniform_draw(from_, to, self.numel())  # raises typed
+        host = torch.from_numpy(values).to(dtype=self.dtype)
+        self.copy_(host.reshape(self.shape))
+        return self
 
     # Create a new tensor on cpu
     cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)

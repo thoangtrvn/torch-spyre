@@ -90,7 +90,9 @@ __all__ = [
     "injection_words_2x32",
     "key_schedule_2x32",
     "launch_raw_state_draw",
+    "raw_words_to_uniform",
     "reconstruct_raw_state_from_tensor",
+    "route_uniform_draw",
     "replay_band_stream_raw",
     "rng_pattern_registered",
     "seed_to_key",
@@ -788,43 +790,110 @@ def build_rng_launch_plan(
     )
 
 
-def route_uniform_draw(from_: float, to: float, numel: int) -> None:
-    """The device route for a user-facing uniform draw — REFUSES, typed.
+#: One T=1 launch reconstructs ``x0`` and ``x1`` — 32 lanes each, full 32-bit
+#: words — so a single launch yields ``2 * RNG_KAT_LANES`` = 64 uniform words.
+#: That bounds the T=1 device uniform fill: ``numel <= 64``.
+_RNG_MAX_UNIFORM_ELEMS = 2 * RNG_KAT_LANES
+
+
+def raw_words_to_uniform(words, from_: float = 0.0, to: float = 1.0) -> np.ndarray:
+    """Map full 32-bit random words to ``[from_, to)`` (the P0 uniform grid).
+
+    ``u = (word >> 8) * 2**-24`` (doc 43 P0 / the C-5 fp32 grid): the top 24
+    bits of each word, scaled into the unit interval, then affinely scaled to
+    ``[from_, to)``. This is a PURE/DETERMINISTIC function of the raw bits — it
+    is exercised offline on known words. It is NOT the silicon-witnessed uniform
+    *epilogue* (the ``u = hi*2^-16 + floor(lo/256)*2^-24`` grid, P5 owed): it
+    rebuilds uniform values from the witnessed RAW-STATE egress on the host.
+    """
+    w = np.asarray(words, dtype=np.uint32)
+    u = (w >> np.uint32(8)).astype(np.float64) * (2.0**-24)
+    return (float(from_) + u * (float(to) - float(from_))).astype(np.float32)
+
+
+def _generator_state():
+    """The live per-device ``SpyreGeneratorState`` from the ``torch.spyre`` module.
+
+    Returns ``None`` if the device module is not registered (e.g. the backend
+    half imported standalone). The default generator (``device=None``) is the
+    one ``torch.spyre.manual_seed`` seeds and ``get_rng_state`` round-trips, so
+    a draw here advances the state the user can reproduce/reset.
+    """
+    try:
+        import torch
+    except Exception:
+        return None
+    mod = getattr(torch, "spyre", None)
+    impl = getattr(mod, "_impl", None) if mod is not None else None
+    if impl is None or not hasattr(impl, "_rng_state"):
+        return None
+    try:
+        return impl._rng_state(None)
+    except Exception:
+        return None
+
+
+def route_uniform_draw(
+    from_: float, to: float, numel: int, *, device=None
+) -> np.ndarray:
+    """Device route for a user-facing uniform draw: fill from DEVICE bits.
 
     Called by the ``uniform_``/``rand`` kernels only when the device-RNG switch
-    is ON. Every path here refuses:
+    is ON. Returns a host ``float32`` array of ``numel`` uniforms in
+    ``[from_, to)`` whose *random bits* come from the silicon-witnessed T=1
+    raw-state kernel (``draw_raw_state``), never from a host RNG.
 
-    * T≥2 (more than 32 elements) is unbuilt (T-DV-34);
-    * the uniform fp32 grid is unwitnessed (P5 owed);
-    * and, even for a single T=1 tile, ``rng_kat`` must be registered first.
+    Design:
 
-    There is deliberately no fallback: with the switch ON, a caller asked for
-    device RNG, so silently substituting a host draw would be the exact
-    silent-mislead the contract forbids.
+    * **Reserve** ``numel`` blocks from the device generator so successive
+      draws differ (offset advances) and a fixed seed reproduces (offset reset
+      by ``manual_seed``/``set_rng_state``). Graph replay must therefore
+      advance the offset across replays — see ``SpyreGeneratorState.reserve``.
+    * **Generate on device** via ``draw_raw_state(seed, offset)`` (one T=1
+      launch yields 64 full 32-bit words: ``x0`` then ``x1``). At most ``64``
+      elements are served per draw.
+    * **Map on the host** with :func:`raw_words_to_uniform`
+      (``u=(w>>8)*2**-24`` then affine scale). The elementwise bit-ops it needs
+      (``>>``/``&``) are NOT registered on spyre (only add/sub/mul/div/pow/...
+      are), so the map cannot run on device today; the random *bits* are
+      device-generated regardless, never from a host RNG.
+
+    Refuses typed (``SpyreRngError``) when ``numel`` exceeds one T=1 tile
+    (T-DV-34 unbuilt) or when ``rng_kat`` is not registered. There is
+    deliberately no host-RNG fallback: with the switch ON the caller asked for
+    device RNG, so a silent host substitute is forbidden.
     """
-    tiles = (int(numel) + RNG_KAT_LANES - 1) // RNG_KAT_LANES
-    if tiles >= 2:
+    numel = int(numel)
+    if numel < 0:
+        raise ValueError(f"numel must be non-negative, got {numel}")
+    if numel > _RNG_MAX_UNIFORM_ELEMS:
         raise SpyreRngError(
-            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements = {tiles} "
-            f"tiles; only the single 32-lane T=1 tile is witnessed."
+            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements exceed the "
+            f"{_RNG_MAX_UNIFORM_ELEMS} words a single T=1 launch yields (one "
+            f"32-lane tile). Draw on the host, or split into independent draws."
         )
-    if (float(from_), float(to)) != (0.0, 1.0):
-        raise SpyreRngError(
-            f"uniform_({from_}, {to}): the device uniform grid is fixed at [0, 1); "
-            f"arbitrary from_/to_ scaling is unwitnessed. Refusing."
-        )
+    if numel == 0:
+        return np.empty(0, dtype=np.float32)
     if not rng_pattern_registered():
         raise SpyreRngError(
             "device RNG is not wired yet: backend pattern 'rng_kat' is not "
             "registered (lane B). Turn off TORCH_SPYRE_DEVICE_RNG to use the "
-            "documented host-CPU offload, or wait for registration + integration."
+            "documented host-CPU offload, or wait for registration."
         )
-    # Registered, but the uniform grid itself is still unwitnessed (P5).
-    raise SpyreRngError(
-        "device RNG is registered but the uniform fp32 grid is UNWITNESSED "
-        "(P5 owed): only the raw-state KAT egress is witnessed. A user-facing "
-        "uniform draw is not yet connectable."
-    )
+    state = _generator_state()
+    if state is None:
+        raise SpyreRngError(
+            "device RNG: the spyre generator state is unreachable (torch.spyre "
+            "not registered); cannot reserve a draw offset. Refusing rather than "
+            "falling back to a host draw."
+        )
+    # Reserve one block per element so a second draw advances the offset.
+    offset = state.reserve(numel)
+    x0, x1 = draw_raw_state(state.seed, offset, device=device)
+    words = np.concatenate([np.asarray(x0, np.uint32), np.asarray(x1, np.uint32)])[
+        :numel
+    ]
+    return raw_words_to_uniform(words, from_, to)
 
 
 # ---------------------------------------------------------------------------
