@@ -586,9 +586,11 @@ class SpyreGeneratorState:
     """A real ``(seed u64, offset u64)`` generator state (one per device).
 
     The offset is the block-offset the host folds into the next draw's key
-    schedule (doc 43 §3.2). It advances by the reservation of a launched draw;
-    because the device path is not yet connected, no draw here advances it —
-    what is real today is the seed, the round-trip, and the ability to reserve.
+    schedule (doc 43 §3.2). It advances on every device draw: ``route_uniform_draw``
+    calls :meth:`reserve` for ``numel`` blocks before launching, so successive
+    draws differ and a fixed seed reproduces from a reset offset. Reproducibility
+    is carried by this ``(seed, offset)`` pair — ``manual_seed`` sets the seed
+    and zeroes the offset, and ``get_rng_state``/``set_rng_state`` round-trip both.
     """
 
     seed: int = _DEFAULT_SEED
