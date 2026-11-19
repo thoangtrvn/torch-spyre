@@ -1,0 +1,126 @@
+# Copyright 2025 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""ON-DEVICE T=1 RNG KAT — the 3 published Random123 2x32-20 anchors on silicon.
+
+Device-only: SKIPS unless a real ``spyre`` device is present AND ``rng_kat`` is
+registered in the box's ``sentient_codegen`` (i.e. the codegen tree is at a
+staging tip carrying the rng-kat registration). Run on the box with that
+codegen on ``PYTHONPATH``.
+
+This is the END-TO-END device proof, two ways:
+* ``test_published_anchor_bit_exact_on_device`` — builds each anchor's EXPLICIT
+  ``(counter, key)`` params (NOT a seed-derived stream), launches
+  ``launch_raw_state_draw`` on the real device, reconstructs ``x0/x1`` from the
+  raw egress, and compares to the frozen vectors. This is the device analogue of
+  the offline emulator replay and is the strong witness.
+* ``test_draw_raw_state_is_reproducible_on_device`` — the seed→stream smoke:
+  ``draw_raw_state(seed)`` twice is identical (exercises the whole wired path
+  and asserts params reach LX: a params swizzle shows as wrong/zero values).
+
+Transport caveat (why the anchor test matters): ``stream_to_sticks`` is recipe
+order; on silicon a multi-stick fp32 params tensor past the first stick may need
+device word-order, which the launcher does not model. If the anchor test fails
+with garbage/zeros past stick 0 while the emulator replay passed, that is the
+transport swizzle, not the arithmetic.
+"""
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+hr = pytest.importorskip("torch_spyre.rng")
+
+_VECTORS = json.loads(
+    (Path(__file__).parent / "data" / "rng_kat_raw_state_2x32_20.json").read_text()
+)["vectors"]
+
+
+def _runtime_available() -> bool:
+    """True only with the REAL spyre runtime, not codegen-only mode (where
+    device tensors allocate but ``launch_kernel_from_bytes`` refuses)."""
+    try:
+        from torch_spyre._runtime import codegen_only_available
+
+        return not codegen_only_available()
+    except Exception:
+        return False
+
+
+def _rng_kat_registered() -> bool:
+    try:
+        from sentient_codegen.scheduler.matmul import PATTERN_REGISTRY
+
+        return "rng_kat" in PATTERN_REGISTRY
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not (_runtime_available() and _rng_kat_registered()),
+    reason="needs a spyre device AND rng_kat registered in the box's "
+    "sentient_codegen (codegen tree at a staging tip)",
+)
+
+
+def _anchor_plan(vector: dict) -> "hr.RngLaunchPlan":
+    """Build the launch plan for one anchor's EXPLICIT (counter, key) params."""
+    c0, c1 = vector["counter"]
+    k0, k1 = vector["key"]
+    blocks = np.arange(hr.RNG_KAT_LANES, dtype=np.uint32)
+    stream = hr.build_band_lxlu_stream(
+        blocks,
+        x0_base=(c0 + k0) & 0xFFFFFFFF,
+        x1=(c1 + k1) & 0xFFFFFFFF,
+        rotations=[hr.ROTATIONS_2X32[r % 8] for r in range(hr.RNG_KAT_ROUNDS)],
+        injections=hr.injection_words_2x32((k0, k1), hr.RNG_KAT_ROUNDS),
+        rounds=hr.RNG_KAT_ROUNDS,
+        egress=hr.EgressMode.RAW_STATE,
+    )
+    params = hr.stream_to_sticks(stream)
+    return hr.RngLaunchPlan(
+        params=params,
+        egress=hr.EgressMode.RAW_STATE,
+        sticks=int(params.shape[0]),
+        lanes=int(params.shape[1]),
+        rounds=hr.RNG_KAT_ROUNDS,
+        xlat_segments={"input": 0, "output": 1},
+        declared_segment_count=2,
+        output_sticks=hr.band_egress_stick_count(
+            hr.RNG_KAT_ROUNDS, egress=hr.EgressMode.RAW_STATE
+        ),
+    )
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_published_anchor_bit_exact_on_device(index):
+    vector = _VECTORS[index]
+    out = hr.launch_raw_state_draw(_anchor_plan(vector))
+    x0, x1 = hr.reconstruct_raw_state_from_tensor(out)
+    assert [int(v) for v in x0] == [int(v) for v in vector["expected_x0"]], (
+        f"anchor {index} x0 mismatch on device"
+    )
+    assert [int(v) for v in x1] == [int(v) for v in vector["expected_x1"]], (
+        f"anchor {index} x1 mismatch on device"
+    )
+
+
+def test_draw_raw_state_is_reproducible_on_device():
+    a0, a1 = hr.draw_raw_state(12345, 0)
+    b0, b1 = hr.draw_raw_state(12345, 0)
+    assert (np.asarray(a0) == np.asarray(b0)).all()
+    assert (np.asarray(a1) == np.asarray(b1)).all()
