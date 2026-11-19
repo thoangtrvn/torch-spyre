@@ -135,6 +135,19 @@ def spyre_ones(
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
+    # Honest draw path: device RNG has no normal-distribution kernel at all (its
+    # only witnessed artifact is the T=1 raw-state Threefry KAT). With the
+    # device-RNG switch ON we REFUSE typed rather than silently offload; with it
+    # OFF (the default) this stays the documented host-CPU offload.
+    from torch_spyre.rng import SpyreRngError, device_rng_enabled
+
+    if device_rng_enabled():
+        raise SpyreRngError(
+            "device RNG has no normal-distribution path: the only witnessed "
+            "artifact is the T=1 raw-state Threefry KAT (uniform-derived). "
+            "Turn off TORCH_SPYRE_DEVICE_RNG to use the documented host-CPU "
+            "offload, or draw normals from a uniform stream on the host."
+        )
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.
     # cpu_tmp = self.to("cpu")
@@ -155,6 +168,21 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
 
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
+    # Honest draw path (see torch_spyre/rng.py). `torch.rand` lands here: it
+    # allocates via the factory fallback, then fills with uniform_.
+    #
+    # Default (switch OFF): the documented host-CPU offload — draw on CPU, copy
+    # to device. Reproducible only via the CPU stream; this is NOT device RNG.
+    #
+    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route is attempted, and it
+    # REFUSES TYPED for every current case (T>=2 unbuilt, uniform fp32 grid
+    # unwitnessed, pattern unregistered until lane B). A caller who opted into
+    # device RNG must never get a silent host substitute.
+    from torch_spyre.rng import device_rng_enabled, route_uniform_draw
+
+    if device_rng_enabled():
+        route_uniform_draw(from_, to, self.numel())  # raises SpyreRngError
+
     # Create a new tensor on cpu
     cpu_tmp = torch.empty_like(self, device="cpu", memory_format=torch.preserve_format)
 

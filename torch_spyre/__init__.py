@@ -26,7 +26,10 @@ from ._runtime import (
 )
 
 from . import profiler
-from .raw_copy import raw_copy_from_device, raw_copy_to_device
+from .raw_copy import (
+    raw_copy_from_device as raw_copy_from_device,
+    raw_copy_to_device as raw_copy_to_device,
+)
 
 _runtime_init_lock = threading.Lock()
 
@@ -306,6 +309,10 @@ class _SpyreImpl:
         self._initialized = False
         self._in_bad_fork = False
         self._pending_device_idx = None
+        # Per-device RNG generator state (seed, offset). Keyed by device index
+        # (-1 = the default generator). Set here, NOT lazily, so manual_seed /
+        # get_rng_state never force `_lazy_init` (which would start the runtime).
+        self._rng_states = {}
 
         # When spawning a supprocess from inductor, ensure that IS_INDUCTOR_SPAWNED_SUBPROCESS=1
         # This will avoid additional initialization when processes are spawned from torch inductor (This happens in Triton pathway)
@@ -383,19 +390,56 @@ class _SpyreImpl:
     def _is_in_bad_fork(self) -> bool:
         return self._in_bad_fork
 
+    def _rng_state(self, device: int | None = None):
+        """The host generator state for ``device`` (None = the default generator)."""
+        from .rng import SpyreGeneratorState
+
+        idx = -1 if device is None else int(device)
+        state = self._rng_states.get(idx)
+        if state is None:
+            state = SpyreGeneratorState()
+            self._rng_states[idx] = state
+        return state
+
     def manual_seed(self, seed: int, device: int | None = None) -> None:
-        fn = getattr(self._C, "manual_seed", None)
-        if fn:
-            fn(int(seed), -1 if device is None else int(device))
+        """Seed the Spyre generator. This is a REAL state set, not a no-op.
+
+        Sets the host ``(seed, offset=0)`` state for ``device`` and, if the
+        runtime C++ module is already loaded, forwards the seed to it as well.
+        The host state is what ``get_rng_state``/``set_rng_state`` round-trip and
+        what the device draw path (once wired) folds into its key schedule.
+        """
+        if seed is None:
+            raise TypeError("manual_seed: seed must be an int, got None")
+        seed = int(seed)
+        self._rng_state(device).manual_seed(seed)
+        # Forward only if the runtime module is ALREADY loaded — never force
+        # _lazy_init from a seed call (that would start the runtime).
+        _C = self.__dict__.get("_C")
+        if _C is not None:
+            fn = getattr(_C, "manual_seed", None)
+            if fn:
+                fn(seed, -1 if device is None else int(device))
 
     def manual_seed_all(self, seed: int) -> None:
-        _C = self._C
-        if hasattr(_C, "manual_seed_all"):
-            _C.manual_seed_all(int(seed))
-        else:
-            # Otherwise, fan out:
-            for idx in range(self.device_count()):
-                self.manual_seed(seed, device=idx)
+        """Seed every Spyre generator (default + all known devices)."""
+        if seed is None:
+            raise TypeError("manual_seed_all: seed must be an int, got None")
+        seed = int(seed)
+        self._rng_state(None).manual_seed(seed)
+        for state in self._rng_states.values():
+            state.manual_seed(seed)
+        _C = self.__dict__.get("_C")
+        if _C is not None and hasattr(_C, "manual_seed_all"):
+            _C.manual_seed_all(seed)
+
+    def get_rng_state(self, device: int | None = None):
+        """Return the Spyre generator state as a CPU ByteTensor (round-trippable)."""
+        return self._rng_state(device).get_state()
+
+    def set_rng_state(self, state, device: int | None = None) -> None:
+        """Restore a Spyre generator state produced by :meth:`get_rng_state`."""
+        self._rng_state(device).set_state(state)
 
     def is_available(self) -> bool:
         if codegen_only_available():
@@ -450,6 +494,8 @@ def make_spyre_module() -> types.ModuleType:
     mod._is_in_bad_fork = lambda: impl._is_in_bad_fork()
     mod.manual_seed = lambda s: impl.manual_seed(s)
     mod.manual_seed_all = lambda s: impl.manual_seed_all(s)
+    mod.get_rng_state = lambda device=None: impl.get_rng_state(device)
+    mod.set_rng_state = lambda state, device=None: impl.set_rng_state(state, device)
     mod.is_available = lambda: impl.is_available()
     mod.is_initialized = lambda: impl.is_initialized()
     mod.device_count = lambda: impl.device_count()
@@ -548,6 +594,7 @@ def _autoload():
     _autoload._ran = True
 
     import torch  # noqa: E402
+
     if codegen_only_available():
         from . import _codegen_backend  # noqa: F401
     else:
@@ -558,6 +605,7 @@ def _autoload():
     torch._register_device_module(DEVICE_NAME, make_spyre_module())
     if codegen_only_available():
         import torch_spyre._C  # noqa: F401
+
         _register_codegen_only_factory_kernels()
         _activate_spyre_triton_driver()
         from torch_spyre._inductor import _autoload as ts_autoload
