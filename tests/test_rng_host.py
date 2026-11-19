@@ -340,3 +340,27 @@ def test_normal_kernel_refuses_when_switch_on(monkeypatch):
     x = torch.empty(32, device="spyre")
     with pytest.raises(SpyreRngError):
         torch.ops.aten.normal_(x, 0.0, 1.0)
+
+
+def test_uniform_refuses_a_per_call_generator_on_the_device_path(monkeypatch):
+    """Device RNG has ONE per-device default generator; a per-call ``generator=``
+    is not supported yet (multi-stream unbuilt). It must refuse TYPED, not
+    silently draw from the default stream — the switch-off host path DOES honor
+    ``generator=``, so a silent ignore here would be a correctness trap.
+
+    Calls the guard helper directly (the decorated kernel name resolves to
+    ``None`` on import, and the public generator overload does not route here
+    in a codegen-only build), so the guard is asserted where it is enforced."""
+    import torch
+
+    from torch_spyre.ops.eager import _reject_per_call_generator
+    from torch_spyre.rng import SpyreRngError
+
+    monkeypatch.setenv(hr.DeviceRngSwitch.ENV, "1")
+    assert hr.device_rng_enabled() is True
+    g = torch.Generator()
+    with pytest.raises(SpyreRngError) as excinfo:
+        _reject_per_call_generator(g)
+    assert "generator" in str(excinfo.value).lower()
+    # A missing generator is allowed (no-op).
+    assert _reject_per_call_generator(None) is None

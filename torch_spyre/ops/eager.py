@@ -166,6 +166,24 @@ def spyre__zero_(self: torch.Tensor) -> torch.Tensor:
     return self
 
 
+def _reject_per_call_generator(generator) -> None:
+    """Device RNG has ONE per-device default generator; a per-call ``generator=``
+    is not supported yet (multi-stream unbuilt). Refuse TYPED rather than
+    silently draw from the wrong stream. The switch-off host path DOES honor
+    ``generator=``, so a silent ignore on the device path would be a
+    correctness trap. Module-level so it is unit-testable (the decorated
+    ``spyre__uniform_`` name resolves to ``None`` on import)."""
+    if generator is not None:
+        from torch_spyre.rng import SpyreRngError
+
+        raise SpyreRngError(
+            "device RNG does not support a per-call generator= yet (the device "
+            "path uses the single per-device default generator). Pass "
+            "generator=None, or turn off TORCH_SPYRE_DEVICE_RNG for the "
+            "host-CPU offload, which honors generator=."
+        )
+
+
 @torch.library.register_kernel("aten::uniform_", "spyre")  # type:ignore
 def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Honest draw path (see torch_spyre/rng.py). `torch.rand` lands here: it
@@ -182,6 +200,7 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     from torch_spyre.rng import device_rng_enabled, route_uniform_draw
 
     if device_rng_enabled():
+        _reject_per_call_generator(generator)
         values = route_uniform_draw(from_, to, self.numel())  # raises typed
         host = torch.from_numpy(values).to(dtype=self.dtype)
         self.copy_(host.reshape(self.shape))
