@@ -34,6 +34,17 @@ order; on silicon a multi-stick fp32 params tensor past the first stick may need
 device word-order, which the launcher does not model. If the anchor test fails
 with garbage/zeros past stick 0 while the emulator replay passed, that is the
 transport swizzle, not the arithmetic.
+
+Relationship to the codegen KAT (the two roles are DISTINCT):
+  * The CANONICAL device *kernel* witness is the codegen slice-6 raw-state KAT
+    in spyre-knowledgebase (receipt silicon-71dcf6e2ef41; binary e697b657; the
+    3 published anchors bit-exact). THAT is what proves the SFP kernel.
+  * THIS file is the torch-spyre *framework-integration* regression: it drives
+    torch_spyre's own launch path (RngLaunchPlan ABI -> launch_raw_state_draw ->
+    _C.launch_kernel_from_bytes -> egress reconstruct) and checks it reproduces
+    the same bits. It lives in torch-spyre because the framework depends on the
+    backend, never the reverse — a test that imports torch_spyre cannot live in
+    the codegen repo without inverting that dependency.
 """
 
 import json
