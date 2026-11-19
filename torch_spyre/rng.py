@@ -909,23 +909,40 @@ def route_uniform_draw(from_: float, to: float, numel: int) -> None:
 _RAW_KAT_CACHE: "tuple[bytes, object] | None" = None
 
 
-def _stick_bytes() -> int:
+#: Targets with a silicon-witnessed device RNG kernel. RNG is 1p0-only today
+#: (the witnessed binary e697b657 is a rcudd1a emission); 1p5 has no RNG
+#: contract. A non-witnessed target REFUSES rather than emit a wrong-generation
+#: binary, and the compile target + stick geometry come from the SAME generation.
+_RNG_WITNESSED_TARGETS = frozenset({"rcudd1a"})
+
+
+def _stick_bytes(target: str) -> int:
     """One stick = 32 lanes x 4 bytes = 128 on rcudd1a (gen-owned, not typed)."""
-    from sentient_codegen.gen.registry import get_default_target, get_generation
+    from sentient_codegen.gen.registry import get_generation
 
-    return int(get_generation(get_default_target()).hw.stick_bytes)
+    return int(get_generation(target).hw.stick_bytes)
 
 
-def build_rng_kat_binary() -> "tuple[bytes, object]":
+def build_rng_kat_binary(target: "str | None" = None) -> "tuple[bytes, object]":
     """Compile (once) the registered ``rng_kat`` T=1 raw-state binary + plan.
 
-    Returns ``(binary, xlat_plan)``. The binary is the silicon-witnessed
-    ``e697b657…`` (4352 B); the XLAT plan is derived from the SAME scheduled
-    program, so the plan describes exactly the bytes that are launched (the
-    T-LR-2B artifact-pairing rule). Raises ``SpyreRngError`` if the backend has
-    not registered ``rng_kat`` (lane B not landed).
+    The target is resolved from the generation registry (``get_default_target()``)
+    unless passed explicitly, and threaded through the compile so the target and
+    the stick geometry share one generation. Returns ``(binary, xlat_plan)``; for
+    a rcudd1a target the binary is the silicon-witnessed ``e697b657…`` (4352 B).
+    The XLAT plan is derived from the SAME scheduled program (T-LR-2B). Raises
+    ``SpyreRngError`` on a target with no witnessed RNG kernel (RNG is 1p0-only),
+    or if the backend has not registered ``rng_kat`` (lane B not landed).
     """
     global _RAW_KAT_CACHE
+    from sentient_codegen.gen.registry import get_default_target
+
+    tgt = get_default_target() if target is None else target
+    if tgt not in _RNG_WITNESSED_TARGETS:
+        raise SpyreRngError(
+            f"device RNG has no witnessed kernel for target {tgt!r}; it is 1p0 "
+            f"({sorted(_RNG_WITNESSED_TARGETS)})-only (1p5 RNG is unbuilt)"
+        )
     if _RAW_KAT_CACHE is not None:
         return _RAW_KAT_CACHE
     if not rng_pattern_registered():
@@ -954,15 +971,15 @@ def build_rng_kat_binary() -> "tuple[bytes, object]":
         num_cores=1,
         element_bits=32,
     )
-    pattern = resolve_pattern("rng_kat", tiling=tiling, target="rcudd1a")
-    scheduled = finalize_pattern_program(pattern, tiling, "rcudd1a")
-    binary = compile_scheduled_program(scheduled, target="rcudd1a")
-    sb = _stick_bytes()
+    pattern = resolve_pattern("rng_kat", tiling=tiling, target=tgt)
+    scheduled = finalize_pattern_program(pattern, tiling, tgt)
+    binary = compile_scheduled_program(scheduled, target=tgt)
+    sb = _stick_bytes(tgt)
     params_bytes = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.RAW_STATE) * sb
     out_bytes = out_sticks * sb
     xlat_plan = build_xlat_relocation_plan(
         scheduled,
-        target="rcudd1a",
+        target=tgt,
         binary=binary,
         num_cores=1,
         symbol_extents={0: params_bytes, 1: out_bytes},
