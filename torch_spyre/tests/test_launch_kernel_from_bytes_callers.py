@@ -37,6 +37,7 @@ with the offending ``file:line``. That is the bypass-route signal; do not
 resolve it by adding the new caller to the table without deciding whether it
 must instead route through plan validation.
 """
+
 from __future__ import annotations
 
 import ast
@@ -85,9 +86,11 @@ def _enumerate_cxx_launch_call_sites():
             with open(path, "r", encoding="utf-8") as handle:
                 tree = ast.parse(handle.read(), filename=path)
             for node in ast.walk(tree):
-                if isinstance(node, ast.Call) and isinstance(
-                    node.func, ast.Name
-                ) and node.func.id == _LAUNCH_FUNCTION_NAME:
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == _LAUNCH_FUNCTION_NAME
+                ):
                     sites.append((path, node.lineno))
     return sites
 
@@ -96,6 +99,14 @@ def _enumerate_cxx_launch_call_sites():
 # the classification and its justification, so a reader can audit each entry
 # against the deferral record that grants it.
 _SANCTIONED_CALLERS = {
+    "rng.py": (
+        "plan-validating caller — the T=1 raw-state KAT launch derives an "
+        "XLAT relocation plan beside the binary (build_xlat_relocation_plan on "
+        "the SAME scheduled program) and gates the [params, out] binding with "
+        "validate_positional_launch before the C++ call (T-LR-2B); the frozen "
+        "2-segment ABI (segment 0 = params, segment 1 = raw output) is the "
+        "rng_kat contract"
+    ),
     "ops/softmax.py": (
         "plan-validating caller — the tensor list is derived from the "
         "named tensors_by_symbol mapping and gated by "

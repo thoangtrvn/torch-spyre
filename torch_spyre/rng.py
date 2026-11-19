@@ -74,13 +74,17 @@ __all__ = [
     "StreamSlot",
     "StreamWord",
     "build_band_lxlu_stream",
+    "build_rng_kat_binary",
     "build_rng_launch_plan",
     "device_rng_enabled",
     "draw_params_stream",
+    "draw_raw_state",
     "epoch_key_2x32",
     "fold_key_schedule_2x32",
     "injection_words_2x32",
     "key_schedule_2x32",
+    "launch_raw_state_draw",
+    "reconstruct_raw_state_from_tensor",
     "replay_band_stream_raw",
     "rng_pattern_registered",
     "seed_to_key",
@@ -878,3 +882,180 @@ def route_uniform_draw(from_: float, to: float, numel: int) -> None:
         "(P5 owed): only the raw-state KAT egress is witnessed. A user-facing "
         "uniform draw is not yet connectable."
     )
+
+
+# ---------------------------------------------------------------------------
+# Device launch (the integration step): compile + launch the registered
+# rng_kat T=1 raw-state kernel, then reconstruct the full 32-bit state.
+# ---------------------------------------------------------------------------
+#
+# This is the seam that connects the host half above to the backend half (lane
+# B). It mirrors ``torch_spyre/ops/softmax.py``'s plan-validating launch: the
+# binary is compiled from the registered ``rng_kat`` pattern, an XLAT
+# relocation plan is derived from the SAME scheduled program, the positional
+# bindings are validated against it, and only then is the C++ launch issued.
+# The 2-segment ABI is the frozen contract's: segment 0 = params, segment 1 =
+# raw-state output.
+#
+# HONESTY: ``launch_raw_state_draw`` needs a real ``spyre`` device and the flex
+# runtime (``torch_spyre._C``); it is NOT exercised on a host. The offline proof
+# that the two halves agree is the emulator full-transport replay in
+# ``tests/test_rng_kat_integration.py`` (lane A's params through lane B's
+# kernel -> the three published anchors bit-exact), plus the connected-compile
+# byte match against the silicon-witnessed ``e697b657…``.
+
+#: Cached ``(binary, xlat_plan)`` for the fixed T=1 raw-state KAT. The kernel is
+#: shape-invariant (one fixed silicon-witnessed cell), so it is compiled once.
+_RAW_KAT_CACHE: "tuple[bytes, object] | None" = None
+
+
+def _stick_bytes() -> int:
+    """One stick = 32 lanes x 4 bytes = 128 on rcudd1a (gen-owned, not typed)."""
+    from sentient_codegen.gen.registry import get_default_target, get_generation
+
+    return int(get_generation(get_default_target()).hw.stick_bytes)
+
+
+def build_rng_kat_binary() -> "tuple[bytes, object]":
+    """Compile (once) the registered ``rng_kat`` T=1 raw-state binary + plan.
+
+    Returns ``(binary, xlat_plan)``. The binary is the silicon-witnessed
+    ``e697b657…`` (4352 B); the XLAT plan is derived from the SAME scheduled
+    program, so the plan describes exactly the bytes that are launched (the
+    T-LR-2B artifact-pairing rule). Raises ``SpyreRngError`` if the backend has
+    not registered ``rng_kat`` (lane B not landed).
+    """
+    global _RAW_KAT_CACHE
+    if _RAW_KAT_CACHE is not None:
+        return _RAW_KAT_CACHE
+    if not rng_pattern_registered():
+        raise SpyreRngError(
+            "device RNG is not wired: backend pattern 'rng_kat' is not registered"
+        )
+    from sentient_codegen.backend.launch_abi import build_xlat_relocation_plan
+    from sentient_codegen.backend.ttir_to_schedule import compile_scheduled_program
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+    from sentient_codegen.scheduler.engine import (
+        TilingConfig,
+        finalize_pattern_program,
+        resolve_pattern,
+    )
+
+    out_sticks = _rm.band_egress_stick_count(
+        RNG_KAT_ROUNDS, egress=_rm.EgressMode.RAW_STATE
+    )
+    tiling = TilingConfig(
+        M=out_sticks,
+        K=1,
+        N=RNG_KAT_LANES,
+        tile_m=out_sticks,
+        tile_k=1,
+        tile_n=RNG_KAT_LANES,
+        num_cores=1,
+        element_bits=32,
+    )
+    pattern = resolve_pattern("rng_kat", tiling=tiling, target="rcudd1a")
+    scheduled = finalize_pattern_program(pattern, tiling, "rcudd1a")
+    binary = compile_scheduled_program(scheduled, target="rcudd1a")
+    sb = _stick_bytes()
+    params_bytes = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.RAW_STATE) * sb
+    out_bytes = out_sticks * sb
+    xlat_plan = build_xlat_relocation_plan(
+        scheduled,
+        target="rcudd1a",
+        binary=binary,
+        num_cores=1,
+        symbol_extents={0: params_bytes, 1: out_bytes},
+    )
+    _RAW_KAT_CACHE = (binary, xlat_plan)
+    return _RAW_KAT_CACHE
+
+
+def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None):
+    """Launch the registered T=1 raw-state KAT for ``plan``; return its output.
+
+    Requires a real ``spyre`` device and the flex runtime. Returns the 4-stick
+    raw egress tensor, shape ``(4, 32)``; feed it to
+    :func:`reconstruct_raw_state_from_tensor` to recover ``(x0, x1)``. The
+    positional binding is ``[params, out]`` — exactly the frozen 2-segment ABI
+    (segment 0 = params, segment 1 = raw-state output). The launch is gated by
+    ``validate_positional_launch`` against the plan derived beside the binary, so
+    a permuted or truncated binding refuses before the C++ call (T-LR-2B).
+    """
+    import torch
+
+    from torch_spyre._C import launch_kernel_from_bytes
+
+    if plan.egress is not EgressMode.RAW_STATE:
+        raise SpyreRngError(
+            "launch_raw_state_draw only launches the raw-state KAT egress; got "
+            f"{plan.egress!r}"
+        )
+    binary, xlat_plan = build_rng_kat_binary()
+    dev = torch.device("spyre") if device is None else device
+    # Recipe order (the launcher's device-word-order / swizzle concern, not the
+    # builder's). int32 holds the same 32-bit words, byte for byte.
+    params = torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(dev)
+    out = torch.zeros((plan.output_sticks, plan.lanes), dtype=torch.int32, device=dev)
+    tensors_by_symbol = {
+        xlat_plan.symbols[0].symbol_id: params,
+        xlat_plan.symbols[1].symbol_id: out,
+    }
+    specs = {
+        sym.symbol_id: (
+            int(
+                tensors_by_symbol[sym.symbol_id].element_size()
+                * tensors_by_symbol[sym.symbol_id].nelement()
+            ),
+            "input" if sym.access_mode == "read" else "output",
+        )
+        for sym in xlat_plan.symbols
+    }
+    from sentient_codegen.backend.launch_abi import validate_positional_launch
+
+    validate_positional_launch(xlat_plan, binary, specs)
+    launch_kernel_from_bytes(
+        binary, [tensors_by_symbol[s.symbol_id] for s in xlat_plan.symbols]
+    )
+    return out
+
+
+def reconstruct_raw_state_from_tensor(out) -> "tuple[np.ndarray, np.ndarray]":
+    """Recover full 32-bit ``(x0, x1)`` from the 4-stick raw egress tensor.
+
+    The frozen reconstruction: each egress word MUST be a canonical band word
+    ``0x4B000000 | half`` (``half < 2^16``); then ``half = word & 0xFFFF``,
+    ``x0 = (x0h<<16)|x0l``, ``x1 = (x1h<<16)|x1l``. A non-canonical word
+    refuses rather than silently returning a truncated state.
+    """
+    words = np.asarray(out.detach().to("cpu").numpy(), dtype=np.uint32)
+    if words.ndim != 2 or words.shape[0] != 4:
+        raise SpyreRngError(
+            "raw-state egress must be 4 sticks (x0h, x0l, x1h, x1l); got shape "
+            f"{words.shape}"
+        )
+    halves = []
+    for i, row in enumerate(words):
+        if ((row & np.uint32(0xFF000000)) != np.uint32(0x4B000000)).any():
+            raise SpyreRngError(
+                f"raw egress stick {i} is not a canonical band word "
+                f"(0x4B000000|half); the device did not write raw state"
+            )
+        halves.append((row & np.uint32(0xFFFF)).astype(np.uint64))
+    x0h, x0l, x1h, x1l = halves
+    return (
+        ((x0h << np.uint64(16)) | x0l).astype(np.uint32),
+        ((x1h << np.uint64(16)) | x1l).astype(np.uint32),
+    )
+
+
+def draw_raw_state(seed: int, offset: int = 0, *, device=None):
+    """Connected T=1 draw: build the plan, launch it, return ``(x0, x1)``.
+
+    This is the whole wired path for the one witnessed cell. It needs a real
+    device; the host-side derivation and the device kernel are proven to agree
+    offline (``tests/test_rng_kat_integration.py``). T>=2 / the uniform fp32
+    grid still refuse typed (DV-34 / P5 unbuilt) inside ``build_rng_launch_plan``.
+    """
+    plan = build_rng_launch_plan(seed=seed, offset=offset, egress=EgressMode.RAW_STATE)
+    return reconstruct_raw_state_from_tensor(launch_raw_state_draw(plan, device=device))
