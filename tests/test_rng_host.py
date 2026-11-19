@@ -21,7 +21,9 @@ Covers the three obligations of the host half:
     2x32-20 anchors, reconstructing x0/x1 bit-exact against the frozen vectors
     (and, when the backend is importable, is byte-identical to the reference
     builder it ports);
-(c) the route scaffold refuses TYPED before the backend registers ``rng_kat``.
+(c) the route refuses TYPED for T>=2 / pre-registration; within one T=1 tile it
+    is a device fill (Path A) whose device-gated tests live in
+    ``test_rng_uniform_device.py``.
 
 The oracle JSON in ``tests/data/`` is a read-only copy of the frozen KAT vectors
 from ``spyre-knowledgebase`` (provenance in the file's ``_vendored_from`` field);
@@ -263,7 +265,8 @@ def test_manual_seed_all_sets_state():
 
 
 # ---------------------------------------------------------------------------
-# (c) The route scaffold refuses TYPED pre-registration (and T>=2 / uniform).
+# (c) The route refuses TYPED pre-registration and T>=2; within one T=1 tile it
+#     is a device fill (Path A), not a refusal.
 # ---------------------------------------------------------------------------
 
 
@@ -295,22 +298,37 @@ def test_launch_plan_refuses_the_unwitnessed_uniform_grid():
     assert "uniform" in str(excinfo.value).lower()
 
 
-def test_route_uniform_draw_refuses_when_switch_on(monkeypatch):
-    from torch_spyre.rng import SpyreRngError
+def test_route_uniform_draw_refuses_only_beyond_one_tile(monkeypatch):
+    """Path A contract: only T>=2 (numel > 64) is a typed refusal.
+
+    Within one T=1 tile (numel <= ``_RNG_MAX_UNIFORM_ELEMS``) the route is a
+    FILL, not a refusal: it succeeds on a live device, or raises the
+    registration / runtime-unavailable seam — never the T>=2 refusal.
+    """
+    from torch_spyre.rng import SpyreRngError, _RNG_MAX_UNIFORM_ELEMS
 
     monkeypatch.setenv(hr.DeviceRngSwitch.ENV, "1")
     assert hr.device_rng_enabled() is True
-    # T>=2 first.
-    with pytest.raises(SpyreRngError):
-        hr.route_uniform_draw(0.0, 1.0, 64)
-    # The uniform grid route refuses for a single T=1 tile too (pre-registration
-    # or the unwitnessed uniform grid).
-    with pytest.raises(SpyreRngError):
-        hr.route_uniform_draw(0.0, 1.0, 32)
+    # More than one T=1 tile is T>=2: typed refusal.
+    with pytest.raises(SpyreRngError) as excinfo:
+        hr.route_uniform_draw(0.0, 1.0, _RNG_MAX_UNIFORM_ELEMS + 1)
+    assert "T>=2" in str(excinfo.value) or "T-DV-34" in str(excinfo.value)
+    # One full tile is NOT a T>=2 refusal (fill / registration / runtime seam).
+    try:
+        out = hr.route_uniform_draw(0.0, 1.0, _RNG_MAX_UNIFORM_ELEMS)
+    except Exception as exc:  # noqa: BLE001 — either pre-device seam is acceptable
+        msg = str(exc)
+        assert "T>=2" not in msg and "T-DV-34" not in msg
+    else:
+        assert out.shape == (_RNG_MAX_UNIFORM_ELEMS,)
 
 
-def test_uniform_and_normal_kernels_refuse_when_switch_on(monkeypatch):
-    """The device-RNG switch turns the honest offload into a typed refusal."""
+def test_normal_kernel_refuses_when_switch_on(monkeypatch):
+    """normal_ still refuses with the switch on (P1 Box-Muller unwitnessed).
+
+    (uniform_ was split out: after Path A it fills from device bits up to one
+    T=1 tile; its device-gated fill tests live in test_rng_uniform_device.py.)
+    """
     import torch
 
     spyre = _spyre_module_or_skip()
@@ -321,4 +339,4 @@ def test_uniform_and_normal_kernels_refuse_when_switch_on(monkeypatch):
     monkeypatch.setenv(hr.DeviceRngSwitch.ENV, "1")
     x = torch.empty(32, device="spyre")
     with pytest.raises(SpyreRngError):
-        torch.ops.aten.uniform_(x, 0.0, 1.0)
+        torch.ops.aten.normal_(x, 0.0, 1.0)
