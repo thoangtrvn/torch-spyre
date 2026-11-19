@@ -13,11 +13,12 @@
 # limitations under the License.
 """Residency + partition manager (Option 1 shared construction).
 
-All OFFLINE: no device, and NO dependence on the parallel codegen lane's
-``patch_offset_words``. The patch path is exercised with a REAL local patch
+All OFFLINE: no device. The patch path is exercised with a REAL local patch
 function that recomputes only the three offset-dependent sticks
 (COUNTER, X0_BASE_LO, X0_BASE_HI), and its output is checked BYTE-IDENTICAL to
-a full ``build_band_lxlu_stream`` rebuild from codegen.
+a full ``build_band_lxlu_stream`` rebuild from codegen. The DEVICE half is
+exercised with a fake device bridge that COUNTS every host->device row, so the
+data-movement claim (251 rows -> 3 rows) is measured, not asserted in prose.
 
 What is pinned here:
 
@@ -26,6 +27,13 @@ What is pinned here:
   epoch rollover does a FULL rebuild, never a bare patch;
 * ``ensure_params`` over a ``(seed, offset)`` sweep is byte-identical to a full
   codegen rebuild;
+* DEVICE residency — the full 251-stick (32 KB) params upload happens ONCE; a
+  same-seed offset advance writes EXACTLY the 3 offset-dependent rows (384 B),
+  and the resident device buffer is byte-identical to a fresh full build at the
+  final ``(seed, offset)`` including across an epoch rollover;
+* the default patch owner resolves to the codegen ``patch_offset_words`` and is
+  the one used on an offset advance; the no-owner fallback is a full (correct)
+  rebuild, visibly marked — never silent;
 * the partition allocator hands out pairwise-disjoint, epoch-rounded counter
   ranges that never cross 2^30 and never contain a block index >= 2^23;
 * determinism — the same ``(seed, offset)`` yields identical params and
@@ -99,6 +107,60 @@ def _real_patch_fn(stream, *, blocks, x0_base):
     out[5] = hr.StreamWord(stream[5].slot, splat(lo))
     out[6] = hr.StreamWord(stream[6].slot, splat(hi - 128))
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# Fake device bridge — COUNTS every host->device row (the accounting gate).
+# ---------------------------------------------------------------------------
+
+_WORDS_PER_STICK = _LANES  # 32 lanes per stick, one uint32 word each
+_BYTES_PER_WORD = 4
+_FULL_STICKS = 251  # RAW_STATE params stream size
+_OFFSET_ROWS = (4, 5, 6)  # COUNTER, X0_BASE_LO, X0_BASE_HI
+
+
+class _FakeDeviceTensor:
+    """A device-tensor stand-in: a mirrored word buffer plus its shape."""
+
+    def __init__(self, words: np.ndarray):
+        self.words = np.array(words, dtype=np.uint32, copy=True)
+
+    @property
+    def shape(self) -> tuple:
+        return tuple(self.words.shape)
+
+    @property
+    def device(self):
+        return "fake-device"
+
+
+class _FakeDeviceBridge:
+    """Device bridge that models the transport and counts the bytes moved."""
+
+    def __init__(self):
+        self.upload_rows = 0
+        self.written_rows = 0
+        self.uploads: list[int] = []  # row count of each full upload
+        self.writes: list[tuple] = []  # row indices of each partial write
+
+    def upload(self, host_words, device):
+        arr = np.array(host_words, dtype=np.uint32, copy=True)
+        self.upload_rows += int(arr.shape[0])
+        self.uploads.append(int(arr.shape[0]))
+        return _FakeDeviceTensor(arr)
+
+    def write_rows(self, resident, row_indices, host_rows):
+        rows = tuple(int(r) for r in row_indices)
+        resident.words[list(rows)] = np.asarray(host_rows, dtype=np.uint32)
+        self.written_rows += len(rows)
+        self.writes.append(rows)
+
+    def to_host(self, resident):
+        return np.array(resident.words, dtype=np.uint32, copy=True)
+
+    @staticmethod
+    def rows_to_bytes(rows: int) -> int:
+        return int(rows) * _WORDS_PER_STICK * _BYTES_PER_WORD
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +341,168 @@ def test_allocator_refuses_a_scan_above_the_exactness_bound():
     res = hr.SpyreRngResources()
     with pytest.raises(hr.SpyreRngError):
         res.reserve(_EXACT + 1)
+
+
+# ---------------------------------------------------------------------------
+# DEVICE residency — the headline: 251-row upload ONCE, 3-row writes after.
+# ---------------------------------------------------------------------------
+
+
+def test_offset_dependent_rows_come_from_codegen():
+    """The rows written are the codegen owner's, not a hardcoded triple."""
+    res = hr.SpyreRngResources()
+    rows = res.offset_dependent_rows()
+    assert rows == _OFFSET_ROWS, (
+        "offset_dependent_indices must drive the written rows "
+        f"(expected {_OFFSET_ROWS}, got {rows})"
+    )
+    # Same rows the codegen owner reports for the default (RAW_STATE) egress.
+    assert rows == tuple(
+        rm.offset_dependent_indices(rounds=_ROUNDS, egress=rm.EgressMode.RAW_STATE)
+    )
+
+
+def test_offset_advance_writes_only_three_rows_device_side():
+    """THE data-movement gate: per offset advance, 3 rows (384 B) not 251."""
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    seed = 0xC0FFEE
+
+    res.ensure_device_params(_spec(seed, 0), 0)
+    assert bridge.uploads == [_FULL_STICKS], "first draw uploads the full params"
+    assert bridge.written_rows == 0
+    assert res.last_device_update(0) == "upload"
+
+    offsets = [1, 32, 33, 64, 200, 4096]
+    for offset in offsets:
+        res.ensure_device_params(_spec(seed, offset), 0)
+        assert res.last_device_update(0) == "patch"
+
+    # Every advance wrote EXACTLY the 3 offset-dependent rows.
+    assert bridge.writes == [_OFFSET_ROWS] * len(offsets)
+    assert bridge.written_rows == 3 * len(offsets)
+    # The full params tensor was NEVER re-uploaded after the first build.
+    assert bridge.uploads == [_FULL_STICKS]
+
+    before_bytes = _FakeDeviceBridge.rows_to_bytes(_FULL_STICKS)
+    after_bytes = _FakeDeviceBridge.rows_to_bytes(3)
+    print(
+        f"\n[upload accounting] before: {_FULL_STICKS} rows = {before_bytes} B "
+        f"per draw -> after: 3 rows = {after_bytes} B per offset advance "
+        f"({before_bytes // after_bytes}x fewer bytes)"
+    )
+    assert before_bytes == 32128 and after_bytes == 384
+    # Per-advance host->device write is exactly 384 B, not 32 KB.
+    for offset in offsets:
+        res.ensure_device_params(_spec(seed, offset + 1), 0)
+    assert bridge.written_rows == 3 * len(offsets) + 3 * len(offsets)
+
+
+def test_resident_device_buffer_byte_identical_across_sweep_with_epoch_rollover():
+    """The device mirror equals a fresh full build at every (seed, offset)."""
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    seed = 0xABCDEF
+    sweep = [
+        0,
+        1,
+        32,
+        64,
+        1000,
+        _EPOCH - 64,  # epoch 0 tail
+        _EPOCH,  # epoch rollover -> FULL upload
+        _EPOCH + 1,  # patch in the new epoch
+        _EPOCH + 64,
+    ]
+    for offset in sweep:
+        tensor = res.ensure_device_params(_spec(seed, offset), 0)
+        got = np.asarray(bridge.to_host(tensor))
+        want = _reference_params(seed, offset)
+        assert got.shape == want.shape == (_FULL_STICKS, _LANES)
+        np.testing.assert_array_equal(got, want, err_msg=f"offset={offset}")
+        # The 3 offset-dependent rows equal the corresponding reference rows.
+        rows = res.offset_dependent_rows()
+        np.testing.assert_array_equal(got[list(rows)], want[list(rows)])
+    # First build + epoch rollover => exactly two full uploads; every other
+    # advance in the same epoch was a 3-row write.
+    assert bridge.uploads == [_FULL_STICKS, _FULL_STICKS]
+    assert bridge.writes == [_OFFSET_ROWS] * (len(sweep) - 2)
+
+
+def test_seed_change_reuploads_the_device_buffer():
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    res.ensure_device_params(_spec(11, 0), 0)  # first upload
+    res.ensure_device_params(_spec(11, 64), 0)  # patch
+    res.ensure_device_params(_spec(99, 64), 0)  # seed change -> full upload
+    assert bridge.uploads == [_FULL_STICKS, _FULL_STICKS]
+    assert res.last_device_update(0) == "upload"
+    got = np.asarray(bridge.to_host(res.ensure_device_params(_spec(99, 64), 0)))
+    np.testing.assert_array_equal(got, _reference_params(99, 64))
+
+
+def test_repeated_device_spec_does_not_write():
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    t1 = res.ensure_device_params(_spec(42, 128), 0)
+    moved = bridge.upload_rows + bridge.written_rows
+    t2 = res.ensure_device_params(_spec(42, 128), 0)
+    assert t1 is t2
+    assert res.last_device_update(0) == "cached"
+    assert bridge.upload_rows + bridge.written_rows == moved, (
+        "a repeated spec must not touch device memory"
+    )
+
+
+def test_device_residents_per_device_are_independent():
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    a = res.ensure_device_params(_spec(9, 0), 0)
+    b = res.ensure_device_params(_spec(9, 0), 1)
+    assert a is not b
+    assert bridge.uploads == [_FULL_STICKS, _FULL_STICKS]
+
+
+# ---------------------------------------------------------------------------
+# Real-patch integration — the codegen owner is the default and is used.
+# ---------------------------------------------------------------------------
+
+
+def test_default_patch_resolves_to_the_codegen_owner(monkeypatch):
+    calls = []
+    real = rm.patch_offset_words
+
+    def spy(stream, *, blocks, x0_base):
+        calls.append(1)
+        return real(stream, blocks=blocks, x0_base=x0_base)
+
+    monkeypatch.setattr(rm, "patch_offset_words", spy)
+
+    res = hr.SpyreRngResources()
+    res.ensure_params(_spec(1, 0), 0)
+    res.ensure_params(_spec(1, 64), 0)  # offset advance
+    assert len(calls) == 1, "the codegen patch owner must be used on an advance"
+    assert res.patch_source(0) == "codegen"
+    # And it is byte-identical to the codegen rebuild.
+    np.testing.assert_array_equal(
+        res.ensure_params(_spec(1, 64), 0), _reference_params(1, 64)
+    )
+
+
+def test_without_patch_owner_device_advance_uploads_and_is_marked(monkeypatch):
+    """No codegen owner -> full (correct) upload, visibly marked, never silent."""
+    monkeypatch.setattr(hr, "_load_codegen_patch_fn", lambda: None)
+    monkeypatch.setattr(hr, "_load_codegen_offset_indices", lambda: None)
+
+    bridge = _FakeDeviceBridge()
+    res = hr.SpyreRngResources(device_bridge=bridge)
+    res.ensure_device_params(_spec(5, 0), 0)
+    tensor = res.ensure_device_params(_spec(5, 64), 0)
+
+    assert res.patch_source(0) is None, "no codegen patch -> no patch-source claim"
+    assert res.last_device_update(0) == "upload", "fallback must be a full upload"
+    assert bridge.writes == [], "no partial write when the owner is absent"
+    assert bridge.uploads == [_FULL_STICKS, _FULL_STICKS]
+    np.testing.assert_array_equal(
+        np.asarray(bridge.to_host(tensor)), _reference_params(5, 64)
+    )

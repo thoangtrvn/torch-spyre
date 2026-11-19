@@ -66,7 +66,7 @@ import os
 import struct
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -411,6 +411,26 @@ def _from_codegen_stream(stream: Sequence) -> tuple[StreamWord, ...]:
     )
 
 
+def _to_codegen_stream(stream: Sequence) -> tuple:
+    """Adapt local ``StreamWord`` pops back into codegen ``StreamWord`` pops.
+
+    The codegen patch owner (``patch_offset_words``/``offset_dependent_indices``)
+    matches slots against the CODEGEN ``StreamSlot`` enum, so its input must be
+    codegen ``StreamWord`` objects — a local slot (a different enum with equal
+    values) compares unequal and would make the owner refuse an empty
+    offset-dependent set. Slots are mapped by value; the words array carries
+    through unchanged.
+    """
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+
+    return tuple(
+        _rm.StreamWord(
+            _rm.StreamSlot(w.slot.value), np.asarray(w.words, dtype=np.uint32)
+        )
+        for w in stream
+    )
+
+
 def build_band_lxlu_stream(
     blocks: np.ndarray,
     *,
@@ -667,12 +687,22 @@ class SpyreGeneratorState:
 # change (``manual_seed``/``set_rng_state``) or an epoch rollover re-keys the
 # schedule and so forces a FULL rebuild.
 #
+# The DEVICE half (``ensure_device_params``) keeps a resident device tensor per
+# device: first build uploads the full 251-stick (32 KB) params ONCE, an offset
+# advance writes only the three offset-dependent rows (384 B) in place, and a
+# seed change / epoch rollover re-uploads. That is the actual data-movement win
+# (251 -> 3 rows); throughput is still launch/sync-bound and must be measured
+# on the box, not inferred.
+#
 # The codegen owner of the patch recipe
-# (``threefry_recipe_model.patch_offset_words``) is landed by a PARALLEL lane,
-# so ``patch_fn`` is INJECTED. The class is unit-testable with a local patch
-# function and no device. When the codegen patch is not importable, an offset
-# advance falls back to a full rebuild: byte-identical (correct), merely
-# unoptimized. That is a performance fallback, never a correctness one.
+# (``threefry_recipe_model.patch_offset_words``) and of the row indices
+# (``threefry_recipe_model.offset_dependent_indices``) is landed by a PARALLEL
+# lane, so both are INJECTED/resolved lazily. The class is unit-testable with a
+# local patch function, a fake device bridge, and no device. When the codegen
+# patch is not importable, an offset advance falls back to a full rebuild /
+# full upload: byte-identical (correct), merely unoptimized, and MARKED via
+# ``patch_source()``/``last_device_update()`` — never a silent fallback. That is
+# a performance fallback, never a correctness one.
 
 #: Blocks are rfp32-exact only below 2^23 (``build_band_lxlu_stream`` guard).
 _EXACT_BLOCK_LIMIT = 1 << 23
@@ -777,10 +807,78 @@ def _load_codegen_patch_fn():
     return getattr(_rm, "patch_offset_words", None)
 
 
-class _DeviceResident:
-    """Host bookkeeping for one device's resident params buffer."""
+def _load_codegen_offset_indices():
+    """The codegen offset-dependent-index owner, or ``None`` if unavailable."""
+    try:
+        from sentient_codegen.emulator import threefry_recipe_model as _rm
+    except Exception:
+        return None
+    return getattr(_rm, "offset_dependent_indices", None)
 
-    __slots__ = ("seed", "epoch", "base_counter", "stream", "params")
+
+class _TorchDeviceBridge:
+    """The default device bridge: real ``torch`` tensors on the target device.
+
+    The bridge is the ONLY place the host touches device memory, so it is both
+    the real transport and the seam an offline test injects to COUNT bytes. Its
+    three methods define the residency protocol:
+
+    * ``upload(host_words, device) -> resident`` — allocate a resident tensor and
+      copy the WHOLE ``(sticks, lanes)`` params array (the first-draw / rebuild
+      cost: 251 sticks for RAW_STATE).
+    * ``write_rows(resident, row_indices, host_rows)`` — write ONLY the named
+      rows in place (the offset-advance cost: 3 sticks = 384 B).
+    * ``to_host(resident) -> np.ndarray`` — mirror the device buffer back for
+      verification.
+
+    ``host_words``/``host_rows`` are ``uint32`` numpy arrays in recipe order;
+    ``int32`` holds the same 32-bit words byte for byte.
+    """
+
+    def upload(self, host_words, device):
+        import torch
+
+        dev = torch.device("spyre") if device is None else device
+        src = np.ascontiguousarray(host_words.view(np.int32))
+        return torch.from_numpy(src).to(dev)
+
+    def write_rows(self, resident, row_indices, host_rows):
+        import torch
+
+        rows = tuple(int(r) for r in row_indices)
+        idx = torch.as_tensor(rows, dtype=torch.long, device=resident.device)
+        src = np.ascontiguousarray(host_rows.view(np.int32))
+        values = torch.from_numpy(src).to(resident.device)
+        resident.index_copy_(0, idx, values)
+
+    def to_host(self, resident):
+        return resident.detach().to("cpu").numpy().view(np.uint32)
+
+
+class _DeviceResident:
+    """Bookkeeping for one device's resident params buffer.
+
+    ``stream``/``params`` are the HOST mirror (recipe order + stacked sticks).
+    ``device_tensor`` is the RESIDENT device buffer (an object owned by the
+    injected device bridge; a ``torch.Tensor`` for the default bridge).
+    ``device_reflects`` is the ``(seed, epoch, base_counter)`` the device buffer
+    currently encodes — it lags the host mirror and is what the per-draw
+    minimal write is derived from. ``patch_source`` records which patch owner
+    advanced the host stream (``"codegen"`` / ``"injected"``) or ``None`` when
+    the last update was a full rebuild (including the no-patch fallback).
+    """
+
+    __slots__ = (
+        "seed",
+        "epoch",
+        "base_counter",
+        "stream",
+        "params",
+        "device_tensor",
+        "device_reflects",
+        "patch_source",
+        "last_device_update",
+    )
 
     def __init__(self, seed, epoch, base_counter, stream, params):
         self.seed = seed
@@ -788,6 +886,14 @@ class _DeviceResident:
         self.base_counter = base_counter
         self.stream = stream
         self.params = params
+        self.device_tensor = None
+        self.device_reflects = None
+        self.patch_source = None
+        self.last_device_update = None
+
+    def reflected_key(self) -> tuple:
+        """The ``(seed, epoch, base_counter)`` tuple this resident encodes."""
+        return (self.seed, self.epoch, self.base_counter)
 
 
 class SpyreRngResources:
@@ -810,6 +916,13 @@ class SpyreRngResources:
     ``patch_fn(stream, *, blocks, x0_base) -> tuple[StreamWord, ...]`` are
     INJECTED so the class unit-tests without the codegen patch and without a
     device. The default ``patch_fn`` is the codegen owner, resolved lazily.
+
+    :meth:`ensure_device_params` adds the DEVICE half: it keeps a resident
+    device tensor per device and, on a same-seed offset advance, writes only the
+    three offset-dependent rows (384 B) into it instead of re-uploading the
+    whole 251-stick (32 KB) params tensor. The write goes through an injected
+    ``device_bridge`` (default :class:`_TorchDeviceBridge`), which is also the
+    seam an offline test uses to COUNT the bytes actually moved.
     """
 
     _DEFAULT = object()
@@ -819,12 +932,16 @@ class SpyreRngResources:
         *,
         build_fn=_DEFAULT,
         patch_fn=_DEFAULT,
+        device_bridge=_DEFAULT,
         rounds: int = RNG_KAT_ROUNDS,
         egress: EgressMode = EgressMode.RAW_STATE,
         stream: int = 0,
     ) -> None:
         self._build_fn = build_fn
         self._patch_fn = patch_fn
+        self._device_bridge = (
+            _TorchDeviceBridge() if device_bridge is self._DEFAULT else device_bridge
+        )
         self._rounds = int(rounds)
         self._egress = egress
         self._stream = int(stream)
@@ -832,6 +949,11 @@ class SpyreRngResources:
         # Partition allocator cursor: (epoch, next_counter). Starts at epoch 0.
         self._alloc_epoch = 0
         self._alloc_counter = 0
+        # Lazy cache of the codegen offset-dependent row indices (may be None:
+        # no owner). ``_offset_rows_resolved`` distinguishes "not computed yet"
+        # from "computed and absent", so a missing owner is not re-probed.
+        self._offset_rows_cache: "tuple[int, ...] | None" = None
+        self._offset_rows_resolved = False
 
     # -- partition allocator -------------------------------------------------
 
@@ -879,16 +1001,86 @@ class SpyreRngResources:
         """
         if not isinstance(spec, RngDrawSpec):
             raise TypeError(f"ensure_params expects an RngDrawSpec, got {type(spec)!r}")
+        return self._advance(_device_index(device), spec).params
+
+    def ensure_device_params(self, spec: RngDrawSpec, device=None, *, bridge=None):
+        """Return the RESIDENT DEVICE tensor for ``spec`` on ``device``.
+
+        This is the Option 1 data-movement win: the params live in device memory
+        once, and a same-seed + same-epoch offset advance writes ONLY the three
+        offset-dependent rows (COUNTER, X0_BASE_LO, X0_BASE_HI) — 3 sticks =
+        384 B — instead of re-uploading the full 251-stick (32 128 B) tensor.
+
+        The minimal write is derived from ``device_reflects`` (what the device
+        buffer currently encodes) vs the host's target spec, so it is correct
+        even if ``ensure_params`` already advanced the host mirror:
+
+        * first draw, seed change, epoch rollover, or no offset-index owner ->
+          FULL upload (``bridge.upload``);
+        * same seed + epoch, offset advanced -> ``bridge.write_rows`` of the
+          offset-dependent rows only;
+        * the device buffer already reflects ``spec`` -> nothing is written.
+
+        ``bridge`` defaults to the per-instance device bridge; an offline test
+        injects a counting fake to assert the exact bytes moved.
+        """
+        if not isinstance(spec, RngDrawSpec):
+            raise TypeError(
+                f"ensure_device_params expects an RngDrawSpec, got {type(spec)!r}"
+            )
         dev = _device_index(device)
-        seed = (spec.seed_lo, spec.seed_hi)
+        res = self._advance(dev, spec)
+        bridge = self._device_bridge if bridge is None else bridge
+        target = res.reflected_key()
+
+        if res.device_tensor is None:
+            res.device_tensor = bridge.upload(res.params, device)
+            res.last_device_update = "upload"
+        elif res.device_reflects == target:
+            # Replay-safe: the device buffer already encodes this spec.
+            res.last_device_update = "cached"
+            return res.device_tensor
+        elif (
+            res.device_reflects is not None
+            and res.device_reflects[0] == res.seed
+            and res.device_reflects[1] == res.epoch
+        ):
+            rows = self._offset_dependent_rows()
+            if rows is None:
+                # No offset-index owner (codegen absent): full re-upload keeps
+                # this CORRECT, merely unoptimized. Marked via patch_source.
+                res.device_tensor = bridge.upload(res.params, device)
+                res.last_device_update = "upload"
+            else:
+                host_rows = np.ascontiguousarray(res.params[list(rows)])
+                bridge.write_rows(res.device_tensor, rows, host_rows)
+                res.last_device_update = "patch"
+        else:
+            # Seed change or epoch rollover relative to what the device holds:
+            # the key-derived words change, so the whole buffer must be re-sent.
+            res.device_tensor = bridge.upload(res.params, device)
+            res.last_device_update = "upload"
+        res.device_reflects = target
+        return res.device_tensor
+
+    # -- invalidation core ---------------------------------------------------
+
+    def _advance(self, dev: int, spec: RngDrawSpec) -> _DeviceResident:
+        """Advance the HOST resident for ``spec``; return the resident record.
+
+        Implements the invalidation contract: a same-seed + same-epoch offset
+        advance patches (when a patch owner is available), a seed change or an
+        epoch rollover rebuilds fully, and a repeated spec is a no-op.
+        """
         res = self._residents.get(dev)
+        seed = (spec.seed_lo, spec.seed_hi)
         if res is None:
             return self._full_build(dev, spec)
         same_seed = res.seed == seed
         same_epoch = res.epoch == spec.epoch
         if same_seed and same_epoch and res.base_counter == spec.base_counter:
             # Replay-safe: nothing advances, return the cached buffer unchanged.
-            return res.params
+            return res
         if same_seed and same_epoch:
             patched = self._patch_offset(dev, res, spec)
             if patched is not None:
@@ -898,38 +1090,65 @@ class SpyreRngResources:
         # Seed change or epoch rollover: key-derived words change -> rebuild.
         return self._full_build(dev, spec)
 
-    def _full_build(self, dev: int, spec: RngDrawSpec) -> np.ndarray:
+    def _full_build(self, dev: int, spec: RngDrawSpec) -> _DeviceResident:
         stream = self._build(spec, dev)
         params = stream_to_sticks(stream)
-        self._residents[dev] = _DeviceResident(
+        prev = self._residents.get(dev)
+        # A full rebuild that keeps the SAME (seed, epoch) leaves the device
+        # buffer valid for every key-derived row; carrying it lets the device
+        # path still do the 3-row write (the seed/epoch key comparison in
+        # ensure_device_params decides whether that is safe).
+        carry_device = (
+            prev is not None
+            and prev.device_tensor is not None
+            and prev.seed == (spec.seed_lo, spec.seed_hi)
+            and prev.epoch == spec.epoch
+        )
+        res = _DeviceResident(
             seed=(spec.seed_lo, spec.seed_hi),
             epoch=spec.epoch,
             base_counter=spec.base_counter,
             stream=stream,
             params=params,
         )
-        return params
+        res.patch_source = None
+        if carry_device and prev is not None:
+            res.device_tensor = prev.device_tensor
+            res.device_reflects = prev.device_reflects
+        self._residents[dev] = res
+        return res
 
     def _patch_offset(
         self, dev: int, res: _DeviceResident, spec: RngDrawSpec
-    ) -> "np.ndarray | None":
-        patch_fn = self._resolve_patch_fn()
+    ) -> "_DeviceResident | None":
+        patch_fn, source = self._resolve_patch()
         if patch_fn is None:
             return None
         seed_key = (spec.seed_lo, spec.seed_hi)
         k_prime = epoch_key_2x32(seed_key, spec.epoch, device=dev, stream=self._stream)
         x0_base, _x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
         blocks = np.arange(RNG_KAT_LANES, dtype=np.uint32)
-        new_stream = patch_fn(res.stream, blocks=blocks, x0_base=x0_base)
+        # The codegen owner keys its slot set on the CODEGEN StreamSlot enum, so
+        # hand it codegen StreamWords (a local enum compares unequal there).
+        new_codegen_stream = patch_fn(
+            _to_codegen_stream(res.stream), blocks=blocks, x0_base=x0_base
+        )
+        new_stream = _from_codegen_stream(new_codegen_stream)
         new_params = stream_to_sticks(new_stream)
-        self._residents[dev] = _DeviceResident(
+        patched_res = _DeviceResident(
             seed=seed_key,
             epoch=spec.epoch,
             base_counter=spec.base_counter,
             stream=new_stream,
             params=new_params,
         )
-        return new_params
+        patched_res.patch_source = source
+        # Same (seed, epoch) as the prior resident by construction: carry the
+        # resident device buffer so the next device draw writes only 3 rows.
+        patched_res.device_tensor = res.device_tensor
+        patched_res.device_reflects = res.device_reflects
+        self._residents[dev] = patched_res
+        return patched_res
 
     def _build(self, spec: RngDrawSpec, dev: int):
         if self._build_fn is self._DEFAULT:
@@ -942,10 +1161,47 @@ class SpyreRngResources:
             )
         return self._build_fn(spec, dev)
 
-    def _resolve_patch_fn(self):
+    def _resolve_patch(self) -> "tuple[Callable[..., tuple] | None, str | None]":
+        """The patch owner plus its source tag (``codegen`` / ``injected``)."""
         if self._patch_fn is self._DEFAULT:
-            return _load_codegen_patch_fn()
-        return self._patch_fn
+            fn = _load_codegen_patch_fn()
+            return fn, ("codegen" if fn is not None else None)
+        if self._patch_fn is None:
+            return None, None
+        return self._patch_fn, "injected"
+
+    def _resolve_patch_fn(self):
+        """The patch owner alone (back-compat shim over :meth:`_resolve_patch`)."""
+        return self._resolve_patch()[0]
+
+    def _offset_dependent_rows(self) -> "tuple[int, ...] | None":
+        """Row indices that depend on ``(blocks, x0_base)``, per codegen.
+
+        Delegates to the codegen recipe owner ``offset_dependent_indices`` so
+        the torch-spyre half never hardcodes the three row positions. Returns
+        ``None`` when that owner is unavailable — the device path then does a
+        full upload (correct, unoptimized), never a guessed row set.
+        """
+        if not self._offset_rows_resolved:
+            self._offset_rows_cache = self._compute_offset_rows()
+            self._offset_rows_resolved = True
+        return self._offset_rows_cache
+
+    def _compute_offset_rows(self) -> "tuple[int, ...] | None":
+        fn = _load_codegen_offset_indices()
+        if fn is None:
+            return None
+        try:
+            return tuple(
+                int(i)
+                for i in fn(
+                    rounds=self._rounds, egress=_to_codegen_egress(self._egress)
+                )
+            )
+        except Exception:
+            # A codegen-side refusal (e.g. an unsupported egress) is not a
+            # reason to crash the host path: fall back to the full upload.
+            return None
 
     # -- observability -------------------------------------------------------
 
@@ -960,6 +1216,26 @@ class SpyreRngResources:
             base_counter=res.base_counter,
             epoch=res.epoch,
         )
+
+    def patch_source(self, device=None) -> "str | None":
+        """Which patch owner last advanced ``device``'s params, or ``None``.
+
+        ``"codegen"`` = the real ``threefry_recipe_model.patch_offset_words``;
+        ``"injected"`` = a caller-supplied patch fn; ``None`` = the last update
+        was a full rebuild (first draw, seed change, epoch rollover, or the
+        no-patch fallback). This makes a silently-unoptimized fallback visible.
+        """
+        res = self._residents.get(_device_index(device))
+        return None if res is None else res.patch_source
+
+    def last_device_update(self, device=None) -> "str | None":
+        """The last device-side write kind: ``upload`` / ``patch`` / ``cached``."""
+        res = self._residents.get(_device_index(device))
+        return None if res is None else res.last_device_update
+
+    def offset_dependent_rows(self) -> "tuple[int, ...] | None":
+        """Public view of the rows the device patch writes (``None`` if absent)."""
+        return self._offset_dependent_rows()
 
 
 #: The process-wide resources instance. Per-device state lives inside it, keyed
@@ -1350,12 +1626,13 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     a permuted or truncated binding refuses before the C++ call (T-LR-2B).
 
     Option 1 wiring: when ``use_resident`` is not ``False`` and the plan carries
-    a :class:`RngDrawSpec`, the params come from the device's resident buffer
-    (:meth:`SpyreRngResources.ensure_params`) — a same-seed offset advance then
-    patches only the three offset-dependent sticks instead of rebuilding the
-    whole 251-stick stream. The bytes are identical to the per-draw full-upload
-    path, so this never changes the draw's result. ``use_resident=False`` forces
-    the baked-in ``plan.params`` (the pre-Option-1 behavior).
+    a :class:`RngDrawSpec`, the launch uses the device's RESIDENT params tensor
+    (:meth:`SpyreRngResources.ensure_device_params`) — the whole 251-stick
+    (32 KB) params tensor is uploaded ONCE, and a same-seed offset advance then
+    writes only the three offset-dependent rows (384 B) into it. The bytes are
+    identical to the per-draw full-upload path, so this never changes the
+    draw's result. ``use_resident=False`` forces the baked-in ``plan.params``
+    and the old per-draw full upload (the pre-Option-1 behavior).
     """
     import torch
 
@@ -1369,12 +1646,20 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     binary, xlat_plan = build_rng_kat_binary()
     dev = torch.device("spyre") if device is None else device
     if use_resident is not False and plan.spec is not None:
-        params_np = get_rng_resources().ensure_params(plan.spec, _device_index(dev))
+        # Resident DEVICE tensor: no per-draw full re-materialization.
+        params = get_rng_resources().ensure_device_params(plan.spec, dev)
+        if params.shape != plan.params.shape:
+            raise SpyreRngError(
+                "resident params shape "
+                f"{tuple(params.shape)} disagrees with the plan's "
+                f"{tuple(plan.params.shape)}; refusing a mid-stream device buffer"
+            )
     else:
-        params_np = plan.params
-    # Recipe order (the launcher's device-word-order / swizzle concern, not the
-    # builder's). int32 holds the same 32-bit words, byte for byte.
-    params = torch.from_numpy(np.ascontiguousarray(params_np.view(np.int32))).to(dev)
+        # Recipe order (the launcher's device-word-order / swizzle concern, not
+        # the builder's). int32 holds the same 32-bit words, byte for byte.
+        params = torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(
+            dev
+        )
     out = torch.zeros((plan.output_sticks, plan.lanes), dtype=torch.int32, device=dev)
     tensors_by_symbol = {
         xlat_plan.symbols[0].symbol_id: params,

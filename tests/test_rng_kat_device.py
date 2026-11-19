@@ -135,3 +135,77 @@ def test_draw_raw_state_is_reproducible_on_device():
     b0, b1 = hr.draw_raw_state(12345, 0)
     assert (np.asarray(a0) == np.asarray(b0)).all()
     assert (np.asarray(a1) == np.asarray(b1)).all()
+
+
+def test_resident_device_tensor_equals_full_upload_after_n_draws():
+    """Device residency on silicon: N draws off the resident params tensor
+    produce identical output to the full-upload path, and the resident device
+    buffer is byte-identical to a fresh full upload at the final offset.
+
+    This exercises the REAL device bridge (``torch.Tensor`` on spyre) — the
+    offline accounting/byte-identity gates live in ``test_rng_residency.py``.
+    """
+    dev = torch.device("spyre")
+    hr.reset_rng_resources()
+    res = hr.get_rng_resources()
+    seed = 20241119
+
+    plan = None
+    for i in range(8):
+        plan = hr.build_rng_launch_plan(
+            seed=seed, offset=i * 64, egress=hr.EgressMode.RAW_STATE
+        )
+        resident_out = hr.launch_raw_state_draw(plan, device=dev)
+        full_out = hr.launch_raw_state_draw(plan, device=dev, use_resident=False)
+        assert torch.equal(resident_out.cpu(), full_out.cpu()), (
+            f"resident vs full-upload mismatch at draw {i}"
+        )
+
+    # The resident device tensor must equal a fresh full upload of the same
+    # (seed, offset) — no stale rows carried across the offset sweep.
+    resident = res.ensure_device_params(plan.spec, dev)
+    fresh = hr._TorchDeviceBridge().upload(plan.params, dev)
+    assert torch.equal(resident.cpu(), fresh.cpu())
+
+
+def test_resident_offset_advance_writes_three_rows_on_device():
+    """On silicon, the device-side update after the first draw is a 3-row write.
+
+    Asserts the accounting seam directly against the real bridge: instrument
+    ``write_rows``/``upload`` on a real-device bridge and count the rows moved
+    across one offset advance.
+    """
+    dev = torch.device("spyre")
+    hr.reset_rng_resources()
+    res = hr.get_rng_resources()
+    seed = 424242
+
+    class _CountingTorchBridge(hr._TorchDeviceBridge):
+        def __init__(self):
+            self.upload_rows = 0
+            self.written_rows = 0
+
+        def upload(self, host_words, device):
+            self.upload_rows += int(host_words.shape[0])
+            return super().upload(host_words, device)
+
+        def write_rows(self, resident, row_indices, host_rows):
+            self.written_rows += len(tuple(row_indices))
+            return super().write_rows(resident, row_indices, host_rows)
+
+    bridge = _CountingTorchBridge()
+    res.ensure_device_params(
+        hr.RngDrawSpec.from_seed_offset(seed, 0), dev, bridge=bridge
+    )
+    assert bridge.upload_rows == hr.band_lxlu_pop_count(
+        hr.RNG_KAT_ROUNDS, egress=hr.EgressMode.RAW_STATE
+    ), "first draw uploads the full params tensor"
+    assert bridge.written_rows == 0
+
+    res.ensure_device_params(
+        hr.RngDrawSpec.from_seed_offset(seed, 64), dev, bridge=bridge
+    )
+    assert bridge.written_rows == 3, "an offset advance writes only 3 rows on device"
+    assert bridge.upload_rows == hr.band_lxlu_pop_count(
+        hr.RNG_KAT_ROUNDS, egress=hr.EgressMode.RAW_STATE
+    ), "the full params tensor is NOT re-uploaded on an offset advance"
