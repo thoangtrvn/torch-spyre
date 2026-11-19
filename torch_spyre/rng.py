@@ -73,10 +73,12 @@ import numpy as np
 __all__ = [
     "DeviceRngSwitch",
     "EgressMode",
+    "RngDrawSpec",
     "RngLaunchPlan",
     "SetupStaging",
     "SpyreGeneratorState",
     "SpyreRngError",
+    "SpyreRngResources",
     "StreamSlot",
     "StreamWord",
     "build_band_lxlu_stream",
@@ -87,6 +89,7 @@ __all__ = [
     "draw_raw_state",
     "epoch_key_2x32",
     "fold_key_schedule_2x32",
+    "get_rng_resources",
     "injection_words_2x32",
     "key_schedule_2x32",
     "launch_raw_state_draw",
@@ -654,6 +657,335 @@ class SpyreGeneratorState:
 
 
 # ---------------------------------------------------------------------------
+# Residency + partition manager (Option 1 shared construction, brief §2.0/§7.2)
+# ---------------------------------------------------------------------------
+#
+# The params stream is draw-invariant except three sticks: COUNTER,
+# X0_BASE_LO, X0_BASE_HI. ``SpyreRngResources`` keeps ONE resident params buffer
+# per device and, on an offset advance within the same seed+epoch, patches only
+# those three sticks instead of rebuilding the whole 251-stick stream. A seed
+# change (``manual_seed``/``set_rng_state``) or an epoch rollover re-keys the
+# schedule and so forces a FULL rebuild.
+#
+# The codegen owner of the patch recipe
+# (``threefry_recipe_model.patch_offset_words``) is landed by a PARALLEL lane,
+# so ``patch_fn`` is INJECTED. The class is unit-testable with a local patch
+# function and no device. When the codegen patch is not importable, an offset
+# advance falls back to a full rebuild: byte-identical (correct), merely
+# unoptimized. That is a performance fallback, never a correctness one.
+
+#: Blocks are rfp32-exact only below 2^23 (``build_band_lxlu_stream`` guard).
+_EXACT_BLOCK_LIMIT = 1 << 23
+
+
+@dataclass(frozen=True)
+class RngDrawSpec:
+    """The canonical host-side draw request (Option 4 later reuses this shape).
+
+    ``seed_lo``/``seed_hi`` are the u64 seed split into two u32 words (the
+    ``seed_to_key`` order). ``epoch`` is the block-epoch index
+    (``offset >> 30``); ``base_counter`` is the offset WITHIN that epoch
+    (``offset & (2^30 - 1)``), i.e. the counter base the draw folds in.
+    """
+
+    seed_lo: int
+    seed_hi: int
+    base_counter: int
+    epoch: int
+
+    def __post_init__(self) -> None:
+        for name, value, limit in (
+            ("seed_lo", self.seed_lo, 1 << 32),
+            ("seed_hi", self.seed_hi, 1 << 32),
+        ):
+            if not 0 <= int(value) < limit:
+                raise ValueError(f"RngDrawSpec.{name} must fit in u32, got {value!r}")
+        if not 0 <= int(self.epoch):
+            raise ValueError(
+                f"RngDrawSpec.epoch must be non-negative, got {self.epoch!r}"
+            )
+        if not 0 <= int(self.base_counter) < _EPOCH_BLOCKS:
+            raise ValueError(
+                "RngDrawSpec.base_counter must be an offset within one epoch "
+                f"[0, 2^{_EPOCH_BITS}), got {self.base_counter!r}"
+            )
+
+    @classmethod
+    def from_seed_offset(cls, seed: int, offset: int) -> "RngDrawSpec":
+        """Build the spec from the u64 ``(seed, offset)`` generator state."""
+        if offset < 0:
+            raise ValueError(f"offset must be non-negative, got {offset}")
+        seed_lo, seed_hi = seed_to_key(seed)
+        return cls(
+            seed_lo=seed_lo,
+            seed_hi=seed_hi,
+            base_counter=offset % _EPOCH_BLOCKS,
+            epoch=offset // _EPOCH_BLOCKS,
+        )
+
+
+def _device_index(device) -> int:
+    """Normalize ``None`` / int / ``torch.device`` into a device index."""
+    if device is None:
+        return 0
+    if isinstance(device, int):
+        return int(device)
+    index = getattr(device, "index", None)
+    if index is None:
+        # e.g. torch.device("spyre") with no explicit index -> device 0.
+        return 0
+    return int(index)
+
+
+def _default_build_stream(
+    spec: RngDrawSpec,
+    device_index: int,
+    *,
+    rounds: int,
+    egress: EgressMode,
+    stream: int,
+) -> "tuple[StreamWord, ...]":
+    """Full params stream for ``spec`` (the un-optimized baseline build).
+
+    Mirrors :func:`draw_params_stream` exactly for the same ``(seed, offset)``:
+    ``blocks = 0..lanes-1`` and ``x0_base = (base_counter + ks0) mod 2^32``, so a
+    resident first build is byte-identical to the per-draw full upload path.
+    """
+    seed_key = (spec.seed_lo, spec.seed_hi)
+    k_prime = epoch_key_2x32(seed_key, spec.epoch, device=device_index, stream=stream)
+    x0_base, x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
+    injections = injection_words_2x32(k_prime, rounds)
+    rotations = [ROTATIONS_2X32[r % 8] for r in range(rounds)]
+    blocks = np.arange(RNG_KAT_LANES, dtype=np.uint32)
+    return build_band_lxlu_stream(
+        blocks,
+        x0_base=x0_base,
+        x1=x1,
+        rotations=rotations,
+        injections=injections,
+        rounds=rounds,
+        egress=egress,
+    )
+
+
+def _load_codegen_patch_fn():
+    """The codegen offset-patch owner, or ``None`` if that lane has not landed."""
+    try:
+        from sentient_codegen.emulator import threefry_recipe_model as _rm
+    except Exception:  # backend absent, or the patch lane not merged yet
+        return None
+    return getattr(_rm, "patch_offset_words", None)
+
+
+class _DeviceResident:
+    """Host bookkeeping for one device's resident params buffer."""
+
+    __slots__ = ("seed", "epoch", "base_counter", "stream", "params")
+
+    def __init__(self, seed, epoch, base_counter, stream, params):
+        self.seed = seed
+        self.epoch = epoch
+        self.base_counter = base_counter
+        self.stream = stream
+        self.params = params
+
+
+class SpyreRngResources:
+    """Per-device residency + partition manager for the RNG params stream.
+
+    ONE instance serves a process; its state is keyed by device index so two
+    devices never alias. It owns two responsibilities (brief §2.0):
+
+    * **Partition allocation** — :meth:`reserve` hands out pairwise-DISJOINT
+      counter ranges as ``(epoch, base_counter)``; ranges never overlap, never
+      cross the ``2^30`` epoch, and never produce a block index ``>= 2^23`` (the
+      rfp32 exactness bound; a reservation that cannot fit is rolled to the next
+      epoch, and a single reservation above ``2^23`` is refused).
+    * **Resident params** — :meth:`ensure_params` builds the buffer ONCE, patches
+      only the offset-dependent words on a same-seed offset advance, and does a
+      FULL rebuild on a seed change / epoch rollover. The reflected
+      ``(seed, epoch, base_counter)`` is cached and the invalidation is explicit.
+
+    ``build_fn(spec, device_index) -> tuple[StreamWord, ...]`` and
+    ``patch_fn(stream, *, blocks, x0_base) -> tuple[StreamWord, ...]`` are
+    INJECTED so the class unit-tests without the codegen patch and without a
+    device. The default ``patch_fn`` is the codegen owner, resolved lazily.
+    """
+
+    _DEFAULT = object()
+
+    def __init__(
+        self,
+        *,
+        build_fn=_DEFAULT,
+        patch_fn=_DEFAULT,
+        rounds: int = RNG_KAT_ROUNDS,
+        egress: EgressMode = EgressMode.RAW_STATE,
+        stream: int = 0,
+    ) -> None:
+        self._build_fn = build_fn
+        self._patch_fn = patch_fn
+        self._rounds = int(rounds)
+        self._egress = egress
+        self._stream = int(stream)
+        self._residents: dict[int, _DeviceResident] = {}
+        # Partition allocator cursor: (epoch, next_counter). Starts at epoch 0.
+        self._alloc_epoch = 0
+        self._alloc_counter = 0
+
+    # -- partition allocator -------------------------------------------------
+
+    def reserve(self, n: int) -> "tuple[int, int]":
+        """Reserve ``n`` disjoint block-counters; return ``(epoch, base_counter)``.
+
+        The returned range is ``[base_counter, base_counter + n)`` within
+        ``epoch``. Ranges handed out here are pairwise disjoint, never cross the
+        ``2^30`` epoch boundary, and never contain a block index ``>= 2^23``.
+        """
+        n = int(n)
+        if n < 0:
+            raise ValueError(f"reserve(n) requires n >= 0, got {n}")
+        if n == 0:
+            return self._alloc_epoch, self._alloc_counter
+        if n > _EXACT_BLOCK_LIMIT:
+            raise SpyreRngError(
+                f"reserve({n}): a single draw cannot exceed 2^23 = {_EXACT_BLOCK_LIMIT} "
+                "block-counters (rfp32 exactness bound); split the draw."
+            )
+        # Roll to the next epoch rather than emit a block index past the limit.
+        if self._alloc_counter + n > _EXACT_BLOCK_LIMIT:
+            self._alloc_epoch += 1
+            self._alloc_counter = 0
+        epoch = self._alloc_epoch
+        base = self._alloc_counter
+        # Structural invariant: base+n stays inside [0, 2^23) < 2^30.
+        assert base + n <= _EXACT_BLOCK_LIMIT <= _EPOCH_BLOCKS
+        self._alloc_counter = base + n
+        return epoch, base
+
+    # -- resident params -----------------------------------------------------
+
+    def ensure_params(self, spec: RngDrawSpec, device=None) -> np.ndarray:
+        """Return the resident ``(sticks, lanes)`` params for ``spec`` on ``device``.
+
+        Invalidation contract (brief §2.0):
+
+        * first draw for a device -> full build, upload the resident buffer;
+        * offset advance, same seed + epoch -> patch ONLY the offset-dependent
+          words (falls back to a full rebuild if the codegen patch is absent);
+        * seed change / epoch rollover -> FULL rebuild (the key-derived words
+          change);
+        * a different ``device`` index -> separate resources, never aliased.
+        """
+        if not isinstance(spec, RngDrawSpec):
+            raise TypeError(f"ensure_params expects an RngDrawSpec, got {type(spec)!r}")
+        dev = _device_index(device)
+        seed = (spec.seed_lo, spec.seed_hi)
+        res = self._residents.get(dev)
+        if res is None:
+            return self._full_build(dev, spec)
+        same_seed = res.seed == seed
+        same_epoch = res.epoch == spec.epoch
+        if same_seed and same_epoch and res.base_counter == spec.base_counter:
+            # Replay-safe: nothing advances, return the cached buffer unchanged.
+            return res.params
+        if same_seed and same_epoch:
+            patched = self._patch_offset(dev, res, spec)
+            if patched is not None:
+                return patched
+            # Patch path unavailable (codegen lane not merged): rebuild fully.
+            return self._full_build(dev, spec)
+        # Seed change or epoch rollover: key-derived words change -> rebuild.
+        return self._full_build(dev, spec)
+
+    def _full_build(self, dev: int, spec: RngDrawSpec) -> np.ndarray:
+        stream = self._build(spec, dev)
+        params = stream_to_sticks(stream)
+        self._residents[dev] = _DeviceResident(
+            seed=(spec.seed_lo, spec.seed_hi),
+            epoch=spec.epoch,
+            base_counter=spec.base_counter,
+            stream=stream,
+            params=params,
+        )
+        return params
+
+    def _patch_offset(
+        self, dev: int, res: _DeviceResident, spec: RngDrawSpec
+    ) -> "np.ndarray | None":
+        patch_fn = self._resolve_patch_fn()
+        if patch_fn is None:
+            return None
+        seed_key = (spec.seed_lo, spec.seed_hi)
+        k_prime = epoch_key_2x32(seed_key, spec.epoch, device=dev, stream=self._stream)
+        x0_base, _x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
+        blocks = np.arange(RNG_KAT_LANES, dtype=np.uint32)
+        new_stream = patch_fn(res.stream, blocks=blocks, x0_base=x0_base)
+        new_params = stream_to_sticks(new_stream)
+        self._residents[dev] = _DeviceResident(
+            seed=seed_key,
+            epoch=spec.epoch,
+            base_counter=spec.base_counter,
+            stream=new_stream,
+            params=new_params,
+        )
+        return new_params
+
+    def _build(self, spec: RngDrawSpec, dev: int):
+        if self._build_fn is self._DEFAULT:
+            return _default_build_stream(
+                spec,
+                dev,
+                rounds=self._rounds,
+                egress=self._egress,
+                stream=self._stream,
+            )
+        return self._build_fn(spec, dev)
+
+    def _resolve_patch_fn(self):
+        if self._patch_fn is self._DEFAULT:
+            return _load_codegen_patch_fn()
+        return self._patch_fn
+
+    # -- observability -------------------------------------------------------
+
+    def reflected(self, device=None) -> "RngDrawSpec | None":
+        """The ``(seed, epoch, base_counter)`` the resident buffer reflects."""
+        res = self._residents.get(_device_index(device))
+        if res is None:
+            return None
+        return RngDrawSpec(
+            seed_lo=res.seed[0],
+            seed_hi=res.seed[1],
+            base_counter=res.base_counter,
+            epoch=res.epoch,
+        )
+
+
+#: The process-wide resources instance. Per-device state lives inside it, keyed
+#: by device index — this is a process handle, NOT a bare module-global buffer.
+_RNG_RESOURCES: "SpyreRngResources | None" = None
+
+
+def get_rng_resources() -> SpyreRngResources:
+    """Return the process-wide :class:`SpyreRngResources` (created on demand)."""
+    global _RNG_RESOURCES
+    if _RNG_RESOURCES is None:
+        _RNG_RESOURCES = SpyreRngResources()
+    return _RNG_RESOURCES
+
+
+def reset_rng_resources() -> None:
+    """Drop the process-wide resources (tests / device teardown).
+
+    Not part of the public RNG API surface; exposed for deterministic test
+    isolation so a stale resident buffer never leaks between cases.
+    """
+    global _RNG_RESOURCES
+    _RNG_RESOURCES = None
+
+
+# ---------------------------------------------------------------------------
 # The route scaffold (torch-spyre half of "how the two lanes meet").
 # ---------------------------------------------------------------------------
 
@@ -719,6 +1051,9 @@ class RngLaunchPlan:
     declared_segment_count: int
     #: Raw-egress reconstruction: x0 = (x0h<<16)|x0l, x1 = (x1h<<16)|x1l.
     output_sticks: int
+    #: The draw spec this plan was derived from (Option 1 residency). ``None`` on
+    #: a hand-built plan; the launcher then falls back to the baked-in params.
+    spec: "RngDrawSpec | None" = None
 
 
 def build_rng_launch_plan(
@@ -789,6 +1124,7 @@ def build_rng_launch_plan(
         xlat_segments={"input": 0, "output": 1},
         declared_segment_count=2,
         output_sticks=band_egress_stick_count(RNG_KAT_ROUNDS, egress=egress),
+        spec=RngDrawSpec.from_seed_offset(seed, offset),
     )
 
 
@@ -1002,7 +1338,7 @@ def build_rng_kat_binary(target: "str | None" = None) -> "tuple[bytes, object]":
     return _RAW_KAT_CACHE
 
 
-def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None):
+def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None):
     """Launch the registered T=1 raw-state KAT for ``plan``; return its output.
 
     Requires a real ``spyre`` device and the flex runtime. Returns the 4-stick
@@ -1012,6 +1348,14 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None):
     (segment 0 = params, segment 1 = raw-state output). The launch is gated by
     ``validate_positional_launch`` against the plan derived beside the binary, so
     a permuted or truncated binding refuses before the C++ call (T-LR-2B).
+
+    Option 1 wiring: when ``use_resident`` is not ``False`` and the plan carries
+    a :class:`RngDrawSpec`, the params come from the device's resident buffer
+    (:meth:`SpyreRngResources.ensure_params`) — a same-seed offset advance then
+    patches only the three offset-dependent sticks instead of rebuilding the
+    whole 251-stick stream. The bytes are identical to the per-draw full-upload
+    path, so this never changes the draw's result. ``use_resident=False`` forces
+    the baked-in ``plan.params`` (the pre-Option-1 behavior).
     """
     import torch
 
@@ -1024,9 +1368,13 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None):
         )
     binary, xlat_plan = build_rng_kat_binary()
     dev = torch.device("spyre") if device is None else device
+    if use_resident is not False and plan.spec is not None:
+        params_np = get_rng_resources().ensure_params(plan.spec, _device_index(dev))
+    else:
+        params_np = plan.params
     # Recipe order (the launcher's device-word-order / swizzle concern, not the
     # builder's). int32 holds the same 32-bit words, byte for byte.
-    params = torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(dev)
+    params = torch.from_numpy(np.ascontiguousarray(params_np.view(np.int32))).to(dev)
     out = torch.zeros((plan.output_sticks, plan.lanes), dtype=torch.int32, device=dev)
     tensors_by_symbol = {
         xlat_plan.symbols[0].symbol_id: params,
@@ -1088,5 +1436,10 @@ def draw_raw_state(seed: int, offset: int = 0, *, device=None):
     offline (``tests/test_rng_kat_integration.py``). T>=2 / the uniform fp32
     grid still refuse typed (DV-34 / P5 unbuilt) inside ``build_rng_launch_plan``.
     """
-    plan = build_rng_launch_plan(seed=seed, offset=offset, egress=EgressMode.RAW_STATE)
+    plan = build_rng_launch_plan(
+        seed=seed,
+        offset=offset,
+        device=_device_index(device),
+        egress=EgressMode.RAW_STATE,
+    )
     return reconstruct_raw_state_from_tensor(launch_raw_state_draw(plan, device=device))
