@@ -26,13 +26,19 @@ WHAT THIS MODULE OWNS (the torch-spyre / host half)
    silent no-op); ``get_rng_state``/``set_rng_state`` round-trip it. This is
    the design-of-record state from doc 43 §3.1 / §3.2: a u64 seed and a u64
    block offset, one generator per device.
-2. **The params stream.** ``build_band_lxlu_stream`` is a byte-for-byte port of
-   the silicon-witnessed reference
+2. **The params stream.** ``build_band_lxlu_stream`` is a THIN DELEGATING
+   WRAPPER around the single owner in codegen,
    ``sentient_codegen.emulator.threefry_recipe_model.build_band_lxlu_stream``
-   (``threefry_recipe_model.py``). A divergence here is the exact failure mode
-   the contract exists to prevent, so the port is pinned by
-   ``tests/test_rng_host.py`` against the three published Random123 2x32-20
-   anchors, reconstructing x0/x1 bit-exact.
+   (``threefry_recipe_model.py``). The recipe is NOT reimplemented here: this
+   module only adapts the codegen ``StreamWord`` tuple into torch-spyre's
+   ``(sticks, lanes)`` numpy form and translates the codegen ``StreamSlot`` /
+   ``EgressMode`` / ``SetupStaging`` vocabulary into the local mirrors. A
+   divergence is the exact failure mode the contract exists to prevent, so
+   ``tests/test_rng_host.py`` still pins the result against the three published
+   Random123 2x32-20 anchors (x0/x1 bit-exact) and against the reference
+   builder byte-for-byte. The same delegation applies to ``threefry2x32_20``,
+   ``key_schedule_2x32`` and ``injection_words_2x32`` (owner:
+   ``sentient_codegen.emulator.threefry_reference``).
 3. **The route scaffold.** ``build_rng_launch_plan`` turns a draw into the
    params stream and a launch ABI, and REFUSES TYPED (``SpyreRngError``) until
    lane B registers the ``rng_kat`` pattern. It also refuses, typed, the
@@ -110,9 +116,6 @@ SKEIN_KS_PARITY32 = 0x1BD11BDA
 _EPOCH_BITS = 30
 _EPOCH_BLOCKS = 1 << _EPOCH_BITS
 _U32_MASK = 0xFFFFFFFF
-#: The band counter block index must stay exact in rfp32 (< 2^23); see the
-#: reference ``build_band_lxlu_stream`` refusal.
-_COUNTER_EXACT_BLOCKS = 1 << 23
 #: ``0x4B000000`` == 2^23 as an rfp32 word; band halves are stored as B + h.
 _B_VAL = float(1 << 23)
 
@@ -171,16 +174,9 @@ class StreamSlot(Enum):
     BAND_SETUP_B = "band_setup_b"
 
 
-#: The four band setup constants, in pop order (raw rfp32 bit patterns, NOT
-#: values: FMA(S0=LXLU, S1=1.0, S2=0.0) copies the popped word exactly, so the
-#: constant must arrive as its own bit pattern).
-BAND_SETUP_CONSTANTS: tuple[int, int, int, int] = (
-    0x4B00FFFF,
-    0x4B7F0000,
-    0x37800000,
-    0x4B000000,
-)
-
+#: The four band setup slot labels, in pop order. The constant WORDS are owned
+#: by the codegen stream builder (``threefry_recipe_model``); only the slot
+#: vocabulary is mirrored here for the local ``band_lxlu_pop_count``.
 BAND_SETUP_SLOTS = (
     StreamSlot.BAND_SETUP_M16B,
     StreamSlot.BAND_SETUP_MHI,
@@ -252,28 +248,18 @@ def band_egress_stick_count(
 
 
 # ---------------------------------------------------------------------------
-# rfp32 encode (identity port of the reference helper)
-# ---------------------------------------------------------------------------
-
-
-def _encode_rfp32_values(values: np.ndarray) -> np.ndarray:
-    """Exact rfp32 values (float64) to raw words (uint32)."""
-    return values.astype(np.float32).view(np.uint32)
-
-
-def _halves(word: int) -> tuple[float, float]:
-    """(lo, hi) 16-bit halves of a 32-bit word, as floats."""
-    if not 0 <= int(word) <= _U32_MASK:
-        raise ValueError(f"not a 32-bit word: {word}")
-    return float(int(word) & 0xFFFF), float(int(word) >> 16)
-
-
-# ---------------------------------------------------------------------------
-# Threefry2x32-20 reference (host oracle; mirrors the frozen reference exactly)
+# Threefry2x32-20 (thin delegation to the codegen owner)
 # ---------------------------------------------------------------------------
 
 
 def _rotl32(x: np.ndarray, r: int) -> np.ndarray:
+    """32-bit rotate-left used by the stream-replay oracle.
+
+    The generator itself is owned by
+    ``sentient_codegen.emulator.threefry_reference``; this helper survives only
+    for :func:`replay_band_stream_raw`, which decodes a params stream back into
+    the band arithmetic to check the bytes it carries.
+    """
     r %= 32
     if r == 0:
         return x
@@ -285,25 +271,20 @@ def threefry2x32_20(
 ) -> tuple[np.ndarray, np.ndarray]:
     """The canonical generator: Threefry2x32-20 of counter (c0, c1).
 
-    Elementwise over uint32 arrays. Round-for-round the Random123
-    ``threefry2x32_R`` reference; used here as the host oracle the params
-    stream is checked against.
+    Thin adapter over the single owner
+    ``sentient_codegen.emulator.threefry_reference.threefry2x32_20``: it masks
+    the key words to u32 (the historical host behaviour) and coerces the counter
+    to uint32 arrays, then delegates every round to codegen. No round arithmetic
+    lives here.
     """
+    from sentient_codegen.emulator.threefry_reference import (
+        threefry2x32_20 as _ref_threefry2x32_20,
+    )
+
     k0, k1 = (int(w) & _U32_MASK for w in key)
     c0 = np.asarray(c0, dtype=np.uint32)
     c1 = np.asarray(c1, dtype=np.uint32)
-    ks = [np.uint32(k0), np.uint32(k1), np.uint32(SKEIN_KS_PARITY32 ^ k0 ^ k1)]
-    with np.errstate(over="ignore"):
-        x0 = c0 + np.uint32(k0)
-        x1 = c1 + np.uint32(k1)
-        for r in range(RNG_KAT_ROUNDS):
-            x0 = x0 + x1
-            x1 = _rotl32(x1, ROTATIONS_2X32[r % 8]) ^ x0
-            if r % 4 == 3:
-                s = (r + 1) // 4
-                x0 = x0 + ks[s % 3]
-                x1 = x1 + ks[(s + 1) % 3] + np.uint32(s)
-    return x0, x1
+    return _ref_threefry2x32_20(c0, c1, (k0, k1))
 
 
 # ---------------------------------------------------------------------------
@@ -320,9 +301,18 @@ def seed_to_key(seed: int) -> tuple[int, int]:
 
 
 def key_schedule_2x32(key: tuple[int, int]) -> tuple[int, int, int]:
-    """(ks0, ks1, ks2) with ks2 = C240 ^ k0 ^ k1 (threefry.h)."""
+    """(ks0, ks1, ks2) with ks2 = C240 ^ k0 ^ k1 (threefry.h).
+
+    Thin adapter over
+    ``sentient_codegen.emulator.threefry_reference.key_schedule_2x32``; masks
+    the key words to u32 for the historical host behaviour.
+    """
+    from sentient_codegen.emulator.threefry_reference import (
+        key_schedule_2x32 as _ref_key_schedule_2x32,
+    )
+
     k0, k1 = (int(w) & _U32_MASK for w in key)
-    return k0, k1, SKEIN_KS_PARITY32 ^ k0 ^ k1
+    return _ref_key_schedule_2x32((k0, k1))
 
 
 def injection_words_2x32(
@@ -331,14 +321,15 @@ def injection_words_2x32(
     """Per-injection (x0 word, x1 word) for injections s = 1 .. rounds // 4.
 
     Injection s follows round 4s-1: x0 += ks[s mod 3], x1 += ks[(s+1) mod 3] + s.
+    Thin adapter over
+    ``sentient_codegen.emulator.threefry_reference.injection_words_2x32``.
     """
-    if not 0 <= rounds <= 32:
-        raise ValueError(f"threefry2x32: rounds must be in [0, 32], got {rounds}")
-    ks = key_schedule_2x32(key)
-    return tuple(
-        (ks[s % 3], (ks[(s + 1) % 3] + s) & _U32_MASK)
-        for s in range(1, rounds // 4 + 1)
+    from sentient_codegen.emulator.threefry_reference import (
+        injection_words_2x32 as _ref_injection_words_2x32,
     )
+
+    k0, k1 = (int(w) & _U32_MASK for w in key)
+    return _ref_injection_words_2x32((k0, k1), rounds)
 
 
 def epoch_key_2x32(
@@ -378,7 +369,7 @@ def fold_key_schedule_2x32(key: tuple[int, int], offset: int) -> tuple[int, int]
 
 
 # ---------------------------------------------------------------------------
-# The params stream — byte-for-byte port of the reference builder.
+# The params stream — thin delegating wrapper over the codegen owner.
 # ---------------------------------------------------------------------------
 
 
@@ -388,6 +379,31 @@ class StreamWord:
 
     slot: StreamSlot
     words: np.ndarray = field(compare=False)
+
+
+def _to_codegen_egress(egress: EgressMode):
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+
+    return _rm.EgressMode(egress.value)
+
+
+def _to_codegen_setup_staging(setup_staging: SetupStaging):
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+
+    return _rm.SetupStaging(setup_staging.value)
+
+
+def _from_codegen_stream(stream: Sequence) -> tuple[StreamWord, ...]:
+    """Adapt codegen ``StreamWord`` pops into torch-spyre ``StreamWord`` pops.
+
+    The slot vocabulary is matched by value (the two enums carry identical
+    strings), so a new slot on the codegen side either round-trips or fails
+    loud on the local ``StreamSlot(...)`` lookup — never a silent drop.
+    """
+    return tuple(
+        StreamWord(StreamSlot(w.slot.value), np.asarray(w.words, dtype=np.uint32))
+        for w in stream
+    )
 
 
 def build_band_lxlu_stream(
@@ -403,109 +419,36 @@ def build_band_lxlu_stream(
 ) -> tuple[StreamWord, ...]:
     """The host-side LXLU pops for one band tile, in recipe order.
 
-    BYTE-FOR-BYTE port of
+    Thin delegating wrapper: the recipe is OWNED by
     ``sentient_codegen.emulator.threefry_recipe_model.build_band_lxlu_stream``.
-    ``blocks`` are the per-lane counter indices (< 2^23, exact in rfp32); the
-    epilogue's M8/NEG9/S32 and the rotate's MASK/SC1/SC2/Q are splatted
-    constants derived from the round's rotation and the band formulas.
+    This function only translates the local ``SetupStaging`` / ``EgressMode``
+    vocabulary into the codegen enums, calls the owner, and adapts the returned
+    ``StreamWord`` tuple back into torch-spyre ``StreamWord`` objects with
+    ``uint32`` word arrays. No recipe arithmetic is reimplemented here.
 
-    T=1 (RAW_STATE, the default here) yields exactly **251** sticks of 32 lanes:
+    ``blocks`` are the per-lane counter indices (< 2^23, exact in rfp32). T=1
+    (RAW_STATE, the default here) yields exactly **251** sticks of 32 lanes:
     4 setup constants, COUNTER, 4 folded-key sticks, 20 rounds x 12, and the
-    final x0-injection pair.
+    final x0-injection pair. A codegen refusal (e.g. the counter block-index
+    limit) is re-raised as :class:`SpyreRngError` so every host refusal stays
+    the one typed exception.
     """
-    blocks = np.asarray(blocks)
-    if blocks.dtype != np.uint32:
-        raise TypeError(f"blocks must be numpy uint32, got {blocks.dtype}")
-    if (blocks >= _COUNTER_EXACT_BLOCKS).any():
-        raise SpyreRngError(
-            "band counter block index >= 2^23 is not exact in rfp32; split the launch"
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+
+    try:
+        ref_stream = _rm.build_band_lxlu_stream(
+            blocks,
+            x0_base=x0_base,
+            x1=x1,
+            rotations=rotations,
+            injections=injections,
+            rounds=rounds,
+            setup_staging=_to_codegen_setup_staging(setup_staging),
+            egress=_to_codegen_egress(egress),
         )
-    if len(injections) != rounds // 4:
-        raise ValueError(f"need {rounds // 4} injections, got {len(injections)}")
-    if len(rotations) != rounds:
-        raise ValueError(f"need {rounds} rotations, got {len(rotations)}")
-    lanes = blocks.size
-    b_val = _B_VAL
-
-    def splat(value: float) -> np.ndarray:
-        # Reference parity: encode ONE value, then repeat the resulting word.
-        word = _encode_rfp32_values(np.array([value]))[0]
-        return np.full(lanes, word, dtype=np.uint32)
-
-    def halves(word: int) -> tuple[float, float]:
-        return float(int(word) & 0xFFFF), float(int(word) >> 16)
-
-    out: list[StreamWord] = []
-    if setup_staging is SetupStaging.LXLU:
-        out += [
-            StreamWord(slot, np.full(lanes, word, dtype=np.uint32))
-            for slot, word in zip(BAND_SETUP_SLOTS, BAND_SETUP_CONSTANTS)
-        ]
-    out.append(
-        StreamWord(StreamSlot.COUNTER, _encode_rfp32_values(blocks.astype(np.float64)))
-    )
-    bl, bh = halves(x0_base)  # halves returns (lo, hi)
-    kl, kh = halves(x1)
-    out += [
-        StreamWord(StreamSlot.X0_BASE_LO, splat(bl)),
-        StreamWord(StreamSlot.X0_BASE_HI, splat(bh - 128)),
-        StreamWord(StreamSlot.X1_LO, splat(kl + b_val)),
-        StreamWord(StreamSlot.X1_HI, splat(kh + b_val)),
-    ]
-    for r in range(rounds):
-        w0 = injections[r // 4 - 1][0] if r % 4 == 0 and r > 0 else 0
-        w1 = injections[(r + 1) // 4 - 1][1] if r % 4 == 3 else 0
-        i0l, i0h = halves(w0)
-        i1l, i1h = halves(w1)
-        q, rr = divmod(rotations[r], 16)
-        mask = b_val + 2.0 ** (16 - rr) - 1
-        sc1 = 2.0 ** (rr - 16)
-        sc2 = 2.0**rr
-        out += [
-            StreamWord(StreamSlot.INJ0_LO, splat(i0l - b_val)),
-            StreamWord(StreamSlot.INJ0_HI, splat(i0h - b_val - 128)),
-            StreamWord(StreamSlot.BAND_ROT_MASK, splat(mask)),
-            StreamWord(StreamSlot.BAND_ROT_SC1, splat(sc1)),
-            StreamWord(StreamSlot.BAND_ROT_MASK, splat(mask)),
-            StreamWord(StreamSlot.BAND_ROT_SC1, splat(sc1)),
-            StreamWord(StreamSlot.BAND_ROT_SC2, splat(sc2)),
-            StreamWord(StreamSlot.BAND_ROT_SC2, splat(sc2)),
-            StreamWord(StreamSlot.BAND_ROT_Q, splat(float(q))),
-            StreamWord(StreamSlot.BAND_ROT_Q, splat(float(q))),
-            StreamWord(StreamSlot.INJ1_LO, splat(i1l + b_val)),
-            StreamWord(StreamSlot.INJ1_HI, splat(i1h + b_val - 128)),
-        ]
-    final = injections[rounds // 4 - 1][0] if rounds % 4 == 0 and rounds > 0 else 0
-    fl, fh = halves(final)
-    out += [
-        StreamWord(StreamSlot.INJ0_LO, splat(fl)),
-        StreamWord(StreamSlot.INJ0_HI, splat(fh - 128)),
-    ]
-    if egress is EgressMode.UNIFORM:
-        for _ in range(2):
-            out += [
-                StreamWord(StreamSlot.BAND_EPI_M8, splat(b_val + 0xFF00)),
-                StreamWord(StreamSlot.BAND_EPI_NEG9, splat(-(128.0 + 2.0**-9))),
-                StreamWord(StreamSlot.BAND_EPI_S32, splat(2.0**-32)),
-            ]
-    elif egress is not EgressMode.RAW_STATE:
-        raise SpyreRngError(f"unknown egress mode {egress!r}")
-
-    # Self-check: the emitted order must equal the declared pop order.
-    prologue = (
-        BAND_SETUP_SLOTS + BAND_CORE_PROLOGUE_SLOTS
-        if setup_staging is SetupStaging.LXLU
-        else BAND_CORE_PROLOGUE_SLOTS
-    )
-    epilogue = (
-        BAND_EPILOGUE_SLOTS if egress is EgressMode.UNIFORM else BAND_EPILOGUE_SLOTS_RAW
-    )
-    expect = prologue + BAND_ROUND_SLOTS * rounds + epilogue
-    if tuple(w.slot for w in out) != expect:
-        raise AssertionError(
-            "band stream builder order diverged from the declared pop order"
-        )
-    return tuple(out)
+    except _rm.RecipeModelError as exc:
+        raise SpyreRngError(str(exc)) from exc
+    return _from_codegen_stream(ref_stream)
 
 
 def stream_to_sticks(stream: Sequence[StreamWord]) -> np.ndarray:
