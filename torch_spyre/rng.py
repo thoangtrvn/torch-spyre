@@ -1909,7 +1909,7 @@ def _device_stick_layout(tensor):
     The device-side layout (``[sticks, elems_per_stick]``) decides whether a
     caller tensor's allocation is exactly the 2 dense sticks the uniform egress
     writes. Unknown (host / ``_C`` absent) returns ``None`` so the caller takes
-    the always-safe scratch path rather than guessing a direct binding.
+    the unchanged host-map path rather than guessing a direct binding.
     """
     try:
         from torch_spyre import _C
@@ -2008,8 +2008,10 @@ def launch_uniform_draw(
     tensor ``out`` as segment 1 per :func:`_select_uniform_binding` — the
     silicon-witnessed DIRECT 2-stick binding (33<=numel<=64, dense (2,32)) — with
     the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
-    round trip of the generated floats. A caller that would need the scratch +
-    device→device copy refuses typed there (f32 d2d copy is unbuilt on 1p0).
+    round trip of the generated floats. A caller outside that cell never reaches
+    this function — ``route_uniform_fill`` takes the unchanged host-map path
+    (the scratch + device→device copy leg is unavailable: f32 d2d copy is
+    unbuilt on 1p0).
     When ``out`` is ``None`` it writes the full ``(2,32)`` egress into a fresh
     device tensor and returns it (no copy needed — the caller owns it).
 
