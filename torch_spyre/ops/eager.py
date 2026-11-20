@@ -195,9 +195,9 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Switch ON (TORCH_SPYRE_DEVICE_RNG): ``route_uniform_fill`` fills
     # DEVICE-generated uniforms straight into ``self`` — the silicon-witnessed
     # T=1 UNIFORM egress (binary d0930bd5…), DIRECT-bound to the caller tensor
-    # (float32, contiguous, 33<=numel<=64, device layout (2,32), identity map),
+    # (float32, contiguous, numel==64, device layout (2,32), identity map),
     # with ZERO host round trip. For every other caller (non-identity (from_,to),
-    # non-fp32, non-contiguous / non-(2,32), and numel<=32 whose device scratch
+    # non-fp32, non-contiguous / non-(2,32), and 1<=numel<=63 whose device scratch
     # path is f32-blocked) it returns False and the caller takes TODAY's host-map
     # path below — device bits still come from the device, but with a round trip;
     # this is an optimisation of the common case, NOT a narrowing (doc 54 §4.1).

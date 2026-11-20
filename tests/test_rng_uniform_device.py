@@ -27,13 +27,13 @@ Two tiers:
 The P5 route (``route_uniform_fill`` -> ``launch_uniform_draw``) writes the
 silicon-witnessed 2-stick UNIFORM egress straight into the caller tensor with
 zero host round trip, for the direct cell — float32, contiguous, identity
-``[0, 1)``, device layout ``(2,32)``, i.e. ``33 <= numel <= 64`` (doc 54 v5).
-A ``(2,32)`` scratch + device→device copy would cover ``numel <= 32`` but the
-f32 d2d copy is refused on 1p0 (pointer-grain gate), so those callers fall back
-to the host map. Every other caller (1..32, non-identity bounds, non-fp32,
-non-contiguous) also falls back; only ``numel > 64`` refuses. The pure binding
-rule, the route refusals, and the uniform binary digest are host-testable and
-run in the OFFLINE tier below.
+``[0, 1)``, device layout ``(2,32)``, ``numel == 64`` (the extent-exact cell;
+doc 54 v7/v8). A ``(2,32)`` scratch + device→device copy would cover the other
+callers but the f32 d2d copy is refused on 1p0 (pointer-grain gate), so
+``1..63`` along with non-identity bounds / non-fp32 / non-contiguous fall back
+to the unchanged host map, byte-identically; only ``numel > 64`` refuses. The
+pure binding rule, the route refusals, and the uniform binary digest are
+host-testable and run in the OFFLINE tier below.
 """
 
 import numpy as np
@@ -218,23 +218,19 @@ def test_uniform_strided_behaves_as_today(device_rng_on):
     assert (v >= 0.0).all() and (v < 1.0).all()
 
 
-@pytest.mark.parametrize("n", [64, 33], ids=["numel64", "numel33"])
 @device_only
-def test_uniform_direct_bind_stream_identical_to_host_map(device_rng_on, n):
-    """§4.3 stream contract: the DIRECT device bind yields the SAME stream as
-    today's host map — proving the device stick order == the host concatenation
-    order (a wrong order would pass a range check and still be wrong).
-
-    Parametrized over BOTH ends of the direct cell (numel=64 and numel=33), each
-    its own independent witness (doc 54 §4.1: numel=33 does not inherit
-    numel=64's credibility)."""
+def test_uniform_direct_bind_stream_identical_to_host_map(device_rng_on):
+    """§4.3 stream contract: the DIRECT device bind (numel=64) yields the SAME
+    stream as today's host map — proving the device stick order == the host
+    concatenation order (a wrong order would pass a range check and still be
+    wrong)."""
     spyre = getattr(torch, "spyre")
     spyre.manual_seed(99)
-    a = torch.empty(n, dtype=torch.float32, device="spyre")
+    a = torch.empty(64, dtype=torch.float32, device="spyre")
     a.uniform_()  # direct device bind
     got = a.cpu().numpy()
     spyre.manual_seed(99)
-    exp = np.asarray(hr.route_uniform_draw(0.0, 1.0, n), dtype=np.float32)
+    exp = np.asarray(hr.route_uniform_draw(0.0, 1.0, 64), dtype=np.float32)
     np.testing.assert_array_equal(got.view(np.uint32), exp.view(np.uint32))
 
 
@@ -252,10 +248,14 @@ def test_select_uniform_binding_direct_and_fallback():
 
     kw = dict(from_=0.0, to=1.0, is_float32=True, is_contiguous=True)
     assert _select_uniform_binding(numel=0, device_size=(0,), **kw) == "empty"
-    # DIRECT for the whole (2,32) two-stick cell (1-D 33..64).
-    for n in (33, 63, 64):
-        assert _select_uniform_binding(numel=n, device_size=(2, 32), **kw) == "direct"
-    # 1..32 is a (1,32) one-stick allocation -> host path (cannot host 2 sticks).
+    # DIRECT only at numel==64 on a dense (2,32) layout (extent-exact).
+    assert _select_uniform_binding(numel=64, device_size=(2, 32), **kw) == "direct"
+    # 33..63 is allocation-safe (two sticks) but NOT extent-exact -> fallback.
+    for n in (33, 63):
+        assert _select_uniform_binding(numel=n, device_size=(2, 32), **kw) == (
+            "fallback"
+        )
+    # 1..32 is a (1,32) one-stick allocation -> host path (scratch f32-blocked).
     for n in (1, 32):
         assert _select_uniform_binding(numel=n, device_size=(1, 32), **kw) == (
             "fallback"
@@ -370,10 +370,11 @@ def test_uniform_binary_digest_matches_the_silicon_witness():
     "make, from_, to",
     [
         (lambda: torch.empty(32, dtype=torch.float32, device="spyre"), 0.0, 1.0),
+        (lambda: torch.empty(63, dtype=torch.float32, device="spyre"), 0.0, 1.0),
         (lambda: torch.empty(64, dtype=torch.float32, device="spyre"), 0.0, 2.0),
         (lambda: torch.empty(32, dtype=torch.float16, device="spyre"), 0.0, 1.0),
     ],
-    ids=["numel32", "affine_0_2", "fp16_32"],
+    ids=["numel32", "numel63", "affine_0_2", "fp16_32"],
 )
 @device_only
 def test_fallback_stream_identical_to_route_uniform_draw(
