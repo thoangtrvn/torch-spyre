@@ -1230,6 +1230,17 @@ class SpyreRngResources:
         res = self._residents.get(_device_index(device))
         return res is not None and res.device_tensor is not None
 
+    def stream_index(self) -> int:
+        """The RNG stream every resident buffer in this instance is built with.
+
+        Named ``stream_index`` (not ``stream``) to avoid confusion with
+        ``_DeviceResident.stream``, which is the stream WORDS tuple. The
+        resident invalidation key is (seed, epoch, base_counter) and carries no
+        stream index, so a single instance can only honour one stream at a time;
+        a caller needing per-stream residency creates one instance per stream.
+        """
+        return self._stream
+
     def reflected(self, device=None) -> "RngDrawSpec | None":
         """The ``(seed, epoch, base_counter)`` the resident buffer reflects."""
         res = self._residents.get(_device_index(device))
@@ -1363,6 +1374,13 @@ class RngLaunchPlan:
     #: The draw spec this plan was derived from (Option 1 residency). ``None`` on
     #: a hand-built plan; the launcher then falls back to the baked-in params.
     spec: "RngDrawSpec | None" = None
+    #: The RNG stream this plan was built for. Carried so the launcher can hold
+    #: the resident path honest: the resident buffer belongs to
+    #: ``SpyreRngResources`` and is keyed by (seed, epoch, base_counter), which
+    #: carries no stream index. A resident launch of a plan whose stream differs
+    #: from the resources' stream would silently ship the resource's words, so
+    #: the launcher refuses typed instead.
+    stream: int = 0
 
 
 def build_rng_launch_plan(
@@ -1440,8 +1458,9 @@ def build_rng_launch_plan(
                 "RngDrawSpec carries no stream index, so the resident key would "
                 f"silently serve stream-0 params for a stream-{stream} request. "
                 "A nonzero stream requires launching with use_resident=False "
-                "(until the launcher honours plan.stream / a stream key exists), "
-                "or a separate resources key per stream."
+                "(the launcher also refuses a resident launch whose plan.stream "
+                "differs from the resources' stream), or a separate resources "
+                "key per stream."
             )
         # Resident path: the launcher reads the device tensor, so build only the
         # declared ABI — no params words. Shape derives from the LOCAL
@@ -1472,6 +1491,7 @@ def build_rng_launch_plan(
         declared_segment_count=2,
         output_sticks=band_egress_stick_count(RNG_KAT_ROUNDS, egress=egress),
         spec=spec,
+        stream=int(stream),
     )
 
 
@@ -1710,6 +1730,13 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     tensor against the plan's DECLARED ``(sticks, lanes)``; forcing
     ``use_resident=False`` on it refuses typed rather than launching an empty
     params tensor.
+
+    STREAM IDENTITY: the resident buffer is built with the RESOURCE's stream,
+    and its invalidation key (seed, epoch, base_counter) carries no stream
+    index. When the resident branch is taken and ``plan.stream`` differs from
+    :meth:`SpyreRngResources.stream_index`, this refuses ``SpyreRngError``
+    rather than silently launching the resource's words and discarding
+    ``plan.params``. ``stream == 0`` (every production caller) is unaffected.
     """
     import torch
 
@@ -1724,7 +1751,22 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     dev = torch.device("spyre") if device is None else device
     if use_resident is not False and plan.spec is not None:
         # Resident DEVICE tensor: no per-draw full re-materialization.
-        params = get_rng_resources().ensure_device_params(plan.spec, dev)
+        resources = get_rng_resources()
+        # The resident buffer is built with the RESOURCE's own stream, and the
+        # resident invalidation key (seed, epoch, base_counter) carries no
+        # stream index. A plan built for a different stream would silently ship
+        # the resource's words and discard ``plan.params`` -- refuse typed.
+        if plan.stream != resources.stream_index():
+            raise SpyreRngError(
+                f"resident launch cannot honour stream {plan.stream}: this "
+                f"device's resident params buffer is built with the resource's "
+                f"stream {resources.stream_index()}, and the resident key "
+                "(seed, epoch, base_counter) carries no stream index. Remedy: "
+                "launch with use_resident=False to use this plan's own "
+                f"stream-{plan.stream} params, or keep a separate "
+                "SpyreRngResources per stream (the multi-generator direction)."
+            )
+        params = resources.ensure_device_params(plan.spec, dev)
         # Validate against the plan's DECLARED ABI (sticks, lanes), not the
         # words: a resident-only plan (``params is None``) declares them from
         # the local band-count mirror (drift-guarded vs the codegen owner) so
