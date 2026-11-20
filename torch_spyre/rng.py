@@ -1542,17 +1542,19 @@ _RNG_MAX_UNIFORM_ELEMS = 2 * RNG_KAT_LANES
 #: and witnessed, so the clean single-launch tile-loop ceiling is 255. Mirrors
 #: ``sentient_codegen.scheduler.rng._RNG_TILE_LOOP_MAX``.
 _RNG_TILE_LOOP_MAX = 255
-#: Silicon-witnessed head of the device tile loop (UNIFORM egress). 1/2/4/16
-#: tiles (numel 64/128/256/1024) read back bit-exact vs host ``threefry2x32_20``
-#: on 2026-11-20 (claims rng-multitile-{2,4,16}tile — the same witnessed binaries
-#: the codegen route emits). The loop body is tile-invariant and its only
-#: per-tile variables (counter +1, egress stride 2n) are linear, so ANY width
-#: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind; the
-#: deepest witnessed count exercises the mechanism. A width above this head (or
-#: above the ISA bound) refuses typed — no unwitnessed width is routed. Step this
-#: up as wider counts are silicon-witnessed (next: 64/128/255). Mirrors
+#: Silicon-witnessed head of the device tile loop (UNIFORM egress). 2/4/16/32/63
+#: tiles read back bit-exact vs host ``threefry2x32_20`` on 2026-11-20 (claims
+#: rng-multitile-{2,4,16,32,63}tile — the same witnessed binaries the codegen
+#: route emits). The loop body is tile-invariant and its only per-tile variables
+#: (counter +1, egress stride 2n) are linear, so ANY width
+#: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind. 63 is ALSO
+#: the hard LX block-load ceiling: 64 tiles' params (16448 sticks) overflow the
+#: 2 MB / 16384-stick LX scratchpad, the block load wraps, and the leading tiles
+#: come back garbage (witnessed at 64/128/255 — bit-exact at 63). So the width
+#: ceiling and the witness head coincide; going beyond needs per-tile params
+#: streaming (not built), NOT another witness. Mirrors
 #: ``sentient_codegen.scheduler.rng._RNG_WITNESSED_UNIFORM_TILES_MAX``.
-_RNG_WITNESSED_UNIFORM_TILES_MAX = 16
+_RNG_WITNESSED_UNIFORM_TILES_MAX = 63
 #: The widest tile count a route will admit now: the witness head, clamped to the
 #: ISA trip bound.
 _RNG_UNIFORM_TILES_CAP = min(_RNG_WITNESSED_UNIFORM_TILES_MAX, _RNG_TILE_LOOP_MAX)
