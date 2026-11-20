@@ -229,7 +229,15 @@ def band_lxlu_pop_count(
     setup_staging: SetupStaging = SetupStaging.LXLU,
     egress: EgressMode = EgressMode.UNIFORM,
 ) -> int:
-    """LXLU sticks per tile (the reference count law). 251 for RAW_STATE@20."""
+    """LXLU sticks per tile. 251 for RAW_STATE@20.
+
+    LOCAL MIRROR, not the codegen owner: this is hand-derived from the
+    ``BAND_*_SLOTS`` tuples above (the line 184 note), which mirror the codegen
+    slot vocabulary. The codegen owner is
+    ``sentient_codegen.emulator.threefry_recipe_model.band_lxlu_pop_count``;
+    ``tests/test_rng_host.py::test_local_band_counts_mirror_the_codegen_owner``
+    guards against drift when codegen is importable.
+    """
     prologue = (
         BAND_SETUP_SLOTS + BAND_CORE_PROLOGUE_SLOTS
         if setup_staging is SetupStaging.LXLU
@@ -247,7 +255,12 @@ def band_egress_stick_count(
     setup_staging: SetupStaging = SetupStaging.LXLU,
     egress: EgressMode = EgressMode.UNIFORM,
 ) -> int:
-    """The LX egress sticks the band recipe writes: 2 (uniform) / 4 (raw)."""
+    """The LX egress sticks the band recipe writes: 2 (uniform) / 4 (raw).
+
+    LOCAL MIRROR of the codegen egress size, not the codegen owner
+    (``sentient_codegen.emulator.threefry_recipe_model.band_egress_stick_count``);
+    the same drift-guard test asserts parity when codegen is importable.
+    """
     del rounds, setup_staging  # the egress size is a constant of the mode
     return 2 if egress is EgressMode.UNIFORM else 4
 
@@ -1205,6 +1218,18 @@ class SpyreRngResources:
 
     # -- observability -------------------------------------------------------
 
+    def has_device_resident(self, device=None) -> bool:
+        """True iff a DEVICE params tensor already exists for ``device``.
+
+        This is the residency-state query ``build_rng_launch_plan`` consults to
+        decide whether the full params words can be skipped (design note §3.1):
+        when a resident tensor exists the launcher's resident branch reads it,
+        so a per-draw plan needs only the declared ABI. A cold cache returns
+        ``False`` and the plan is built in full, byte-identical to before.
+        """
+        res = self._residents.get(_device_index(device))
+        return res is not None and res.device_tensor is not None
+
     def reflected(self, device=None) -> "RngDrawSpec | None":
         """The ``(seed, epoch, base_counter)`` the resident buffer reflects."""
         res = self._residents.get(_device_index(device))
@@ -1313,10 +1338,18 @@ class RngLaunchPlan:
     This is a PLAN. It carries everything the launcher needs (the 251-stick
     params array, the 2-segment ABI, the raw-egress reconstruction rule) but
     does NOT launch — that is the integration step, after lane B registers.
+
+    A RESIDENT-ONLY plan (``params is None``) omits the words because they are
+    already resident on the device: it still declares the full ABI so the
+    launcher can validate the resident tensor's shape, and it refuses a forced
+    full upload (``use_resident=False``) rather than launching an empty params.
     """
 
     #: (sticks, lanes) uint32 params array in recipe order (251 x 32 for raw).
-    params: np.ndarray
+    #: ``None`` on a RESIDENT-ONLY plan: the words are already resident on the
+    #: device (``SpyreRngResources``), so the plan carries only the declared
+    #: ABI (``sticks``/``lanes``/...) and the launcher reads the resident tensor.
+    params: "np.ndarray | None"
     #: Egress mode this stream was built for (raw-state is the witnessed one).
     egress: EgressMode
     sticks: int
@@ -1340,6 +1373,7 @@ def build_rng_launch_plan(
     device: int = 0,
     stream: int = 0,
     egress: EgressMode = EgressMode.RAW_STATE,
+    resident: bool = False,
 ) -> RngLaunchPlan:
     """Build the T=1 params stream + ABI, refusing every unwired path, typed.
 
@@ -1355,6 +1389,18 @@ def build_rng_launch_plan(
     When all guards pass (only possible after lane B registers AND for the
     raw-state egress), the returned plan is still just a plan — the launcher is
     the integration step.
+
+    ``resident=True`` (design note §3.1) skips the full params-stream build when
+    a DEVICE resident buffer already exists for ``device``: the launcher takes
+    the resident branch and reads that tensor, so materialising the 251 sticks
+    here would only be discarded. Such a plan carries ``params=None`` but the
+    same declared ABI (``sticks`` from the LOCAL ``band_lxlu_pop_count`` mirror
+    — drift-guarded against the codegen owner — and ``lanes`` from
+    ``RNG_KAT_LANES``, not hardcoded). On a COLD cache — no resident buffer —
+    this falls back to the
+    ordinary full build, so the default (and cold) path is byte-identical to
+    the pre-residency behaviour. ``draw_raw_state`` opts in; every other caller
+    keeps the default ``resident=False``.
     """
     if not isinstance(egress, EgressMode):
         raise TypeError(f"egress must be an EgressMode, got {egress!r}")
@@ -1382,25 +1428,50 @@ def build_rng_launch_plan(
             "uniform_/normal_ kernels remain the documented host-CPU offload "
             "until registration + integration land."
         )
-    params_stream = draw_params_stream(
-        seed=seed,
-        offset=offset,
-        rounds=RNG_KAT_ROUNDS,
-        device=device,
-        stream=stream,
-        egress=egress,
-    )
-    params = stream_to_sticks(params_stream)
+    spec = RngDrawSpec.from_seed_offset(seed, offset)
+    if resident and get_rng_resources().has_device_resident(device):
+        if stream != 0:
+            # Silent-wrong guard: RngDrawSpec does NOT carry ``stream``, so the
+            # resident invalidation key cannot distinguish stream 0 from stream
+            # N. Skipping the build here would serve the resource's own stream-0
+            # bytes for a stream-N request. Refuse typed instead.
+            raise SpyreRngError(
+                "resident plan construction cannot honour a nonzero stream: "
+                "RngDrawSpec carries no stream index, so the resident key would "
+                f"silently serve stream-0 params for a stream-{stream} request. "
+                "A nonzero stream requires launching with use_resident=False "
+                "(until the launcher honours plan.stream / a stream key exists), "
+                "or a separate resources key per stream."
+            )
+        # Resident path: the launcher reads the device tensor, so build only the
+        # declared ABI — no params words. Shape derives from the LOCAL
+        # ``band_lxlu_pop_count`` mirror (== the stream length; drift-guarded
+        # against the codegen owner in test_rng_host) and the lane constant.
+        params = None
+        sticks = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=egress)
+        lanes = RNG_KAT_LANES
+    else:
+        params_stream = draw_params_stream(
+            seed=seed,
+            offset=offset,
+            rounds=RNG_KAT_ROUNDS,
+            device=device,
+            stream=stream,
+            egress=egress,
+        )
+        params = stream_to_sticks(params_stream)
+        sticks = int(params.shape[0])
+        lanes = int(params.shape[1])
     return RngLaunchPlan(
         params=params,
         egress=egress,
-        sticks=int(params.shape[0]),
-        lanes=int(params.shape[1]),
+        sticks=sticks,
+        lanes=lanes,
         rounds=RNG_KAT_ROUNDS,
         xlat_segments={"input": 0, "output": 1},
         declared_segment_count=2,
         output_sticks=band_egress_stick_count(RNG_KAT_ROUNDS, egress=egress),
-        spec=RngDrawSpec.from_seed_offset(seed, offset),
+        spec=spec,
     )
 
 
@@ -1633,6 +1704,12 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     identical to the per-draw full-upload path, so this never changes the
     draw's result. ``use_resident=False`` forces the baked-in ``plan.params``
     and the old per-draw full upload (the pre-Option-1 behavior).
+
+    A resident-only plan (``plan.params is None``, built with
+    ``build_rng_launch_plan(..., resident=True)``) still validates the resident
+    tensor against the plan's DECLARED ``(sticks, lanes)``; forcing
+    ``use_resident=False`` on it refuses typed rather than launching an empty
+    params tensor.
     """
     import torch
 
@@ -1648,13 +1725,23 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
     if use_resident is not False and plan.spec is not None:
         # Resident DEVICE tensor: no per-draw full re-materialization.
         params = get_rng_resources().ensure_device_params(plan.spec, dev)
-        if params.shape != plan.params.shape:
+        # Validate against the plan's DECLARED ABI (sticks, lanes), not the
+        # words: a resident-only plan (``params is None``) declares them from
+        # the local band-count mirror (drift-guarded vs the codegen owner) so
+        # the shape contract still holds.
+        if params.shape != (plan.sticks, plan.lanes):
             raise SpyreRngError(
                 "resident params shape "
-                f"{tuple(params.shape)} disagrees with the plan's "
-                f"{tuple(plan.params.shape)}; refusing a mid-stream device buffer"
+                f"{tuple(params.shape)} disagrees with the plan's declared "
+                f"{(plan.sticks, plan.lanes)}; refusing a mid-stream device buffer"
             )
     else:
+        if plan.params is None:
+            raise SpyreRngError(
+                "this launch plan is resident-only (no params words were built); "
+                "use_resident=False needs the full params array. Rebuild with "
+                "build_rng_launch_plan(..., resident=False)."
+            )
         # Recipe order (the launcher's device-word-order / swizzle concern, not
         # the builder's). int32 holds the same 32-bit words, byte for byte.
         params = torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(
@@ -1726,5 +1813,9 @@ def draw_raw_state(seed: int, offset: int = 0, *, device=None):
         offset=offset,
         device=_device_index(device),
         egress=EgressMode.RAW_STATE,
+        # The launcher reads the device-resident params when one exists, so do
+        # not materialise the words here (design note §3.1); a cold cache still
+        # builds them in full inside the builder.
+        resident=True,
     )
     return reconstruct_raw_state_from_tensor(launch_raw_state_draw(plan, device=device))

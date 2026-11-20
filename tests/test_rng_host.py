@@ -364,3 +364,29 @@ def test_uniform_refuses_a_per_call_generator_on_the_device_path(monkeypatch):
     assert "generator" in str(excinfo.value).lower()
     # A missing generator is allowed (no-op).
     assert _reject_per_call_generator(None) is None
+
+
+def test_local_band_counts_mirror_the_codegen_owner():
+    """Drift guard: the LOCAL band-count mirrors equal the codegen owners.
+
+    ``torch_spyre.rng.band_lxlu_pop_count`` / ``band_egress_stick_count`` are
+    local mirrors hand-derived from the ``BAND_*_SLOTS`` tuples, NOT the codegen
+    owner. When codegen is importable, assert the mirror equals
+    ``sentient_codegen.emulator.threefry_recipe_model``; skip with a clear
+    reason when it is absent (this file has no module-level codegen import).
+    """
+    try:
+        from sentient_codegen.emulator import threefry_recipe_model as rm
+    except Exception:
+        pytest.skip(
+            "sentient_codegen not importable (source env.sh) — local band-count "
+            "mirror vs codegen owner not checked here"
+        )
+    for egress in (hr.EgressMode.RAW_STATE, hr.EgressMode.UNIFORM):
+        cg_egress = hr._to_codegen_egress(egress)
+        assert hr.band_lxlu_pop_count(_ROUNDS, egress=egress) == (
+            rm.band_lxlu_pop_count(_ROUNDS, egress=cg_egress)
+        ), f"band_lxlu_pop_count drift for {egress!r}"
+        assert hr.band_egress_stick_count(_ROUNDS, egress=egress) == (
+            rm.band_egress_stick_count(_ROUNDS, egress=cg_egress)
+        ), f"band_egress_stick_count drift for {egress!r}"
