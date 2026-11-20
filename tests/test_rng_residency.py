@@ -522,3 +522,163 @@ def test_without_patch_owner_device_advance_uploads_and_is_marked(monkeypatch):
     np.testing.assert_array_equal(
         np.asarray(bridge.to_host(tensor)), _reference_params(5, 64)
     )
+
+
+# ---------------------------------------------------------------------------
+# Resident-path plan construction (design note §3.1): with a valid resident
+# device buffer, build the plan's ABI WITHOUT materialising the 251-stick
+# params words. The cold-cache / non-resident path stays byte-identical.
+# ---------------------------------------------------------------------------
+
+
+def _prime_device_resident(res, spec, device=0):
+    """Prime a valid DEVICE resident through the offline fake bridge."""
+    res.ensure_device_params(spec, device)
+
+
+def test_resident_plan_skips_the_full_params_stream_build(monkeypatch):
+    """RED on the base: today the plan build calls ``draw_params_stream`` even
+    when a resident device buffer is valid; with the resident path it must not.
+    """
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    seed = 0xC0FFEE
+    _prime_device_resident(hr.get_rng_resources(), _spec(seed, 0))
+
+    calls = []
+    real = hr.draw_params_stream
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(hr, "draw_params_stream", spy)
+
+    # NON-RESIDENT PATH IS UNCHANGED: a default plan still builds the words
+    # (this is the byte-for-byte cold-cache behaviour).
+    cold = hr.build_rng_launch_plan(seed=seed, offset=0, egress=hr.EgressMode.RAW_STATE)
+    assert cold.params is not None
+    assert cold.params.shape == (_FULL_STICKS, _LANES)
+    assert len(calls) == 1, "the default plan build must still materialise params"
+
+    # RESIDENT PATH: a valid resident means the words are already on device.
+    plan = hr.build_rng_launch_plan(
+        seed=seed, offset=64, egress=hr.EgressMode.RAW_STATE, resident=True
+    )
+    assert len(calls) == 1, (
+        "a resident plan must NOT build the params words "
+        f"(draw_params_stream was called {len(calls)} times)"
+    )
+    assert plan.params is None
+
+    # The ABI is still declared honestly, derived from the owners/constants.
+    assert plan.sticks == _FULL_STICKS
+    assert plan.sticks == hr.band_lxlu_pop_count(
+        _ROUNDS, egress=hr.EgressMode.RAW_STATE
+    )
+    assert plan.lanes == _LANES
+    assert plan.output_sticks == 4
+    assert plan.egress is hr.EgressMode.RAW_STATE
+    assert plan.xlat_segments == {"input": 0, "output": 1}
+    assert plan.declared_segment_count == 2
+    assert plan.spec == _spec(seed, 64)
+
+
+def test_resident_plan_falls_back_to_full_build_on_a_cold_cache(monkeypatch):
+    """``resident=True`` with NO resident buffer -> the full (cold) build."""
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    calls = []
+    real = hr.draw_params_stream
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(hr, "draw_params_stream", spy)
+    plan = hr.build_rng_launch_plan(
+        seed=1, offset=0, egress=hr.EgressMode.RAW_STATE, resident=True
+    )
+    assert len(calls) == 1, "a cold cache must still build the words"
+    assert plan.params is not None and plan.params.shape == (_FULL_STICKS, _LANES)
+    np.testing.assert_array_equal(plan.params, _reference_params(1, 0))
+
+
+def test_resident_launched_bytes_match_todays_full_build_across_sweep(monkeypatch):
+    """EQUIVALENCE: the params bytes the resident path actually sends to the
+    device are identical to today's per-draw full-upload plan.
+
+    The sweep covers BOTH branches of the residency invalidation contract:
+    * same seed + epoch, advancing ``base_counter`` -> the 3-row PATCH branch;
+    * seed change and epoch rollover -> the FULL-REBUILD branch.
+    """
+    hr.reset_rng_resources()
+    bridge = _FakeDeviceBridge()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=bridge)
+    )
+    seed = 0xC0FFEE
+    other = 0x5EED
+    sweep = [
+        (seed, 0),  # cold: full upload
+        (seed, 1),  # patch
+        (seed, 64),  # patch
+        (seed, 4096),  # patch
+        (other, 4096),  # seed change -> full rebuild
+        (other, 4097),  # patch
+        (other, _EPOCH),  # epoch rollover -> full rebuild
+        (other, _EPOCH + 64),  # patch
+    ]
+    for s, off in sweep:
+        # TODAY'S PATH: default plan carries the full 251-stick words.
+        today = hr.build_rng_launch_plan(
+            seed=s, offset=off, egress=hr.EgressMode.RAW_STATE
+        )
+        assert today.params is not None
+        np.testing.assert_array_equal(today.params, _reference_params(s, off))
+
+        # NEW PATH: resident-aware plan (words skipped when a resident is valid),
+        # then exactly the device update the launcher performs.
+        plan = hr.build_rng_launch_plan(
+            seed=s, offset=off, egress=hr.EgressMode.RAW_STATE, resident=True
+        )
+        tensor = hr.get_rng_resources().ensure_device_params(_spec(s, off), 0)
+        launched = np.asarray(bridge.to_host(tensor))
+
+        # What is compared: the bytes in the resident device tensor (what the
+        # kernel reads) vs today's plan.params (what the old full upload sent)
+        # vs an independent full codegen rebuild.
+        np.testing.assert_array_equal(
+            launched, today.params, err_msg=f"spec={_spec(s, off)}"
+        )
+        np.testing.assert_array_equal(
+            launched, _reference_params(s, off), err_msg=f"spec={_spec(s, off)}"
+        )
+
+        if plan.params is not None:  # only the cold first draw carries words
+            np.testing.assert_array_equal(plan.params, today.params)
+        else:
+            assert (plan.sticks, plan.lanes) == today.params.shape
+
+
+def test_resident_only_plan_refuses_forced_full_upload(monkeypatch):
+    """A plan built without words cannot satisfy ``use_resident=False``: it
+    refuses typed rather than launching an empty params tensor."""
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    monkeypatch.setattr(hr, "build_rng_kat_binary", lambda target=None: (b"", None))
+    _prime_device_resident(hr.get_rng_resources(), _spec(7, 0))
+    plan = hr.build_rng_launch_plan(
+        seed=7, offset=64, egress=hr.EgressMode.RAW_STATE, resident=True
+    )
+    assert plan.params is None
+    with pytest.raises(hr.SpyreRngError) as excinfo:
+        hr.launch_raw_state_draw(plan, use_resident=False)
+    msg = str(excinfo.value).lower()
+    assert "resident-only" in msg or "params" in msg
