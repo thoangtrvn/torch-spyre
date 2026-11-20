@@ -537,8 +537,16 @@ def _prime_device_resident(res, spec, device=0):
 
 
 def test_resident_plan_skips_the_full_params_stream_build(monkeypatch):
-    """RED on the base: today the plan build calls ``draw_params_stream`` even
-    when a resident device buffer is valid; with the resident path it must not.
+    """The resident path must not build the params words.
+
+    TRUE RED CAUSE on base f06e4f35: this test fails at ``resident=True`` with
+    ``TypeError: build_rng_launch_plan() got an unexpected keyword argument
+    'resident'`` (the kwarg did not exist), NOT at the spy assertion. The
+    defect-class evidence — that the base plan build DOES call
+    ``draw_params_stream`` once while a device resident is valid — is the
+    standalone probe ``receipts/rng-resident-plan/red_probe_base.py`` (prints
+    "calls ...: 1"). The spy half below re-checks the counter in-tree after
+    the change; it is not weakened.
     """
     hr.reset_rng_resources()
     monkeypatch.setattr(
@@ -682,3 +690,43 @@ def test_resident_only_plan_refuses_forced_full_upload(monkeypatch):
         hr.launch_raw_state_draw(plan, use_resident=False)
     msg = str(excinfo.value).lower()
     assert "resident-only" in msg or "params" in msg
+
+
+def test_resident_plan_refuses_nonzero_stream_typed(monkeypatch):
+    """A nonzero ``stream`` cannot be honoured on the resident-only path.
+
+    ``RngDrawSpec`` carries no stream index, so the resident key cannot
+    distinguish stream 0 from stream N; a resident plan must REFUSE typed rather
+    than silently serve the resource's stream-0 bytes. (No caller passes nonzero
+    today; this pins the silent-wrong guard.)
+    """
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    _prime_device_resident(hr.get_rng_resources(), _spec(3, 0))
+
+    with pytest.raises(hr.SpyreRngError) as excinfo:
+        hr.build_rng_launch_plan(
+            seed=3,
+            offset=64,
+            stream=1,
+            egress=hr.EgressMode.RAW_STATE,
+            resident=True,
+        )
+    assert "stream" in str(excinfo.value).lower()
+
+
+def test_resident_plan_stream_zero_is_still_accepted(monkeypatch):
+    """The default stream (0) is unaffected by the nonzero-stream guard."""
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    _prime_device_resident(hr.get_rng_resources(), _spec(3, 0))
+
+    plan = hr.build_rng_launch_plan(
+        seed=3, offset=64, stream=0, egress=hr.EgressMode.RAW_STATE, resident=True
+    )
+    assert plan.params is None
+    assert (plan.sticks, plan.lanes) == (_FULL_STICKS, _LANES)

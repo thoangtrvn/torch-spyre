@@ -229,7 +229,15 @@ def band_lxlu_pop_count(
     setup_staging: SetupStaging = SetupStaging.LXLU,
     egress: EgressMode = EgressMode.UNIFORM,
 ) -> int:
-    """LXLU sticks per tile (the reference count law). 251 for RAW_STATE@20."""
+    """LXLU sticks per tile. 251 for RAW_STATE@20.
+
+    LOCAL MIRROR, not the codegen owner: this is hand-derived from the
+    ``BAND_*_SLOTS`` tuples above (the line 184 note), which mirror the codegen
+    slot vocabulary. The codegen owner is
+    ``sentient_codegen.emulator.threefry_recipe_model.band_lxlu_pop_count``;
+    ``tests/test_rng_host.py::test_local_band_counts_mirror_the_codegen_owner``
+    guards against drift when codegen is importable.
+    """
     prologue = (
         BAND_SETUP_SLOTS + BAND_CORE_PROLOGUE_SLOTS
         if setup_staging is SetupStaging.LXLU
@@ -247,7 +255,12 @@ def band_egress_stick_count(
     setup_staging: SetupStaging = SetupStaging.LXLU,
     egress: EgressMode = EgressMode.UNIFORM,
 ) -> int:
-    """The LX egress sticks the band recipe writes: 2 (uniform) / 4 (raw)."""
+    """The LX egress sticks the band recipe writes: 2 (uniform) / 4 (raw).
+
+    LOCAL MIRROR of the codegen egress size, not the codegen owner
+    (``sentient_codegen.emulator.threefry_recipe_model.band_egress_stick_count``);
+    the same drift-guard test asserts parity when codegen is importable.
+    """
     del rounds, setup_staging  # the egress size is a constant of the mode
     return 2 if egress is EgressMode.UNIFORM else 4
 
@@ -1381,8 +1394,10 @@ def build_rng_launch_plan(
     a DEVICE resident buffer already exists for ``device``: the launcher takes
     the resident branch and reads that tensor, so materialising the 251 sticks
     here would only be discarded. Such a plan carries ``params=None`` but the
-    same declared ABI (``sticks``/``lanes`` derived from the recipe owner, not
-    hardcoded). On a COLD cache — no resident buffer — this falls back to the
+    same declared ABI (``sticks`` from the LOCAL ``band_lxlu_pop_count`` mirror
+    — drift-guarded against the codegen owner — and ``lanes`` from
+    ``RNG_KAT_LANES``, not hardcoded). On a COLD cache — no resident buffer —
+    this falls back to the
     ordinary full build, so the default (and cold) path is byte-identical to
     the pre-residency behaviour. ``draw_raw_state`` opts in; every other caller
     keeps the default ``resident=False``.
@@ -1415,9 +1430,22 @@ def build_rng_launch_plan(
         )
     spec = RngDrawSpec.from_seed_offset(seed, offset)
     if resident and get_rng_resources().has_device_resident(device):
+        if stream != 0:
+            # Silent-wrong guard: RngDrawSpec does NOT carry ``stream``, so the
+            # resident invalidation key cannot distinguish stream 0 from stream
+            # N. Skipping the build here would serve the resource's own stream-0
+            # bytes for a stream-N request. Refuse typed instead.
+            raise SpyreRngError(
+                "resident plan construction cannot honour a nonzero stream: "
+                "RngDrawSpec carries no stream index, so the resident key would "
+                f"silently serve stream-0 params for a stream-{stream} request. "
+                "Use a non-resident draw (resident=False) or a separate "
+                "resources/device key for the desired stream."
+            )
         # Resident path: the launcher reads the device tensor, so build only the
-        # declared ABI — no params words. Shape derives from the recipe owner
-        # (``band_lxlu_pop_count`` == the stream length) and the lane constant.
+        # declared ABI — no params words. Shape derives from the LOCAL
+        # ``band_lxlu_pop_count`` mirror (== the stream length; drift-guarded
+        # against the codegen owner in test_rng_host) and the lane constant.
         params = None
         sticks = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=egress)
         lanes = RNG_KAT_LANES
@@ -1698,7 +1726,8 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
         params = get_rng_resources().ensure_device_params(plan.spec, dev)
         # Validate against the plan's DECLARED ABI (sticks, lanes), not the
         # words: a resident-only plan (``params is None``) declares them from
-        # the recipe owner so the shape contract still holds.
+        # the local band-count mirror (drift-guarded vs the codegen owner) so
+        # the shape contract still holds.
         if params.shape != (plan.sticks, plan.lanes):
             raise SpyreRngError(
                 "resident params shape "
