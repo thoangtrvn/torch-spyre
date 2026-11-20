@@ -1930,16 +1930,25 @@ def _select_uniform_binding(
     * ``"direct"`` — bind the caller tensor itself as segment 1. Only when it is
       float32, contiguous, ``numel == 64`` AND its device layout is exactly the
       2 dense sticks ``(2, 32)`` the egress writes — so the 2-stick store stays
-      inside the allocation.
-    * ``"scratch"`` — write a ``(2, 32)`` fp32 device scratch, then ONE
-      device→device copy of the first ``numel`` elements into the caller. Used
-      for every other allocation-safe contiguous fp32 case (notably
-      ``numel <= 32``, whose 1-stick allocation a 2-stick store would overrun).
+      inside the allocation. This is the ONE silicon-witnessed binding
+      (numel=64, 4/4 seeds, 64/64 words bit-exact — P5 route witness).
 
-    Refuses typed (``SpyreRngError``) for ``numel > 64`` (T-DV-34), a non-fp32
-    dtype (no on-device conversion exists), or a non-contiguous caller (a
-    strided layout silently flattened into the stick layout is the silent-wrong
-    class — the caller must hand a contiguous tensor).
+    Refuses typed (``SpyreRngError``) for:
+
+    * ``numel > 64`` (T-DV-34, one T=1 tile);
+    * a non-fp32 dtype (no on-device conversion; torch_spyre refuses casts);
+    * a non-contiguous caller (a strided layout silently flattened into the
+      stick layout is the silent-wrong class);
+    * **every caller that needs the (2,32) scratch + device→device copy** —
+      notably ``numel <= 32`` (a 1-stick allocation a 2-stick store would
+      overrun), but also any non-``(2,32)`` layout and ``numel in [33,63]``.
+      The copy path is BLOCKED on 1p0: ``copy_from_d2d`` is an Inductor-
+      compiled identity kernel, and an f32 device→device copy is refused by the
+      pointer-grain gate (``SENTIENT-POINTER-ELEMENT-GRAIN-COMPUTE-ONLY-POINTEE``
+      — the f32 pointwise-copy route is unbuilt; witnessed 2026-11-19: full,
+      ``copy_`` and sliced f32 d2d copies all refuse). Refusing typed here is
+      honest: the alternative — a host round trip — is exactly what this route
+      removes, and silently overrunning a 1-stick allocation is worse.
     """
     if numel == 0:
         return "empty"
@@ -1966,7 +1975,20 @@ def _select_uniform_binding(
         )
     if numel == _RNG_MAX_UNIFORM_ELEMS and device_size == (2, RNG_KAT_LANES):
         return "direct"
-    return "scratch"
+    # Everything else needs the (2,32) scratch + a device→device copy, which is
+    # blocked on 1p0 by the unbuilt f32 pointwise-copy route (pointer-grain
+    # gate). Refuse typed rather than overrun a 1-stick allocation (numel<=32)
+    # or host-round-trip the device bits.
+    raise SpyreRngError(
+        f"device uniform_ currently serves only a 64-element float32 caller "
+        f"with a dense (2,32) device layout (the silicon-witnessed direct "
+        f"binding). This caller has numel={numel} (device layout {tuple(device_size) if device_size else None}). "
+        "Smaller/other callers need a (2,32) scratch + one device→device copy, "
+        "but an f32 device→device copy is refused on 1p0 by the unbuilt f32 "
+        "pointwise-copy route (SENTIENT-POINTER-ELEMENT-GRAIN). Draw this size "
+        "on the host (turn off TORCH_SPYRE_DEVICE_RNG), or wait for the f32 "
+        "copy route."
+    )
 
 
 def launch_uniform_draw(
@@ -1975,11 +1997,13 @@ def launch_uniform_draw(
     """Launch the registered T=1 UNIFORM KAT for ``plan`` into ``out``.
 
     Requires a real ``spyre`` device and the flex runtime. Binds the caller
-    tensor ``out`` as segment 1 according to :func:`_select_uniform_binding`
-    (direct 2-stick binding, or a ``(2,32)`` scratch + one device→device copy),
-    with the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
-    round trip of the generated floats. When ``out`` is ``None`` it writes the
-    full ``(2,32)`` egress into a fresh device tensor and returns it.
+    tensor ``out`` as segment 1 per :func:`_select_uniform_binding` — the
+    silicon-witnessed DIRECT 2-stick binding (numel==64, dense (2,32)) — with
+    the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
+    round trip of the generated floats. A caller that would need the scratch +
+    device→device copy refuses typed there (f32 d2d copy is unbuilt on 1p0).
+    When ``out`` is ``None`` it writes the full ``(2,32)`` egress into a fresh
+    device tensor and returns it (no copy needed — the caller owns it).
 
     The kernel egress is the bare ``[0,1)`` fp32 grid ``u = (w>>8)*2**-24``;
     affine scaling is NOT applied here (no on-device affine kernel), so the
@@ -1998,9 +2022,7 @@ def launch_uniform_draw(
     dev = torch.device("spyre") if device is None else device
     params = _resolve_launch_params(plan, dev, use_resident)
 
-    copy_from = None
     if out is None:
-        numel = plan.output_sticks * plan.lanes
         target = torch.empty(
             (plan.output_sticks, plan.lanes), dtype=torch.float32, device=dev
         )
@@ -2010,22 +2032,15 @@ def launch_uniform_draw(
                 "launch_uniform_draw requires a spyre-device caller tensor; got "
                 f"device {out.device!r}. Draw on the host with the switch off."
             )
-        numel = int(out.numel())
         decision = _select_uniform_binding(
-            numel=numel,
+            numel=int(out.numel()),
             is_float32=(out.dtype == torch.float32),
             is_contiguous=out.is_contiguous(),
             device_size=_device_stick_layout(out),
         )
         if decision == "empty":
             return out
-        if decision == "direct":
-            target = out
-        else:  # scratch
-            target = torch.empty(
-                (plan.output_sticks, plan.lanes), dtype=torch.float32, device=dev
-            )
-            copy_from = out
+        target = out  # decision == "direct"
 
     tensors_by_symbol = {
         xlat_plan.symbols[0].symbol_id: params,
@@ -2054,11 +2069,6 @@ def launch_uniform_draw(
     launch_kernel_from_bytes(
         binary, [tensors_by_symbol[s.symbol_id] for s in xlat_plan.symbols]
     )
-    if copy_from is not None:
-        # ONE device→device copy: still zero host round trip. ``[:numel]`` is a
-        # contiguous prefix of the scratch, so the copy stays within bounds.
-        copy_from.view(-1).copy_(target.view(-1)[:numel])
-        return copy_from
     return target
 
 

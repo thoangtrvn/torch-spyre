@@ -195,9 +195,12 @@ def test_uniform_65_refuses_typed(device_rng_on):
 # ---------------------------------------------------------------------------
 
 
-def test_select_uniform_binding_direct_and_scratch():
-    """The 2-stick binding rule: direct only for a dense (2,32) 64-elem caller;
-    every other allocation-safe case takes the scratch + device-copy path."""
+def test_select_uniform_binding_direct_only():
+    """The witnessed binding: direct ONLY for a dense (2,32) 64-element caller.
+
+    Every other caller needs a (2,32) scratch + device→device copy, which is
+    BLOCKED on 1p0 (f32 d2d copy refused by the pointer-grain gate) — so those
+    refuse typed rather than overrun a 1-stick allocation or host-round-trip."""
     from torch_spyre.rng import _select_uniform_binding
 
     kw = dict(is_float32=True, is_contiguous=True)
@@ -205,16 +208,18 @@ def test_select_uniform_binding_direct_and_scratch():
     assert _select_uniform_binding(numel=0, device_size=(0,), **kw) == "empty"
     # numel 64 with the exact (2,32) dense layout binds the caller directly.
     assert _select_uniform_binding(numel=64, device_size=(2, 32), **kw) == "direct"
-    # numel <= 32 allocates ONE stick — a 2-stick store would overrun -> scratch.
-    assert _select_uniform_binding(numel=32, device_size=(1, 32), **kw) == "scratch"
-    assert _select_uniform_binding(numel=1, device_size=(1, 32), **kw) == "scratch"
-    # numel 33..63 is 2 sticks but not the full 64-element direct case -> scratch.
-    assert _select_uniform_binding(numel=33, device_size=(2, 32), **kw) == "scratch"
-    assert _select_uniform_binding(numel=63, device_size=(2, 32), **kw) == "scratch"
-    # A non-(2,32) device layout (e.g. an (8,8) row-padded tensor) -> scratch.
-    assert _select_uniform_binding(numel=64, device_size=(8, 1, 32), **kw) == "scratch"
-    # Unknown layout (None) never guesses direct -> scratch.
-    assert _select_uniform_binding(numel=64, device_size=None, **kw) == "scratch"
+    # Everything else needs the (blocked) scratch+copy path -> typed refusal.
+    for numel, ds in (
+        (32, (1, 32)),  # numel<=32: 1-stick alloc, 2-stick store overruns
+        (1, (1, 32)),
+        (33, (2, 32)),  # 2 sticks but not the witnessed 64-element direct cell
+        (63, (2, 32)),
+        (64, (8, 1, 32)),  # non-(2,32) row-padded layout
+        (64, None),  # unknown layout never guesses direct
+    ):
+        with pytest.raises(hr.SpyreRngError) as e:
+            _select_uniform_binding(numel=numel, device_size=ds, **kw)
+        assert "device" in str(e.value).lower() and "copy" in str(e.value).lower()
 
 
 def test_select_uniform_binding_refuses_typed():
