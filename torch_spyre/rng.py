@@ -1935,20 +1935,24 @@ def _select_uniform_binding(
     * ``"empty"`` — ``numel == 0`` (nothing to write; a no-op).
     * ``"direct"`` — bind the caller tensor itself as segment 1, ZERO host
       round trip. Requires the identity map (``[0,1)``), float32, contiguous,
-      AND a device layout of exactly the 2 dense sticks ``(2, 32)`` the egress
-      writes — a 1-D ``33 <= numel <= 64`` tensor (``device_size == [2,32]``).
-      This is the silicon-witnessed binding.
+      ``numel == 64``, and a device layout of exactly the 2 dense sticks
+      ``(2, 32)`` the egress writes (logical 256 B == the binary's 2-stick
+      write, stick-aligned). This is the extent-EXACT, silicon-witnessed
+      binding. A 33..63 caller is allocation-safe (two sticks physically) but
+      its logical ``numel*4`` extent is not stick-aligned, so the launch-ABI
+      window gate refuses the direct bind — it takes the fallback instead (we do
+      NOT force a padded extent through; this cut binds only the exact cell).
     * ``"fallback"`` — take the EXISTING host-map path (device bits ->
       ``raw_words_to_uniform`` -> ``self.copy_``), unchanged from today. This is
-      the answer for every caller the device scratch path cannot serve without a
-      new refusal (doc 54 §4.1 last rows, §3 option B):
+      the answer for EVERY non-direct caller, with no new refusal (doc 54 §4.1
+      last rows, §5):
 
-        - a non-identity ``(from_, to)`` — the egress writes the bare ``[0,1)``
-          grid and there is no on-device affine kernel; the host map applies it;
+        - a non-identity ``(from_, to)`` — no on-device affine kernel; the host
+          map applies it;
         - non-fp32 — ``spyre__uniform_`` casts on the host today; keep it;
         - non-contiguous / a non-``(2,32)`` device layout (e.g. a 2-D ``(8,8)``
           is EIGHT sticks) — keep today's path;
-        - ``1 <= numel <= 32`` (a ``(1,32)`` one-stick allocation).
+        - ``1 <= numel <= 63`` (one stick, or two sticks but not extent-exact).
 
       The scratch path (a ``(2,32)`` device scratch + one ``copy_from_d2d``) is
       UNAVAILABLE for f32 on 1p0: ``copy_from_d2d`` is an Inductor custom op
@@ -1959,8 +1963,7 @@ def _select_uniform_binding(
       the box 2026-11-19: full ``copy_from_d2d``, full ``copy_`` and sliced
       ``copy_`` all refuse for f32. Doc 54 §3 pre-authorises this fallback:
       option B "is the correct first cut if the scratch path proves
-      unavailable". So ``numel <= 32`` keeps the host round trip rather than a
-      new refusal or a silent overrun.
+      unavailable".
 
     Raises typed (``SpyreRngError``) ONLY for ``numel > 64`` (T-DV-34, one T=1
     tile) — every other case is a device path or the unchanged host path, never
@@ -1981,10 +1984,15 @@ def _select_uniform_binding(
         return "fallback"
     if not is_contiguous:
         return "fallback"
-    if device_size == (2, RNG_KAT_LANES):
+    # Direct bind ONLY at numel == 64 (the extent-EXACT (2,32) cell: logical
+    # nbytes 256 == the binary's 2-stick write, stick-aligned). A 1-D 33..63
+    # caller is allocation-safe (its device allocation is two sticks) but its
+    # LOGICAL byte extent (numel*4) is not stick-aligned, so the launch ABI
+    # window gate refuses the direct bind; and 1..32 is one stick. Both take the
+    # host path. (Passing a padded physical extent to force 33..63 through was
+    # considered and rejected: this cut binds only the extent-exact cell.)
+    if numel == _RNG_MAX_UNIFORM_ELEMS and device_size == (2, RNG_KAT_LANES):
         return "direct"
-    # contiguous fp32 but a (1,32) one-stick allocation (1..32) or some other
-    # layout: the scratch path is f32-blocked -> keep today's host path.
     return "fallback"
 
 
@@ -2054,30 +2062,14 @@ def launch_uniform_draw(
         xlat_plan.symbols[0].symbol_id: params,
         xlat_plan.symbols[1].symbol_id: target,
     }
-
-    def _window_bytes(tensor) -> int:
-        """The tensor's physical allocation bytes.
-
-        A spyre tensor is stick-grade allocated: its device layout product is
-        the physical footprint even when the LOGICAL ``nbytes`` under-reports it
-        (a 33-element fp32 tensor is two 128-byte sticks = 256 B physically, but
-        132 B logically). The launch ABI gate compares the window against the
-        binary's stick-aligned write, so the PHYSICAL footprint is the truthful
-        window (``_C.get_spyre_tensor_layout().device_size`` — the allocation
-        the tensor was shaped from). Falls back to logical bytes when the layout
-        is unknown (the ``out is None`` full-scratch case reports its own)."""
-        logical = int(tensor.element_size() * tensor.nelement())
-        ds = _device_stick_layout(tensor)
-        if ds:
-            prod = 1
-            for v in ds:
-                prod *= int(v)
-            return max(logical, prod * int(tensor.element_size()))
-        return logical
-
+    # Direct bind is extent-exact (numel==64 -> 256 B, stick-aligned), so the
+    # logical nbytes IS the window the ABI gate needs.
     specs = {
         sym.symbol_id: (
-            _window_bytes(tensors_by_symbol[sym.symbol_id]),
+            int(
+                tensors_by_symbol[sym.symbol_id].element_size()
+                * tensors_by_symbol[sym.symbol_id].nelement()
+            ),
             "input" if sym.access_mode == "read" else "output",
         )
         for sym in xlat_plan.symbols
@@ -2103,7 +2095,7 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
 
     Returns ``True`` when the fill was performed ON DEVICE (zero host round
     trip, direct-bind): the caller tensor is float32, contiguous, its device
-    layout is exactly ``(2,32)`` (a 1-D ``33 <= numel <= 64``), and the map is
+    layout is exactly ``(2,32)`` (a 1-D ``numel == 64``), and the map is
     the identity ``[0,1)``. Returns ``False`` when the caller must take the
     EXISTING host-map path — every other case (non-identity ``(from_, to)``,
     non-fp32, non-contiguous / non-``(2,32)``, and ``numel <= 32`` whose scratch

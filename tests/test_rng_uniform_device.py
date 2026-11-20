@@ -243,9 +243,13 @@ def test_select_uniform_binding_direct_and_fallback():
 
     kw = dict(from_=0.0, to=1.0, is_float32=True, is_contiguous=True)
     assert _select_uniform_binding(numel=0, device_size=(0,), **kw) == "empty"
-    # 33..64 is a (2,32) two-stick allocation -> direct bind.
-    for n in (33, 63, 64):
-        assert _select_uniform_binding(numel=n, device_size=(2, 32), **kw) == "direct"
+    # DIRECT only at numel==64 on a dense (2,32) layout (extent-exact).
+    assert _select_uniform_binding(numel=64, device_size=(2, 32), **kw) == "direct"
+    # 33..63 is allocation-safe (two sticks) but NOT extent-exact -> fallback.
+    for n in (33, 63):
+        assert _select_uniform_binding(numel=n, device_size=(2, 32), **kw) == (
+            "fallback"
+        )
     # 1..32 is a (1,32) one-stick allocation -> host path (scratch f32-blocked).
     for n in (1, 32):
         assert _select_uniform_binding(numel=n, device_size=(1, 32), **kw) == (
@@ -355,3 +359,37 @@ def test_uniform_binary_digest_matches_the_silicon_witness():
     assert out_sym.device_dtype == "IEEE_FP32"
     assert out_sym.device_element_bits == 32
     assert out_sym.contiguous_stick_layout is True
+
+
+@pytest.mark.parametrize(
+    "make, from_, to",
+    [
+        (lambda: torch.empty(32, dtype=torch.float32, device="spyre"), 0.0, 1.0),
+        (lambda: torch.empty(63, dtype=torch.float32, device="spyre"), 0.0, 1.0),
+        (lambda: torch.empty(64, dtype=torch.float32, device="spyre"), 0.0, 2.0),
+        (lambda: torch.empty(32, dtype=torch.float16, device="spyre"), 0.0, 1.0),
+    ],
+    ids=["numel32", "numel63", "affine_0_2", "fp16_32"],
+)
+@device_only
+def test_fallback_stream_identical_to_route_uniform_draw(
+    device_rng_on, make, from_, to
+):
+    """NON-REGRESSION (doc 54 §4.1/§5): every FALLBACK caller (1..63, affine,
+    fp16, strided) goes through today's host-map path and yields the SAME value
+    stream as the pre-change ``route_uniform_draw`` for the same seed — i.e. the
+    change is an optimisation of the direct cell, not a narrowing. Bit-exact."""
+    spyre = getattr(torch, "spyre")
+    probe = make()
+    n = probe.numel()
+    dtype = probe.dtype
+    spyre.manual_seed(123)
+    t = make()
+    t.uniform_(from_, to)  # fallback path
+    got = t.cpu().numpy()
+    # Reproduce the pre-change stream exactly.
+    spyre.manual_seed(123)
+    raw = np.asarray(hr.route_uniform_draw(from_, to, n), dtype=np.float32)
+    exp = torch.from_numpy(raw).to(dtype=dtype).cpu().numpy()
+    view = np.uint16 if dtype == torch.float16 else np.uint32
+    np.testing.assert_array_equal(got.view(view), exp.view(view))
