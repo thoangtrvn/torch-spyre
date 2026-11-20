@@ -144,6 +144,16 @@ class _FakeDeviceTensor:
     def device(self):
         return "fake-device"
 
+    def element_size(self) -> int:
+        return _BYTES_PER_WORD
+
+    def nelement(self) -> int:
+        return int(self.words.size)
+
+    def to(self, device):
+        # The launch seam calls ``.to(dev)`` on the full-upload path only.
+        return self
+
 
 class _FakeDeviceBridge:
     """Device bridge that models the transport and counts the bytes moved."""
@@ -736,3 +746,115 @@ def test_resident_plan_stream_zero_is_still_accepted(monkeypatch):
     )
     assert plan.params is None
     assert (plan.sticks, plan.lanes) == (_FULL_STICKS, _LANES)
+
+
+# ---------------------------------------------------------------------------
+# Launcher stream identity (silent-wrong guard).
+#
+# ``RngLaunchPlan.stream`` carries the plan's own stream. The resident buffer
+# belongs to ``SpyreRngResources`` and its invalidation key (seed, epoch,
+# base_counter) has no stream index, so a resident launch of a plan built for a
+# different stream must refuse typed rather than silently ship the resource's
+# words and discard ``plan.params``. ``stream == 0`` is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _drive_launch(monkeypatch, plan, **kwargs):
+    """Drive ``launch_raw_state_draw`` offline; return the params words launched.
+
+    Fakes the torch device seam and the compiled launch call, and no-ops the ABI
+    validator. The COUNTING fake bridge is what distinguishes the resident path
+    (device buffer words) from the full-upload path (``plan.params`` words).
+    """
+    import torch
+    import torch_spyre._C as C
+    import sentient_codegen.backend.launch_abi as launch_abi
+
+    class _Sym:
+        def __init__(self, sid, mode):
+            self.symbol_id = sid
+            self.access_mode = mode
+
+    class _Xlat:
+        symbols = [_Sym(0, "read"), _Sym(1, "output")]
+
+    captured = {}
+
+    monkeypatch.setattr(hr, "build_rng_kat_binary", lambda target=None: (b"", _Xlat()))
+    monkeypatch.setattr(launch_abi, "validate_positional_launch", lambda *a, **k: None)
+    monkeypatch.setattr(torch, "device", lambda spec: None)
+    monkeypatch.setattr(
+        torch,
+        "zeros",
+        lambda shape, dtype=None, device=None: _FakeDeviceTensor(
+            np.zeros(shape, dtype=np.uint32)
+        ),
+    )
+    monkeypatch.setattr(torch, "from_numpy", lambda arr: _FakeDeviceTensor(arr))
+    monkeypatch.setattr(
+        C,
+        "launch_kernel_from_bytes",
+        lambda binary, tensors: captured.setdefault("tensors", tensors),
+    )
+    hr.launch_raw_state_draw(plan, **kwargs)
+    return captured["tensors"][0].words
+
+
+def test_launcher_refuses_resident_launch_of_mismatched_stream(monkeypatch):
+    """RED CLASS: a stream-1 plan launched by default must NOT ship stream-0.
+
+    On base c1fa7497 this launch returned silently with the resource's stream-0
+    words (see receipts/rng-stream-key/red_probe_base.py: launched == resident0,
+    != plan.params). The typed refusal names both true remedies.
+    """
+    hr.reset_rng_resources()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
+    )
+    monkeypatch.setattr(hr, "build_rng_kat_binary", lambda target=None: (b"", None))
+    _prime_device_resident(hr.get_rng_resources(), _spec(11, 0))
+
+    plan = hr.build_rng_launch_plan(
+        seed=11, offset=64, stream=1, egress=hr.EgressMode.RAW_STATE
+    )
+    assert plan.stream == 1, "the full build must carry its stream identity"
+    assert plan.params is not None
+
+    with pytest.raises(hr.SpyreRngError) as excinfo:
+        hr.launch_raw_state_draw(plan)
+    msg = str(excinfo.value)
+    assert "stream 1" in msg
+    assert "use_resident=False" in msg
+    assert "separate SpyreRngResources" in msg
+
+
+def test_launcher_stream_zero_warm_path_is_unchanged(monkeypatch):
+    """The default stream: resident launch still ships the resident bytes."""
+    hr.reset_rng_resources()
+    bridge = _FakeDeviceBridge()
+    monkeypatch.setattr(
+        hr, "_RNG_RESOURCES", hr.SpyreRngResources(device_bridge=bridge)
+    )
+    seed = 0xC0FFEE
+    _prime_device_resident(hr.get_rng_resources(), _spec(seed, 0))
+
+    plan = hr.build_rng_launch_plan(
+        seed=seed, offset=64, resident=True, egress=hr.EgressMode.RAW_STATE
+    )
+    assert plan.stream == 0
+    launched = _drive_launch(monkeypatch, plan)
+    np.testing.assert_array_equal(launched, _reference_params(seed, 64))
+
+
+def test_forced_full_upload_honours_nonzero_stream_plan(monkeypatch):
+    """``use_resident=False`` + stream=1 still launches ``plan.params``."""
+    hr.reset_rng_resources()
+    seed = 1234
+    plan = hr.build_rng_launch_plan(
+        seed=seed, offset=0, stream=1, egress=hr.EgressMode.RAW_STATE
+    )
+    assert plan.stream == 1
+    launched = _drive_launch(monkeypatch, plan, use_resident=False)
+    np.testing.assert_array_equal(launched, plan.params)
+    # Guard against a vacuous pass: stream 1 is genuinely different data.
+    assert not np.array_equal(launched, _reference_params(seed, 0))
