@@ -260,6 +260,26 @@ def test_select_uniform_binding_direct_and_fallback():
         assert _select_uniform_binding(numel=n, device_size=(1, 32), **kw) == (
             "fallback"
         )
+    # Multi-tile device loop: a witnessed whole-tile width on its exact (2n,32)
+    # layout is direct; the same numel on the wrong layout falls back.
+    for tiles in (2, 4, 16):
+        numel = tiles * 64
+        assert (
+            _select_uniform_binding(numel=numel, device_size=(2 * tiles, 32), **kw)
+            == "direct"
+        )
+        assert (
+            _select_uniform_binding(numel=numel, device_size=(2, 32), **kw)
+            == "fallback"
+        )
+    # A non-whole width (65) or an unwitnessed tile count (3 tiles = 192)
+    # refuses typed, never a silent host draw of an unwitnessed geometry.
+    import pytest as _pytest
+    from torch_spyre.rng import SpyreRngError
+
+    for bad in (65, 192):
+        with _pytest.raises(SpyreRngError):
+            _select_uniform_binding(numel=bad, device_size=(2, 32), **kw)
     # A non-(2,32) layout (e.g. a 2-D (8,8) is EIGHT sticks) -> host path.
     assert _select_uniform_binding(numel=64, device_size=(8, 1, 32), **kw) == (
         "fallback"

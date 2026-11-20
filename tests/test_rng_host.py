@@ -282,12 +282,30 @@ def test_launch_plan_refuses_typed_pre_registration(monkeypatch):
     assert "not wired yet" in str(excinfo.value) or "rng_kat" in str(excinfo.value)
 
 
-def test_launch_plan_refuses_T_ge_2():
+def test_launch_plan_multitile_gate(monkeypatch):
+    """Multi-tile is wired only for the silicon-witnessed UNIFORM widths.
+
+    The tile count is controlled by ``n_tiles`` (not ``numel``, which is the
+    per-tile lane count). A RAW / unwitnessed multi-tile request refuses typed;
+    a witnessed UNIFORM width builds the plan (output 2n sticks, n*257 params).
+    """
     from torch_spyre.rng import SpyreRngError
 
+    # RAW multi-tile has no silicon receipt -> typed refusal (fires before
+    # registration, so no monkeypatch needed here).
     with pytest.raises(SpyreRngError) as excinfo:
-        hr.build_rng_launch_plan(seed=1, numel=64)
-    assert "T>=2" in str(excinfo.value) or "T>=" in str(excinfo.value)
+        hr.build_rng_launch_plan(
+            seed=1, numel=hr.RNG_KAT_LANES, egress=hr.EgressMode.RAW_STATE, n_tiles=2
+        )
+    assert "T>=2" in str(excinfo.value) or "T-DV-34" in str(excinfo.value)
+    # UNIFORM at a witnessed width builds.
+    monkeypatch.setattr(hr, "rng_pattern_registered", lambda: True)
+    plan = hr.build_rng_launch_plan(
+        seed=1, numel=hr.RNG_KAT_LANES, egress=hr.EgressMode.UNIFORM, n_tiles=2
+    )
+    assert plan.n_tiles == 2
+    assert plan.output_sticks == 4
+    assert plan.sticks == 514
 
 
 def test_launch_plan_builds_the_uniform_plan(monkeypatch):
