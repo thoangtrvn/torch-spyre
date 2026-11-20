@@ -1448,21 +1448,28 @@ def build_rng_launch_plan(
     """
     if not isinstance(egress, EgressMode):
         raise TypeError(f"egress must be an EgressMode, got {egress!r}")
-    # Tile guard: multi-tile is wired only for the silicon-witnessed UNIFORM
-    # widths; every other multi-tile request (raw, or an unwitnessed count) is a
-    # typed refusal (T-DV-34).
+    # Tile guard: multi-tile is wired only for the UNIFORM egress, at any width
+    # 1.._RNG_UNIFORM_TILES_CAP; every other multi-tile request (raw, or a width
+    # above the cap / above the ISA bound) is a typed refusal (T-DV-34).
     if n_tiles < 1:
         raise SpyreRngError(
             f"build_rng_launch_plan: n_tiles must be >= 1, got {n_tiles}"
         )
+    if n_tiles > _RNG_TILE_LOOP_MAX:
+        raise SpyreRngError(
+            f"device RNG: n_tiles={n_tiles} exceeds the MVLOOPCNT 8-bit trip "
+            f"bound {_RNG_TILE_LOOP_MAX} (a static count of 0 wraps to 256); "
+            "split into multiple launches."
+        )
     if n_tiles >= 2 and not (
-        egress is EgressMode.UNIFORM and n_tiles in _RNG_WITNESSED_UNIFORM_TILES
+        egress is EgressMode.UNIFORM and n_tiles <= _RNG_UNIFORM_TILES_CAP
     ):
         raise SpyreRngError(
             f"device RNG T>=2 is unbuilt (T-DV-34): {n_tiles} tiles requested; "
-            "only the silicon-witnessed UNIFORM widths "
-            f"{sorted(_RNG_WITNESSED_UNIFORM_TILES)} are multi-tile-wired. Draw "
-            "on the host, or use a witnessed width."
+            "only the UNIFORM egress at width 1.."
+            f"{_RNG_UNIFORM_TILES_CAP} is multi-tile-wired (the silicon-"
+            f"witnessed head is {_RNG_WITNESSED_UNIFORM_TILES_MAX}). Draw on the "
+            "host, or use a width within the cap."
         )
     # Pre-registration guard (lane B not landed yet).
     if not rng_pattern_registered():
@@ -1528,13 +1535,27 @@ def build_rng_launch_plan(
 #: That bounds a single T=1 tile: ``numel == 64`` per tile.
 _RNG_MAX_UNIFORM_ELEMS = 2 * RNG_KAT_LANES
 
-#: Device-tile-loop widths silicon-witnessed for the UNIFORM egress: 1/2/4/16
-#: tiles = numel 64/128/256/1024, all read back bit-exact vs host
-#: ``threefry2x32_20`` on 2026-11-20 (claims rng-multitile-{2,4,16}tile — the
-#: same witnessed binaries the codegen route emits). A whole-64-word fill of one
-#: of these widths is a direct device bind; any other width falls back (host
-#: map) or refuses typed — no unwitnessed width is routed.
-_RNG_WITNESSED_UNIFORM_TILES = frozenset({1, 2, 4, 16})
+#: ISA bound on a single ``MVLOOPCNT`` trip: the LCCR is an 8-bit decrementing
+#: counter, so a static count is 0..255 and **0 WRAPS to 256**
+#: (``sentient_codegen.isa.constraints.validate_loop_count``; ISA "loop count: 0
+#: means 256"). 256 (``imm=0``) is excluded until the wrap encoding is emitted
+#: and witnessed, so the clean single-launch tile-loop ceiling is 255. Mirrors
+#: ``sentient_codegen.scheduler.rng._RNG_TILE_LOOP_MAX``.
+_RNG_TILE_LOOP_MAX = 255
+#: Silicon-witnessed head of the device tile loop (UNIFORM egress). 1/2/4/16
+#: tiles (numel 64/128/256/1024) read back bit-exact vs host ``threefry2x32_20``
+#: on 2026-11-20 (claims rng-multitile-{2,4,16}tile — the same witnessed binaries
+#: the codegen route emits). The loop body is tile-invariant and its only
+#: per-tile variables (counter +1, egress stride 2n) are linear, so ANY width
+#: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind; the
+#: deepest witnessed count exercises the mechanism. A width above this head (or
+#: above the ISA bound) refuses typed — no unwitnessed width is routed. Step this
+#: up as wider counts are silicon-witnessed (next: 64/128/255). Mirrors
+#: ``sentient_codegen.scheduler.rng._RNG_WITNESSED_UNIFORM_TILES_MAX``.
+_RNG_WITNESSED_UNIFORM_TILES_MAX = 16
+#: The widest tile count a route will admit now: the witness head, clamped to the
+#: ISA trip bound.
+_RNG_UNIFORM_TILES_CAP = min(_RNG_WITNESSED_UNIFORM_TILES_MAX, _RNG_TILE_LOOP_MAX)
 
 
 def raw_words_to_uniform(words, from_: float = 0.0, to: float = 1.0) -> np.ndarray:
@@ -1760,8 +1781,10 @@ def build_rng_kat_uniform_binary(
     ``70c8e03e`` — the same silicon-witnessed bytes). The XLAT plan is derived
     from the SAME scheduled program AND declares the output symbol (segment 1)
     as ``f32``/``IEEE_FP32``/32-bit/contiguous (T-LR-7) with extents scaled to
-    ``n_tiles``. Raises ``SpyreRngError`` on a non-witnessed target, an
-    unwitnessed tile count, or if the backend has not registered ``rng_kat``.
+    ``n_tiles``. ``n_tiles`` 1..``_RNG_UNIFORM_TILES_CAP`` is
+    admitted in kind; a count above the cap or above the ISA trip bound raises
+    ``SpyreRngError``, as does a non-witnessed target or a backend that has not
+    registered ``rng_kat``.
     """
     from sentient_codegen.gen.registry import get_default_target, get_generation
 
@@ -1774,6 +1797,17 @@ def build_rng_kat_uniform_binary(
     if n_tiles < 1:
         raise SpyreRngError(
             f"build_rng_kat_uniform_binary: n_tiles must be >= 1, got {n_tiles}"
+        )
+    if n_tiles > _RNG_TILE_LOOP_MAX:
+        raise SpyreRngError(
+            f"build_rng_kat_uniform_binary: n_tiles={n_tiles} exceeds the "
+            f"MVLOOPCNT 8-bit trip bound {_RNG_TILE_LOOP_MAX}; split the launch."
+        )
+    if n_tiles > _RNG_UNIFORM_TILES_CAP:
+        raise SpyreRngError(
+            f"build_rng_kat_uniform_binary: n_tiles={n_tiles} exceeds the "
+            f"silicon-witnessed cap {_RNG_UNIFORM_TILES_CAP}; witness a wider "
+            "count on silicon to raise the cap."
         )
     if n_tiles in _UNIFORM_KAT_CACHE:
         return _UNIFORM_KAT_CACHE[n_tiles]
@@ -2021,16 +2055,19 @@ def _select_uniform_binding(
       unavailable".
 
     Raises typed (``SpyreRngError``) for ``numel > 64`` only when it is not a
-    whole number of 64-word tiles, or the tile count is not silicon-witnessed
-    (witnessed: 2/4/16 tiles = numel 128/256/1024). A witnessed whole-tile fill
-    is a direct device bind or the unchanged host fallback — never a new refusal.
+    whole number of 64-word tiles, or the tile count is above the silicon-
+    witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
+    ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
+    in kind; the witnessed head is 16 tiles = numel 1024). An admitted whole-tile
+    fill is a direct device bind or the unchanged host fallback — never a new
+    refusal.
     """
     if numel == 0:
         return "empty"
     if numel > _RNG_MAX_UNIFORM_ELEMS:
         # Wider-than-one-tile fills: only a whole number of 64-word tiles whose
-        # tile count is silicon-witnessed is expressible on device; everything
-        # else is a typed refusal (never a silent split).
+        # tile count is within the witnessed cap is expressible on device;
+        # everything else is a typed refusal (never a silent split).
         if numel % _RNG_MAX_UNIFORM_ELEMS != 0:
             raise SpyreRngError(
                 f"device RNG: numel={numel} is not a whole number of "
@@ -2038,13 +2075,20 @@ def _select_uniform_binding(
                 "host, or split into whole 64-word draws."
             )
         _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
-        if _n_tiles not in _RNG_WITNESSED_UNIFORM_TILES:
+        if _n_tiles > _RNG_TILE_LOOP_MAX:
             raise SpyreRngError(
-                f"device RNG: a {_n_tiles}-tile fill (numel={numel}) is not "
-                "silicon-witnessed (witnessed tile counts "
-                f"{sorted(_RNG_WITNESSED_UNIFORM_TILES)} = numel "
-                "64/128/256/1024). Draw on the host, or split into witnessed "
-                "widths."
+                f"device RNG: a {_n_tiles}-tile fill (numel={numel}) exceeds the "
+                f"MVLOOPCNT 8-bit trip bound {_RNG_TILE_LOOP_MAX}; split into "
+                "multiple launches."
+            )
+        if _n_tiles > _RNG_UNIFORM_TILES_CAP:
+            raise SpyreRngError(
+                f"device RNG: a {_n_tiles}-tile fill (numel={numel}) exceeds the "
+                f"silicon-witnessed cap {_RNG_UNIFORM_TILES_CAP} (any 1.."
+                f"{_RNG_UNIFORM_TILES_CAP} is admitted in kind; "
+                f"{_RNG_WITNESSED_UNIFORM_TILES_MAX} is the deepest count run on "
+                "silicon). Witness a wider count on silicon to raise the cap, or "
+                "split into narrower draws."
             )
     if float(from_) != 0.0 or float(to) != 1.0:
         return "fallback"
@@ -2060,7 +2104,7 @@ def _select_uniform_binding(
     # layout is not exactly (2n,32)) takes the host-map fallback.
     if numel % _RNG_MAX_UNIFORM_ELEMS == 0:
         _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
-        if _n_tiles in _RNG_WITNESSED_UNIFORM_TILES and device_size == (
+        if 1 <= _n_tiles <= _RNG_UNIFORM_TILES_CAP and device_size == (
             2 * _n_tiles,
             RNG_KAT_LANES,
         ):
