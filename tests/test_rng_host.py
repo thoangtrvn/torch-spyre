@@ -290,12 +290,24 @@ def test_launch_plan_refuses_T_ge_2():
     assert "T>=2" in str(excinfo.value) or "T>=" in str(excinfo.value)
 
 
-def test_launch_plan_refuses_the_unwitnessed_uniform_grid():
-    from torch_spyre.rng import SpyreRngError
+def test_launch_plan_builds_the_uniform_plan(monkeypatch):
+    """UNIFORM is a route now: the plan builds (257 params sticks, 2 out sticks).
 
-    with pytest.raises(SpyreRngError) as excinfo:
-        hr.build_rng_launch_plan(seed=1, numel=32, egress=hr.EgressMode.UNIFORM)
-    assert "uniform" in str(excinfo.value).lower()
+    The old assertion here was that the uniform grid REFUSED (P5 owed). With the
+    silicon-witnessed UNIFORM egress landed, ``build_rng_launch_plan`` builds it:
+    pops 257 (vs raw 251), egress 2 sticks (vs raw 4)."""
+    # Registration must be live for a non-resident build; pin it so the test
+    # does not depend on the ambient backend import state.
+    monkeypatch.setattr(hr, "rng_pattern_registered", lambda: True)
+    plan = hr.build_rng_launch_plan(seed=1, numel=32, egress=hr.EgressMode.UNIFORM)
+    assert plan.egress is hr.EgressMode.UNIFORM
+    assert plan.sticks == hr.band_lxlu_pop_count(_ROUNDS, egress=hr.EgressMode.UNIFORM)
+    assert plan.sticks == 257
+    assert plan.output_sticks == hr.band_egress_stick_count(
+        _ROUNDS, egress=hr.EgressMode.UNIFORM
+    )
+    assert plan.output_sticks == 2
+    assert plan.params is not None and plan.params.shape == (257, 32)
 
 
 def test_route_uniform_draw_refuses_only_beyond_one_tile(monkeypatch):

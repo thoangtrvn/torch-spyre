@@ -1397,16 +1397,13 @@ def build_rng_launch_plan(
 
     Refusals (all ``SpyreRngError``, so they propagate as hard failures):
 
-    * **pre-registration** — ``rng_kat`` is not in the backend pattern registry
-      (lane B has not landed). This is the expected state today.
-    * **uniform fp32 grid** — the user-facing uniform output is UNWITNESSED
-      (P5 owed); only the raw-state KAT egress is witnessed.
+    * **pre-registration** — ``rng_kat`` is not in the backend pattern registry.
     * **T≥2** — a request covering more than one 32-lane tile is unbuilt
       (T-DV-34).
 
-    When all guards pass (only possible after lane B registers AND for the
-    raw-state egress), the returned plan is still just a plan — the launcher is
-    the integration step.
+    Both the RAW_STATE and the (silicon-witnessed, P5) UNIFORM egress build a
+    plan now; the launcher for each validates its own egress. The returned plan
+    is still just a plan — the launcher is the integration step.
 
     ``resident=True`` (design note §3.1) skips the full params-stream build when
     a DEVICE resident buffer already exists for ``device``: the launcher takes
@@ -1429,14 +1426,6 @@ def build_rng_launch_plan(
             f"device RNG T>=2 is unbuilt (T-DV-34): this request covers {numel} "
             f"elements = {tiles} tiles; only the single 32-lane T=1 tile is "
             f"witnessed. Draw on the host, or split into independent T=1 draws."
-        )
-    # Uniform grid guard: unwitnessed (P5 owed), never claimed.
-    if egress is EgressMode.UNIFORM:
-        raise SpyreRngError(
-            "the uniform fp32 grid u = hi*2^-16 + floor(lo/256)*2^-24 is "
-            "UNWITNESSED (P5 owed). Only the raw-state KAT egress (4 sticks, "
-            "x0/x1 halves) is silicon-witnessed. Refusing rather than emit an "
-            "unwitnessed user-facing stream."
         )
     # Pre-registration guard (lane B not landed yet).
     if not rng_pattern_registered():
@@ -1705,6 +1694,146 @@ def build_rng_kat_binary(target: "str | None" = None) -> "tuple[bytes, object]":
     return _RAW_KAT_CACHE
 
 
+#: Cached ``(binary, xlat_plan)`` for the fixed T=1 UNIFORM-egress KAT. The
+#: binary is the silicon-witnessed ``d0930bd5…`` (receipt ``rng-p5-uniform-kat``);
+#: the plan declares the output symbol's fp32 dtype/layout so the T-LR-7 gate
+#: fires on the caller tensor (design 53 Q3.2). Distinct from the raw cache.
+_UNIFORM_KAT_CACHE: "tuple[bytes, object] | None" = None
+
+
+def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, object]":
+    """Compile (once) the registered ``rng_kat`` T=1 UNIFORM binary + plan.
+
+    The UNIFORM analogue of :func:`build_rng_kat_binary` (2 egress sticks, 257
+    params sticks, the one-stick egress stride seed). For a rcudd1a target the
+    binary is the silicon-witnessed ``d0930bd5…`` (4608 B, receipt
+    ``rng-p5-uniform-kat``). The XLAT plan is derived from the SAME scheduled
+    program AND declares the output symbol (segment 1) as ``f32``/``IEEE_FP32``
+    /32-bit/contiguous (T-LR-7) — the raw build passes no ``symbol_dtypes`` and
+    so leaves that gate unfired; the uniform caller-tensor binding needs it
+    armed (design 53 Q3.2). Raises ``SpyreRngError`` on a non-witnessed target
+    or if the backend has not registered ``rng_kat``.
+    """
+    global _UNIFORM_KAT_CACHE
+    from sentient_codegen.gen.registry import get_default_target, get_generation
+
+    tgt = get_default_target() if target is None else target
+    if tgt not in _RNG_WITNESSED_TARGETS:
+        raise SpyreRngError(
+            f"device RNG has no witnessed kernel for target {tgt!r}; it is 1p0 "
+            f"({sorted(_RNG_WITNESSED_TARGETS)})-only (1p5 RNG is unbuilt)"
+        )
+    if _UNIFORM_KAT_CACHE is not None:
+        return _UNIFORM_KAT_CACHE
+    if not rng_pattern_registered():
+        raise SpyreRngError(
+            "device RNG is not wired: backend pattern 'rng_kat' is not registered"
+        )
+    from sentient_codegen.backend.launch_abi import build_xlat_relocation_plan
+    from sentient_codegen.backend.ttir_to_schedule import compile_scheduled_program
+    from sentient_codegen.emulator import threefry_recipe_model as _rm
+    from sentient_codegen.scheduler.engine import (
+        TilingConfig,
+        finalize_pattern_program,
+    )
+    from sentient_codegen.scheduler.rng import rng_kat_pattern_registered
+
+    out_sticks = _rm.band_egress_stick_count(
+        RNG_KAT_ROUNDS, egress=_rm.EgressMode.UNIFORM
+    )
+    tiling = TilingConfig(
+        M=out_sticks,
+        K=1,
+        N=RNG_KAT_LANES,
+        tile_m=out_sticks,
+        tile_k=1,
+        tile_n=RNG_KAT_LANES,
+        num_cores=1,
+        element_bits=32,
+    )
+    # The registered factory with egress=UNIFORM — NOT resolve_pattern, whose
+    # two-arg registry hop defaults to RAW_STATE. This is the same route the
+    # codegen half admitted (binary byte-identical to the offline constructor).
+    pattern = rng_kat_pattern_registered(
+        tiling=tiling, target=tgt, egress=_rm.EgressMode.UNIFORM
+    )
+    scheduled = finalize_pattern_program(pattern, tiling, tgt)
+    binary = compile_scheduled_program(scheduled, target=tgt)
+    sb = _stick_bytes(tgt)
+    params_bytes = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM) * sb
+    out_bytes = out_sticks * sb
+    # Declare the fp32 output symbol so the T-LR-7 dtype/layout gate fires on
+    # the caller tensor. DERIVED from the generation's own dtype map, not typed.
+    _f32 = get_generation(tgt).resolve_device_dtype("f32")
+    symbol_dtypes = {
+        1: {
+            "logical_dtype": _f32.logical_dtype,
+            "device_dtype": _f32.device_dtype,
+            "device_element_bits": _f32.device_bits,
+            "contiguous_stick_layout": True,
+        }
+    }
+    xlat_plan = build_xlat_relocation_plan(
+        scheduled,
+        target=tgt,
+        binary=binary,
+        num_cores=1,
+        symbol_extents={0: params_bytes, 1: out_bytes},
+        symbol_dtypes=symbol_dtypes,
+    )
+    _UNIFORM_KAT_CACHE = (binary, xlat_plan)
+    return _UNIFORM_KAT_CACHE
+
+
+def _resolve_launch_params(plan: "RngLaunchPlan", dev, use_resident):
+    """Return the device params tensor for ``plan`` (resident or full upload).
+
+    Shared by the raw and uniform launchers so the resident-buffer contract
+    (stream identity, declared-shape check, resident-only refusal) is one
+    implementation, not two copies that can drift.
+    """
+    if use_resident is not False and plan.spec is not None:
+        # Resident DEVICE tensor: no per-draw full re-materialization.
+        resources = get_rng_resources()
+        # The resident buffer is built with the RESOURCE's own stream, and the
+        # resident invalidation key (seed, epoch, base_counter) carries no
+        # stream index. A plan built for a different stream would silently ship
+        # the resource's words and discard ``plan.params`` -- refuse typed.
+        if plan.stream != resources.stream_index():
+            raise SpyreRngError(
+                f"resident launch cannot honour stream {plan.stream}: this "
+                f"device's resident params buffer is built with the resource's "
+                f"stream {resources.stream_index()}, and the resident key "
+                "(seed, epoch, base_counter) carries no stream index. Remedy: "
+                "launch with use_resident=False to use this plan's own "
+                f"stream-{plan.stream} params, or keep a separate "
+                "SpyreRngResources per stream (the multi-generator direction)."
+            )
+        params = resources.ensure_device_params(plan.spec, dev)
+        # Validate against the plan's DECLARED ABI (sticks, lanes), not the
+        # words: a resident-only plan (``params is None``) declares them from
+        # the local band-count mirror (drift-guarded vs the codegen owner) so
+        # the shape contract still holds.
+        if params.shape != (plan.sticks, plan.lanes):
+            raise SpyreRngError(
+                "resident params shape "
+                f"{tuple(params.shape)} disagrees with the plan's declared "
+                f"{(plan.sticks, plan.lanes)}; refusing a mid-stream device buffer"
+            )
+        return params
+    if plan.params is None:
+        raise SpyreRngError(
+            "this launch plan is resident-only (no params words were built); "
+            "use_resident=False needs the full params array. Rebuild with "
+            "build_rng_launch_plan(..., resident=False)."
+        )
+    import torch
+
+    # Recipe order (the launcher's device-word-order / swizzle concern, not
+    # the builder's). int32 holds the same 32-bit words, byte for byte.
+    return torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(dev)
+
+
 def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None):
     """Launch the registered T=1 raw-state KAT for ``plan``; return its output.
 
@@ -1749,46 +1878,7 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
         )
     binary, xlat_plan = build_rng_kat_binary()
     dev = torch.device("spyre") if device is None else device
-    if use_resident is not False and plan.spec is not None:
-        # Resident DEVICE tensor: no per-draw full re-materialization.
-        resources = get_rng_resources()
-        # The resident buffer is built with the RESOURCE's own stream, and the
-        # resident invalidation key (seed, epoch, base_counter) carries no
-        # stream index. A plan built for a different stream would silently ship
-        # the resource's words and discard ``plan.params`` -- refuse typed.
-        if plan.stream != resources.stream_index():
-            raise SpyreRngError(
-                f"resident launch cannot honour stream {plan.stream}: this "
-                f"device's resident params buffer is built with the resource's "
-                f"stream {resources.stream_index()}, and the resident key "
-                "(seed, epoch, base_counter) carries no stream index. Remedy: "
-                "launch with use_resident=False to use this plan's own "
-                f"stream-{plan.stream} params, or keep a separate "
-                "SpyreRngResources per stream (the multi-generator direction)."
-            )
-        params = resources.ensure_device_params(plan.spec, dev)
-        # Validate against the plan's DECLARED ABI (sticks, lanes), not the
-        # words: a resident-only plan (``params is None``) declares them from
-        # the local band-count mirror (drift-guarded vs the codegen owner) so
-        # the shape contract still holds.
-        if params.shape != (plan.sticks, plan.lanes):
-            raise SpyreRngError(
-                "resident params shape "
-                f"{tuple(params.shape)} disagrees with the plan's declared "
-                f"{(plan.sticks, plan.lanes)}; refusing a mid-stream device buffer"
-            )
-    else:
-        if plan.params is None:
-            raise SpyreRngError(
-                "this launch plan is resident-only (no params words were built); "
-                "use_resident=False needs the full params array. Rebuild with "
-                "build_rng_launch_plan(..., resident=False)."
-            )
-        # Recipe order (the launcher's device-word-order / swizzle concern, not
-        # the builder's). int32 holds the same 32-bit words, byte for byte.
-        params = torch.from_numpy(np.ascontiguousarray(plan.params.view(np.int32))).to(
-            dev
-        )
+    params = _resolve_launch_params(plan, dev, use_resident)
     out = torch.zeros((plan.output_sticks, plan.lanes), dtype=torch.int32, device=dev)
     tensors_by_symbol = {
         xlat_plan.symbols[0].symbol_id: params,
@@ -1811,6 +1901,234 @@ def launch_raw_state_draw(plan: RngLaunchPlan, *, device=None, use_resident=None
         binary, [tensors_by_symbol[s.symbol_id] for s in xlat_plan.symbols]
     )
     return out
+
+
+def _device_stick_layout(tensor):
+    """``tuple`` of the tensor's device stick layout, or ``None`` if unknown.
+
+    The device-side layout (``[sticks, elems_per_stick]``) decides whether a
+    caller tensor's allocation is exactly the 2 dense sticks the uniform egress
+    writes. Unknown (host / ``_C`` absent) returns ``None`` so the caller takes
+    the always-safe scratch path rather than guessing a direct binding.
+    """
+    try:
+        from torch_spyre import _C
+
+        return tuple(int(v) for v in _C.get_spyre_tensor_layout(tensor).device_size)
+    except Exception:
+        return None
+
+
+def _select_uniform_binding(
+    *, numel: int, is_float32: bool, is_contiguous: bool, device_size
+) -> str:
+    """Decide how to bind the caller tensor to the 2-stick uniform egress.
+
+    Returns one of:
+
+    * ``"empty"`` — ``numel == 0`` (nothing to write; a no-op).
+    * ``"direct"`` — bind the caller tensor itself as segment 1. Only when it is
+      float32, contiguous, ``numel == 64`` AND its device layout is exactly the
+      2 dense sticks ``(2, 32)`` the egress writes — so the 2-stick store stays
+      inside the allocation.
+    * ``"scratch"`` — write a ``(2, 32)`` fp32 device scratch, then ONE
+      device→device copy of the first ``numel`` elements into the caller. Used
+      for every other allocation-safe contiguous fp32 case (notably
+      ``numel <= 32``, whose 1-stick allocation a 2-stick store would overrun).
+
+    Refuses typed (``SpyreRngError``) for ``numel > 64`` (T-DV-34), a non-fp32
+    dtype (no on-device conversion exists), or a non-contiguous caller (a
+    strided layout silently flattened into the stick layout is the silent-wrong
+    class — the caller must hand a contiguous tensor).
+    """
+    if numel == 0:
+        return "empty"
+    if numel > _RNG_MAX_UNIFORM_ELEMS:
+        raise SpyreRngError(
+            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements exceed the "
+            f"{_RNG_MAX_UNIFORM_ELEMS} words a single T=1 launch yields (one "
+            "32-lane tile producing u0,u1). Draw on the host, or split into "
+            "independent draws."
+        )
+    if not is_float32:
+        raise SpyreRngError(
+            "device uniform_ requires a float32 caller tensor: the witnessed "
+            "egress writes IEEE_FP32 and there is no on-device dtype conversion "
+            "(torch_spyre refuses on-device casts). Use a float32 tensor, or "
+            "turn off TORCH_SPYRE_DEVICE_RNG for the host-CPU offload."
+        )
+    if not is_contiguous:
+        raise SpyreRngError(
+            "device uniform_ requires a contiguous caller tensor: the egress "
+            "writes densely packed (2,32) sticks, and flattening a strided "
+            "layout into that stick layout would be a silent-wrong. Call "
+            ".contiguous() first, or turn off TORCH_SPYRE_DEVICE_RNG."
+        )
+    if numel == _RNG_MAX_UNIFORM_ELEMS and device_size == (2, RNG_KAT_LANES):
+        return "direct"
+    return "scratch"
+
+
+def launch_uniform_draw(
+    plan: RngLaunchPlan, *, out=None, device=None, use_resident=None
+):
+    """Launch the registered T=1 UNIFORM KAT for ``plan`` into ``out``.
+
+    Requires a real ``spyre`` device and the flex runtime. Binds the caller
+    tensor ``out`` as segment 1 according to :func:`_select_uniform_binding`
+    (direct 2-stick binding, or a ``(2,32)`` scratch + one device→device copy),
+    with the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
+    round trip of the generated floats. When ``out`` is ``None`` it writes the
+    full ``(2,32)`` egress into a fresh device tensor and returns it.
+
+    The kernel egress is the bare ``[0,1)`` fp32 grid ``u = (w>>8)*2**-24``;
+    affine scaling is NOT applied here (no on-device affine kernel), so the
+    caller (``route_uniform_fill``) only routes the identity ``[0,1)`` map.
+    """
+    import torch
+
+    from torch_spyre._C import launch_kernel_from_bytes
+
+    if plan.egress is not EgressMode.UNIFORM:
+        raise SpyreRngError(
+            "launch_uniform_draw only launches the UNIFORM KAT egress; got "
+            f"{plan.egress!r}"
+        )
+    binary, xlat_plan = build_rng_kat_uniform_binary()
+    dev = torch.device("spyre") if device is None else device
+    params = _resolve_launch_params(plan, dev, use_resident)
+
+    copy_from = None
+    if out is None:
+        numel = plan.output_sticks * plan.lanes
+        target = torch.empty(
+            (plan.output_sticks, plan.lanes), dtype=torch.float32, device=dev
+        )
+    else:
+        if out.device.type != "spyre":
+            raise SpyreRngError(
+                "launch_uniform_draw requires a spyre-device caller tensor; got "
+                f"device {out.device!r}. Draw on the host with the switch off."
+            )
+        numel = int(out.numel())
+        decision = _select_uniform_binding(
+            numel=numel,
+            is_float32=(out.dtype == torch.float32),
+            is_contiguous=out.is_contiguous(),
+            device_size=_device_stick_layout(out),
+        )
+        if decision == "empty":
+            return out
+        if decision == "direct":
+            target = out
+        else:  # scratch
+            target = torch.empty(
+                (plan.output_sticks, plan.lanes), dtype=torch.float32, device=dev
+            )
+            copy_from = out
+
+    tensors_by_symbol = {
+        xlat_plan.symbols[0].symbol_id: params,
+        xlat_plan.symbols[1].symbol_id: target,
+    }
+    specs = {
+        sym.symbol_id: (
+            int(
+                tensors_by_symbol[sym.symbol_id].element_size()
+                * tensors_by_symbol[sym.symbol_id].nelement()
+            ),
+            "input" if sym.access_mode == "read" else "output",
+        )
+        for sym in xlat_plan.symbols
+    }
+    from sentient_codegen.backend.launch_abi import (
+        validate_positional_launch,
+        validate_tensor_dtype_and_layout,
+    )
+
+    validate_positional_launch(xlat_plan, binary, specs)
+    # Arm the T-LR-7 dtype/layout gate: the plan declared segment 1 as fp32
+    # (IEEE_FP32, contiguous). A wrong-dtype or mis-stickified caller tensor
+    # refuses here rather than being bit-reinterpreted on device.
+    validate_tensor_dtype_and_layout(xlat_plan, tensors_by_symbol)
+    launch_kernel_from_bytes(
+        binary, [tensors_by_symbol[s.symbol_id] for s in xlat_plan.symbols]
+    )
+    if copy_from is not None:
+        # ONE device→device copy: still zero host round trip. ``[:numel]`` is a
+        # contiguous prefix of the scratch, so the copy stays within bounds.
+        copy_from.view(-1).copy_(target.view(-1)[:numel])
+        return copy_from
+    return target
+
+
+def route_uniform_fill(self, from_=0.0, to=1.0) -> "object":
+    """Device route for a user-facing ``uniform_`` fill (switch ON).
+
+    Fills the caller tensor ``self`` with device-generated uniforms in
+    ``[from_, to)`` — but ONLY the identity map ``[0, 1)`` is a device route
+    today: the witnessed egress writes the bare ``[0,1)`` fp32 grid, and no
+    on-device affine (``from_ + u*(to-from_)``) kernel exists, so any other
+    ``(from_, to_)`` refuses typed rather than emit values that are not the
+    request (turn off TORCH_SPYRE_DEVICE_RNG for the host offload, which honors
+    arbitrary bounds). There is NO host-RNG fallback: with the switch ON a
+    refusal is the honest outcome, never a silent host substitute.
+
+    Reserves ``numel`` block-counters from the device generator (so successive
+    draws differ, a fixed seed reproduces), draws ONE T=1 counter block and
+    writes it into ``self`` via :func:`launch_uniform_draw` — zero host round
+    trip of the generated floats. The params stream is rebuilt in full per
+    draw (the resident buffer is keyed for the raw egress); a uniform residency
+    is a follow-on, not this cut.
+    """
+    numel = int(self.numel())
+    if numel < 0:
+        raise ValueError(f"numel must be non-negative, got {numel}")
+    if numel > _RNG_MAX_UNIFORM_ELEMS:
+        raise SpyreRngError(
+            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements exceed the "
+            f"{_RNG_MAX_UNIFORM_ELEMS} words a single T=1 launch yields (one "
+            "32-lane tile producing u0,u1). Draw on the host, or split into "
+            "independent draws."
+        )
+    if numel == 0:
+        return self
+    if float(from_) != 0.0 or float(to) != 1.0:
+        raise SpyreRngError(
+            "device uniform_ serves only the identity map [0, 1): the witnessed "
+            "uniform egress writes the bare [0,1) fp32 grid and there is no "
+            f"on-device affine (from + u*(to-from)) kernel to produce "
+            f"[{float(from_)}, {float(to)}). Turn off TORCH_SPYRE_DEVICE_RNG for "
+            "the host-CPU offload, which honors arbitrary bounds."
+        )
+    if not rng_pattern_registered():
+        raise SpyreRngError(
+            "device RNG is not wired yet: backend pattern 'rng_kat' is not "
+            "registered. Turn off TORCH_SPYRE_DEVICE_RNG to use the documented "
+            "host-CPU offload."
+        )
+    state = _generator_state()
+    if state is None:
+        raise SpyreRngError(
+            "device RNG: the spyre generator state is unreachable (torch.spyre "
+            "not registered); cannot reserve a draw offset. Refusing rather than "
+            "falling back to a host draw."
+        )
+    # Reserve one block per element so a second draw advances the offset.
+    offset = state.reserve(numel)
+    plan = build_rng_launch_plan(
+        seed=state.seed,
+        offset=offset,
+        # ONE counter block = 32 lanes; a single launch yields u0,u1 = 64 words.
+        numel=RNG_KAT_LANES,
+        device=_device_index(self.device),
+        egress=EgressMode.UNIFORM,
+        # Full params build (not the raw-keyed resident buffer); the values
+        # themselves never round-trip through the host.
+        resident=False,
+    )
+    launch_uniform_draw(plan, out=self, device=self.device, use_resident=False)
+    return self
 
 
 def reconstruct_raw_state_from_tensor(out) -> "tuple[np.ndarray, np.ndarray]":

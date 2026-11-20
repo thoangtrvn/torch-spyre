@@ -192,18 +192,22 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Default (switch OFF): the documented host-CPU offload — draw on CPU, copy
     # to device. Reproducible only via the CPU stream; this is NOT device RNG.
     #
-    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route fills from DEVICE
-    # random bits (the silicon-witnessed T=1 raw-state kernel), mapping the raw
-    # words to [from_, to) on the host. It REFUSES TYPED for anything beyond one
-    # T=1 tile (numel > 64, T-DV-34 unbuilt) or when the pattern is not
-    # registered. A caller who opted into device RNG never gets a host draw.
-    from torch_spyre.rng import device_rng_enabled, route_uniform_draw
+    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route writes DEVICE-
+    # generated uniforms straight into ``self`` — the silicon-witnessed T=1
+    # UNIFORM egress (binary d0930bd5…), bound to the caller tensor (or a
+    # (2,32) scratch + one device→device copy), with ZERO host round trip. The
+    # egress writes the bare [0,1) fp32 grid, so only the identity map is a
+    # device route; any other (from_, to) REFUSES TYPED (no on-device affine
+    # kernel). It also refuses typed beyond one T=1 tile (numel > 64, T-DV-34),
+    # a non-fp32 or non-contiguous caller, or an unregistered pattern. A caller
+    # who opted into device RNG never gets a host draw.
+    from torch_spyre.rng import device_rng_enabled
 
     if device_rng_enabled():
+        from torch_spyre.rng import route_uniform_fill
+
         _reject_per_call_generator(generator)
-        values = route_uniform_draw(from_, to, self.numel())  # raises typed
-        host = torch.from_numpy(values).to(dtype=self.dtype)
-        self.copy_(host.reshape(self.shape))
+        route_uniform_fill(self, from_, to)  # raises typed
         return self
 
     # Create a new tensor on cpu

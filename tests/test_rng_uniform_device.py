@@ -23,9 +23,12 @@ Two tiers:
   reproducibility, successive-draw divergence, agreement with the host map of
   ``draw_raw_state``, and the n=65 typed refusal.
 
-The random BITS are device-generated (``draw_raw_state``); the map to
-``[from_, to)`` runs on the host because spyre has no registered ``>>``/``&``
-elementwise ops. The witnessed uniform *epilogue* (P5) remains future work.
+``route_uniform_draw`` remains the host-map path (device raw bits, host map).
+The P5 route (``route_uniform_fill`` -> ``launch_uniform_draw``) writes the
+silicon-witnessed 2-stick UNIFORM egress straight into the caller tensor (or a
+(2,32) scratch + one device→device copy) with zero host round trip, only for
+the identity ``[0, 1)`` map. The pure binding rule, the route refusals, and the
+uniform binary digest are host-testable and run in the OFFLINE tier below.
 """
 
 import numpy as np
@@ -123,11 +126,16 @@ def test_uniform_fills_unit_interval(device_rng_on):
 
 
 @device_only
-def test_uniform_fills_requested_range(device_rng_on):
+def test_uniform_fills_requested_range_refuses_typed(device_rng_on):
+    """Non-identity [from_,to) is NOT a device route (no on-device affine).
+
+    The witnessed egress writes the bare [0,1) grid; affine scaling needs a
+    device kernel that does not exist, so the switch-ON path refuses typed
+    rather than emit out-of-request values."""
     t = torch.empty(32, device="spyre")
-    t.uniform_(-3.0, 7.0)
-    vals = t.cpu().numpy()
-    assert (vals >= -3.0).all() and (vals < 7.0).all()
+    with pytest.raises(hr.SpyreRngError) as excinfo:
+        t.uniform_(-3.0, 7.0)
+    assert "identity" in str(excinfo.value).lower() or "[0, 1)" in str(excinfo.value)
 
 
 @device_only
@@ -179,3 +187,104 @@ def test_uniform_65_refuses_typed(device_rng_on):
     t = torch.empty(65, device="spyre")
     with pytest.raises(hr.SpyreRngError):
         t.uniform_()
+
+
+# ---------------------------------------------------------------------------
+# OFFLINE: the caller-tensor binding rule (pure), the route refusals, and the
+# uniform binary digest — no device needed.
+# ---------------------------------------------------------------------------
+
+
+def test_select_uniform_binding_direct_and_scratch():
+    """The 2-stick binding rule: direct only for a dense (2,32) 64-elem caller;
+    every other allocation-safe case takes the scratch + device-copy path."""
+    from torch_spyre.rng import _select_uniform_binding
+
+    kw = dict(is_float32=True, is_contiguous=True)
+    # numel 0 is a no-op.
+    assert _select_uniform_binding(numel=0, device_size=(0,), **kw) == "empty"
+    # numel 64 with the exact (2,32) dense layout binds the caller directly.
+    assert _select_uniform_binding(numel=64, device_size=(2, 32), **kw) == "direct"
+    # numel <= 32 allocates ONE stick — a 2-stick store would overrun -> scratch.
+    assert _select_uniform_binding(numel=32, device_size=(1, 32), **kw) == "scratch"
+    assert _select_uniform_binding(numel=1, device_size=(1, 32), **kw) == "scratch"
+    # numel 33..63 is 2 sticks but not the full 64-element direct case -> scratch.
+    assert _select_uniform_binding(numel=33, device_size=(2, 32), **kw) == "scratch"
+    assert _select_uniform_binding(numel=63, device_size=(2, 32), **kw) == "scratch"
+    # A non-(2,32) device layout (e.g. an (8,8) row-padded tensor) -> scratch.
+    assert _select_uniform_binding(numel=64, device_size=(8, 1, 32), **kw) == "scratch"
+    # Unknown layout (None) never guesses direct -> scratch.
+    assert _select_uniform_binding(numel=64, device_size=None, **kw) == "scratch"
+
+
+def test_select_uniform_binding_refuses_typed():
+    """T>64 / non-fp32 / non-contiguous all refuse typed (never silent)."""
+    from torch_spyre.rng import _select_uniform_binding
+
+    with pytest.raises(hr.SpyreRngError) as e:
+        _select_uniform_binding(
+            numel=65, is_float32=True, is_contiguous=True, device_size=(2, 32)
+        )
+    assert "T>=2" in str(e.value) or "T-DV-34" in str(e.value)
+    with pytest.raises(hr.SpyreRngError) as e:
+        _select_uniform_binding(
+            numel=64, is_float32=False, is_contiguous=True, device_size=(2, 32)
+        )
+    assert "float32" in str(e.value)
+    with pytest.raises(hr.SpyreRngError) as e:
+        _select_uniform_binding(
+            numel=64, is_float32=True, is_contiguous=False, device_size=(2, 32)
+        )
+    assert "contiguous" in str(e.value)
+
+
+class _FakeCaller:
+    """Minimal tensor stand-in for the route guards reached before any device."""
+
+    def __init__(self, numel, device="cpu"):
+        self._n = int(numel)
+        self.device = device
+
+    def numel(self):
+        return self._n
+
+
+def test_route_uniform_fill_refuses_affine_and_t_ge_2_typed():
+    from torch_spyre.rng import route_uniform_fill
+
+    # numel 0 is a no-op (returns the caller).
+    f0 = _FakeCaller(0)
+    assert route_uniform_fill(f0, 0.0, 1.0) is f0
+    # Non-identity bounds refuse BEFORE any device/registration need.
+    with pytest.raises(hr.SpyreRngError) as e:
+        route_uniform_fill(_FakeCaller(32), -3.0, 7.0)
+    assert "identity" in str(e.value).lower() or "[0, 1)" in str(e.value)
+    # numel > 64 refuses (T-DV-34) BEFORE any device need.
+    with pytest.raises(hr.SpyreRngError) as e:
+        route_uniform_fill(_FakeCaller(65), 0.0, 1.0)
+    assert "T>=2" in str(e.value) or "T-DV-34" in str(e.value)
+
+
+def test_uniform_binary_digest_matches_the_silicon_witness():
+    """The uniform route compiles to the witnessed ``d0930bd5…`` and declares
+    the fp32 output symbol (T-LR-7 gate armed)."""
+    import hashlib
+
+    try:
+        from sentient_codegen.scheduler.matmul import PATTERN_REGISTRY
+    except Exception:
+        pytest.skip("sentient_codegen not importable (source env.sh)")
+    if "rng_kat" not in PATTERN_REGISTRY:
+        pytest.skip("rng_kat not registered in the importable codegen tree")
+
+    binary, plan = hr.build_rng_kat_uniform_binary()
+    assert hashlib.sha256(binary).hexdigest() == (
+        "d0930bd58e87cd0094159096cf4338a7572e997a51cf6ba647d7f9f0750cea68"
+    )
+    assert len(binary) == 4608
+    # Segment 1 (output) declares fp32 / IEEE_FP32 / 32 bits / contiguous.
+    out_sym = plan.symbols[1]
+    assert out_sym.logical_dtype == "f32"
+    assert out_sym.device_dtype == "IEEE_FP32"
+    assert out_sym.device_element_bits == 32
+    assert out_sym.contiguous_stick_layout is True
