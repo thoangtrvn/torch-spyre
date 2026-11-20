@@ -126,16 +126,13 @@ def test_uniform_fills_unit_interval(device_rng_on):
 
 
 @device_only
-def test_uniform_fills_requested_range_refuses_typed(device_rng_on):
-    """Non-identity [from_,to) is NOT a device route (no on-device affine).
-
-    The witnessed egress writes the bare [0,1) grid; affine scaling needs a
-    device kernel that does not exist, so the switch-ON path refuses typed
-    rather than emit out-of-request values."""
+def test_uniform_fills_requested_range(device_rng_on):
+    """Non-identity [from_,to) takes the host-map path (device bits, host
+    affine) — it still fills correctly; this is NOT a refusal (doc 54 §4.1)."""
     t = torch.empty(32, device="spyre")
-    with pytest.raises(hr.SpyreRngError) as excinfo:
-        t.uniform_(-3.0, 7.0)
-    assert "identity" in str(excinfo.value).lower() or "[0, 1)" in str(excinfo.value)
+    t.uniform_(-3.0, 7.0)
+    vals = t.cpu().numpy()
+    assert (vals >= -3.0).all() and (vals < 7.0).all()
 
 
 @device_only
@@ -189,84 +186,149 @@ def test_uniform_65_refuses_typed(device_rng_on):
         t.uniform_()
 
 
+@device_only
+def test_uniform_fp16_still_succeeds(device_rng_on):
+    """NON-REGRESSION (doc 54 §4.1): fp16 keeps today's host-map path and fills.
+    Established by execution 2026-11-19 that fp16 succeeds today; this pins it so
+    an added dtype refusal would go red."""
+    t = torch.empty(32, dtype=torch.float16, device="spyre")
+    t.uniform_()
+    v = t.cpu().numpy()
+    assert v.dtype == np.float16
+    assert (v >= 0.0).all() and (v < 1.0).all()
+
+
+@device_only
+def test_uniform_strided_behaves_as_today(device_rng_on):
+    """NON-REGRESSION (doc 54 §4.1/§8): a strided destination fills successfully
+    today (host-map path via ``spyre__uniform_``'s ``self.copy_``). Pin the
+    OBSERVED behaviour (it succeeds, values in range) — do NOT pin an assumed
+    layout/strided outcome; the exact scatter semantics are unverified."""
+    base = torch.empty(128, dtype=torch.float32, device="spyre")
+    t = base[::2]
+    assert t.shape == (64,) and not t.is_contiguous()
+    t.uniform_()
+    v = t.cpu().numpy()
+    assert v.shape == (64,)
+    assert (v >= 0.0).all() and (v < 1.0).all()
+
+
+@device_only
+def test_uniform_direct_bind_stream_identical_to_host_map(device_rng_on):
+    """§4.3 stream contract: the DIRECT device bind (numel=64) yields the SAME
+    stream as today's host map — proving the device stick order == the host
+    concatenation order (a wrong order would pass a range check and still be
+    wrong)."""
+    spyre = getattr(torch, "spyre")
+    spyre.manual_seed(99)
+    a = torch.empty(64, dtype=torch.float32, device="spyre")
+    a.uniform_()  # direct device bind
+    got = a.cpu().numpy()
+    spyre.manual_seed(99)
+    exp = np.asarray(hr.route_uniform_draw(0.0, 1.0, 64), dtype=np.float32)
+    np.testing.assert_array_equal(got.view(np.uint32), exp.view(np.uint32))
+
+
 # ---------------------------------------------------------------------------
 # OFFLINE: the caller-tensor binding rule (pure), the route refusals, and the
 # uniform binary digest — no device needed.
 # ---------------------------------------------------------------------------
 
 
-def test_select_uniform_binding_direct_only():
-    """The witnessed binding: direct ONLY for a dense (2,32) 64-element caller.
-
-    Every other caller needs a (2,32) scratch + device→device copy, which is
-    BLOCKED on 1p0 (f32 d2d copy refused by the pointer-grain gate) — so those
-    refuse typed rather than overrun a 1-stick allocation or host-round-trip."""
+def test_select_uniform_binding_direct_and_fallback():
+    """doc 54 §4.1: direct ONLY for a dense (2,32) two-stick caller with the
+    identity map + fp32 + contiguous; every other caller takes the host path
+    (fallback), never a refusal. Select shapes by computed device_size."""
     from torch_spyre.rng import _select_uniform_binding
 
-    kw = dict(is_float32=True, is_contiguous=True)
-    # numel 0 is a no-op.
+    kw = dict(from_=0.0, to=1.0, is_float32=True, is_contiguous=True)
     assert _select_uniform_binding(numel=0, device_size=(0,), **kw) == "empty"
-    # numel 64 with the exact (2,32) dense layout binds the caller directly.
-    assert _select_uniform_binding(numel=64, device_size=(2, 32), **kw) == "direct"
-    # Everything else needs the (blocked) scratch+copy path -> typed refusal.
-    for numel, ds in (
-        (32, (1, 32)),  # numel<=32: 1-stick alloc, 2-stick store overruns
-        (1, (1, 32)),
-        (33, (2, 32)),  # 2 sticks but not the witnessed 64-element direct cell
-        (63, (2, 32)),
-        (64, (8, 1, 32)),  # non-(2,32) row-padded layout
-        (64, None),  # unknown layout never guesses direct
-    ):
-        with pytest.raises(hr.SpyreRngError) as e:
-            _select_uniform_binding(numel=numel, device_size=ds, **kw)
-        assert "device" in str(e.value).lower() and "copy" in str(e.value).lower()
+    # 33..64 is a (2,32) two-stick allocation -> direct bind.
+    for n in (33, 63, 64):
+        assert _select_uniform_binding(numel=n, device_size=(2, 32), **kw) == "direct"
+    # 1..32 is a (1,32) one-stick allocation -> host path (scratch f32-blocked).
+    for n in (1, 32):
+        assert _select_uniform_binding(numel=n, device_size=(1, 32), **kw) == (
+            "fallback"
+        )
+    # A non-(2,32) layout (e.g. a 2-D (8,8) is EIGHT sticks) -> host path.
+    assert _select_uniform_binding(numel=64, device_size=(8, 1, 32), **kw) == (
+        "fallback"
+    )
+    assert _select_uniform_binding(numel=64, device_size=None, **kw) == "fallback"
+    # Non-identity map / non-fp32 / non-contiguous -> host path, NOT a refusal.
+    assert (
+        _select_uniform_binding(
+            numel=64,
+            device_size=(2, 32),
+            from_=-3.0,
+            to=7.0,
+            is_float32=True,
+            is_contiguous=True,
+        )
+        == "fallback"
+    )
+    assert (
+        _select_uniform_binding(
+            numel=64,
+            device_size=(2, 32),
+            from_=0.0,
+            to=1.0,
+            is_float32=False,
+            is_contiguous=True,
+        )
+        == "fallback"
+    )
+    assert (
+        _select_uniform_binding(
+            numel=64,
+            device_size=(2, 32),
+            from_=0.0,
+            to=1.0,
+            is_float32=True,
+            is_contiguous=False,
+        )
+        == "fallback"
+    )
 
 
-def test_select_uniform_binding_refuses_typed():
-    """T>64 / non-fp32 / non-contiguous all refuse typed (never silent)."""
+def test_select_uniform_binding_refuses_only_t_gt_64():
+    """The ONLY typed refusal added/kept here is numel > 64 (T-DV-34)."""
     from torch_spyre.rng import _select_uniform_binding
 
     with pytest.raises(hr.SpyreRngError) as e:
         _select_uniform_binding(
-            numel=65, is_float32=True, is_contiguous=True, device_size=(2, 32)
+            numel=65,
+            from_=0.0,
+            to=1.0,
+            is_float32=True,
+            is_contiguous=True,
+            device_size=(2, 32),
         )
     assert "T>=2" in str(e.value) or "T-DV-34" in str(e.value)
-    with pytest.raises(hr.SpyreRngError) as e:
-        _select_uniform_binding(
-            numel=64, is_float32=False, is_contiguous=True, device_size=(2, 32)
-        )
-    assert "float32" in str(e.value)
-    with pytest.raises(hr.SpyreRngError) as e:
-        _select_uniform_binding(
-            numel=64, is_float32=True, is_contiguous=False, device_size=(2, 32)
-        )
-    assert "contiguous" in str(e.value)
 
 
-class _FakeCaller:
-    """Minimal tensor stand-in for the route guards reached before any device."""
-
-    def __init__(self, numel, device="cpu"):
-        self._n = int(numel)
-        self.device = device
-
-    def numel(self):
-        return self._n
-
-
-def test_route_uniform_fill_refuses_affine_and_t_ge_2_typed():
+def test_route_uniform_fill_fallback_and_t_gt_64():
+    """route_uniform_fill returns False (host path) for every non-direct case —
+    affine / fp16 / strided / 1-stick — and raises ONLY for numel > 64. No new
+    refusals (doc 54 §4.1). CPU tensors: device_size is None -> fallback."""
     from torch_spyre.rng import route_uniform_fill
 
-    # numel 0 is a no-op (returns the caller).
-    f0 = _FakeCaller(0)
-    assert route_uniform_fill(f0, 0.0, 1.0) is f0
-    # Non-identity bounds refuse BEFORE any device/registration need.
+    assert route_uniform_fill(torch.empty(0, dtype=torch.float32), 0.0, 1.0) is True
+    # Non-identity bounds -> host path (host map applies the affine).
+    assert route_uniform_fill(torch.empty(64, dtype=torch.float32), -3.0, 7.0) is False
+    # fp16 -> host path (spyre__uniform_ casts on the host today).
+    assert route_uniform_fill(torch.empty(32, dtype=torch.float16), 0.0, 1.0) is False
+    # strided -> host path (whatever today does; not narrowed).
+    assert (
+        route_uniform_fill(torch.empty(128, dtype=torch.float32)[::2], 0.0, 1.0)
+        is False
+    )
+    # 1-stick (<=32) / non-(2,32) contiguous -> host path (scratch f32-blocked).
+    assert route_uniform_fill(torch.empty(32, dtype=torch.float32), 0.0, 1.0) is False
+    # ONLY numel > 64 refuses typed (T-DV-34) — unchanged from today.
     with pytest.raises(hr.SpyreRngError) as e:
-        route_uniform_fill(_FakeCaller(32), -3.0, 7.0)
-    assert "identity" in str(e.value).lower() or "[0, 1)" in str(e.value)
-    # numel > 64 refuses (T-DV-34) BEFORE any device need.
-    with pytest.raises(hr.SpyreRngError) as e:
-        route_uniform_fill(_FakeCaller(65), 0.0, 1.0)
+        route_uniform_fill(torch.empty(65, dtype=torch.float32), 0.0, 1.0)
     assert "T>=2" in str(e.value) or "T-DV-34" in str(e.value)
 
 

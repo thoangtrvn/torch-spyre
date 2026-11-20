@@ -1920,35 +1920,51 @@ def _device_stick_layout(tensor):
 
 
 def _select_uniform_binding(
-    *, numel: int, is_float32: bool, is_contiguous: bool, device_size
+    *,
+    numel: int,
+    from_: float,
+    to: float,
+    is_float32: bool,
+    is_contiguous: bool,
+    device_size,
 ) -> str:
-    """Decide how to bind the caller tensor to the 2-stick uniform egress.
+    """Decide how to serve a switch-ON ``uniform_()`` fill (doc 54 §4.1).
 
     Returns one of:
 
     * ``"empty"`` — ``numel == 0`` (nothing to write; a no-op).
-    * ``"direct"`` — bind the caller tensor itself as segment 1. Only when it is
-      float32, contiguous, ``numel == 64`` AND its device layout is exactly the
-      2 dense sticks ``(2, 32)`` the egress writes — so the 2-stick store stays
-      inside the allocation. This is the ONE silicon-witnessed binding
-      (numel=64, 4/4 seeds, 64/64 words bit-exact — P5 route witness).
+    * ``"direct"`` — bind the caller tensor itself as segment 1, ZERO host
+      round trip. Requires the identity map (``[0,1)``), float32, contiguous,
+      AND a device layout of exactly the 2 dense sticks ``(2, 32)`` the egress
+      writes — a 1-D ``33 <= numel <= 64`` tensor (``device_size == [2,32]``).
+      This is the silicon-witnessed binding.
+    * ``"fallback"`` — take the EXISTING host-map path (device bits ->
+      ``raw_words_to_uniform`` -> ``self.copy_``), unchanged from today. This is
+      the answer for every caller the device scratch path cannot serve without a
+      new refusal (doc 54 §4.1 last rows, §3 option B):
 
-    Refuses typed (``SpyreRngError``) for:
+        - a non-identity ``(from_, to)`` — the egress writes the bare ``[0,1)``
+          grid and there is no on-device affine kernel; the host map applies it;
+        - non-fp32 — ``spyre__uniform_`` casts on the host today; keep it;
+        - non-contiguous / a non-``(2,32)`` device layout (e.g. a 2-D ``(8,8)``
+          is EIGHT sticks) — keep today's path;
+        - ``1 <= numel <= 32`` (a ``(1,32)`` one-stick allocation).
 
-    * ``numel > 64`` (T-DV-34, one T=1 tile);
-    * a non-fp32 dtype (no on-device conversion; torch_spyre refuses casts);
-    * a non-contiguous caller (a strided layout silently flattened into the
-      stick layout is the silent-wrong class);
-    * **every caller that needs the (2,32) scratch + device→device copy** —
-      notably ``numel <= 32`` (a 1-stick allocation a 2-stick store would
-      overrun), but also any non-``(2,32)`` layout and ``numel in [33,63]``.
-      The copy path is BLOCKED on 1p0: ``copy_from_d2d`` is an Inductor-
-      compiled identity kernel, and an f32 device→device copy is refused by the
+      The scratch path (a ``(2,32)`` device scratch + one ``copy_from_d2d``) is
+      UNAVAILABLE for f32 on 1p0: ``copy_from_d2d`` is an Inductor custom op
+      lowered by ``lowering.mutate_to(dst, src)`` to a compiled pointwise copy
+      kernel (NOT a raw memcpy), and an f32 device→device copy is refused by the
       pointer-grain gate (``SENTIENT-POINTER-ELEMENT-GRAIN-COMPUTE-ONLY-POINTEE``
-      — the f32 pointwise-copy route is unbuilt; witnessed 2026-11-19: full,
-      ``copy_`` and sliced f32 d2d copies all refuse). Refusing typed here is
-      honest: the alternative — a host round trip — is exactly what this route
-      removes, and silently overrunning a 1-stick allocation is worse.
+      — the f32 pointwise-copy route is unbuilt). Established by execution on
+      the box 2026-11-19: full ``copy_from_d2d``, full ``copy_`` and sliced
+      ``copy_`` all refuse for f32. Doc 54 §3 pre-authorises this fallback:
+      option B "is the correct first cut if the scratch path proves
+      unavailable". So ``numel <= 32`` keeps the host round trip rather than a
+      new refusal or a silent overrun.
+
+    Raises typed (``SpyreRngError``) ONLY for ``numel > 64`` (T-DV-34, one T=1
+    tile) — every other case is a device path or the unchanged host path, never
+    a new refusal (doc 54 §4.1 / §5).
     """
     if numel == 0:
         return "empty"
@@ -1959,36 +1975,17 @@ def _select_uniform_binding(
             "32-lane tile producing u0,u1). Draw on the host, or split into "
             "independent draws."
         )
+    if float(from_) != 0.0 or float(to) != 1.0:
+        return "fallback"
     if not is_float32:
-        raise SpyreRngError(
-            "device uniform_ requires a float32 caller tensor: the witnessed "
-            "egress writes IEEE_FP32 and there is no on-device dtype conversion "
-            "(torch_spyre refuses on-device casts). Use a float32 tensor, or "
-            "turn off TORCH_SPYRE_DEVICE_RNG for the host-CPU offload."
-        )
+        return "fallback"
     if not is_contiguous:
-        raise SpyreRngError(
-            "device uniform_ requires a contiguous caller tensor: the egress "
-            "writes densely packed (2,32) sticks, and flattening a strided "
-            "layout into that stick layout would be a silent-wrong. Call "
-            ".contiguous() first, or turn off TORCH_SPYRE_DEVICE_RNG."
-        )
-    if numel == _RNG_MAX_UNIFORM_ELEMS and device_size == (2, RNG_KAT_LANES):
+        return "fallback"
+    if device_size == (2, RNG_KAT_LANES):
         return "direct"
-    # Everything else needs the (2,32) scratch + a device→device copy, which is
-    # blocked on 1p0 by the unbuilt f32 pointwise-copy route (pointer-grain
-    # gate). Refuse typed rather than overrun a 1-stick allocation (numel<=32)
-    # or host-round-trip the device bits.
-    raise SpyreRngError(
-        f"device uniform_ currently serves only a 64-element float32 caller "
-        f"with a dense (2,32) device layout (the silicon-witnessed direct "
-        f"binding). This caller has numel={numel} (device layout {tuple(device_size) if device_size else None}). "
-        "Smaller/other callers need a (2,32) scratch + one device→device copy, "
-        "but an f32 device→device copy is refused on 1p0 by the unbuilt f32 "
-        "pointwise-copy route (SENTIENT-POINTER-ELEMENT-GRAIN). Draw this size "
-        "on the host (turn off TORCH_SPYRE_DEVICE_RNG), or wait for the f32 "
-        "copy route."
-    )
+    # contiguous fp32 but a (1,32) one-stick allocation (1..32) or some other
+    # layout: the scratch path is f32-blocked -> keep today's host path.
+    return "fallback"
 
 
 def launch_uniform_draw(
@@ -2032,26 +2029,55 @@ def launch_uniform_draw(
                 "launch_uniform_draw requires a spyre-device caller tensor; got "
                 f"device {out.device!r}. Draw on the host with the switch off."
             )
+        # This is the device launcher: it serves only the DIRECT binding (the
+        # identity map). route_uniform_fill routes every other caller to the
+        # host path before reaching here.
         decision = _select_uniform_binding(
             numel=int(out.numel()),
+            from_=0.0,
+            to=1.0,
             is_float32=(out.dtype == torch.float32),
             is_contiguous=out.is_contiguous(),
             device_size=_device_stick_layout(out),
         )
         if decision == "empty":
             return out
-        target = out  # decision == "direct"
+        if decision != "direct":
+            raise SpyreRngError(
+                "launch_uniform_draw serves only the direct (2,32) float32 "
+                f"binding; caller (numel={out.numel()}) must use the host path "
+                "(route_uniform_fill returns False for it). Internal routing bug."
+            )
+        target = out
 
     tensors_by_symbol = {
         xlat_plan.symbols[0].symbol_id: params,
         xlat_plan.symbols[1].symbol_id: target,
     }
+
+    def _window_bytes(tensor) -> int:
+        """The tensor's physical allocation bytes.
+
+        A spyre tensor is stick-grade allocated: its device layout product is
+        the physical footprint even when the LOGICAL ``nbytes`` under-reports it
+        (a 33-element fp32 tensor is two 128-byte sticks = 256 B physically, but
+        132 B logically). The launch ABI gate compares the window against the
+        binary's stick-aligned write, so the PHYSICAL footprint is the truthful
+        window (``_C.get_spyre_tensor_layout().device_size`` — the allocation
+        the tensor was shaped from). Falls back to logical bytes when the layout
+        is unknown (the ``out is None`` full-scratch case reports its own)."""
+        logical = int(tensor.element_size() * tensor.nelement())
+        ds = _device_stick_layout(tensor)
+        if ds:
+            prod = 1
+            for v in ds:
+                prod *= int(v)
+            return max(logical, prod * int(tensor.element_size()))
+        return logical
+
     specs = {
         sym.symbol_id: (
-            int(
-                tensors_by_symbol[sym.symbol_id].element_size()
-                * tensors_by_symbol[sym.symbol_id].nelement()
-            ),
+            _window_bytes(tensors_by_symbol[sym.symbol_id]),
             "input" if sym.access_mode == "read" else "output",
         )
         for sym in xlat_plan.symbols
@@ -2072,45 +2098,49 @@ def launch_uniform_draw(
     return target
 
 
-def route_uniform_fill(self, from_=0.0, to=1.0) -> "object":
-    """Device route for a user-facing ``uniform_`` fill (switch ON).
+def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
+    """Device route for a switch-ON ``uniform_`` fill (doc 54 §4.1).
 
-    Fills the caller tensor ``self`` with device-generated uniforms in
-    ``[from_, to)`` — but ONLY the identity map ``[0, 1)`` is a device route
-    today: the witnessed egress writes the bare ``[0,1)`` fp32 grid, and no
-    on-device affine (``from_ + u*(to-from_)``) kernel exists, so any other
-    ``(from_, to_)`` refuses typed rather than emit values that are not the
-    request (turn off TORCH_SPYRE_DEVICE_RNG for the host offload, which honors
-    arbitrary bounds). There is NO host-RNG fallback: with the switch ON a
-    refusal is the honest outcome, never a silent host substitute.
+    Returns ``True`` when the fill was performed ON DEVICE (zero host round
+    trip, direct-bind): the caller tensor is float32, contiguous, its device
+    layout is exactly ``(2,32)`` (a 1-D ``33 <= numel <= 64``), and the map is
+    the identity ``[0,1)``. Returns ``False`` when the caller must take the
+    EXISTING host-map path — every other case (non-identity ``(from_, to)``,
+    non-fp32, non-contiguous / non-``(2,32)``, and ``numel <= 32`` whose scratch
+    path is f32-blocked). See :func:`_select_uniform_binding`.
 
-    Reserves ``numel`` block-counters from the device generator (so successive
+    Raises typed (``SpyreRngError``) ONLY for ``numel > 64`` (T-DV-34). For the
+    direct path the device generator must be reachable (registration + state),
+    exactly as today's ``route_uniform_draw`` requires; a direct phone with the
+    generator unreachable raises rather than silently host-drawing.
+
+    Reserves ``numel`` block-counters from the device generator (successive
     draws differ, a fixed seed reproduces), draws ONE T=1 counter block and
-    writes it into ``self`` via :func:`launch_uniform_draw` — zero host round
-    trip of the generated floats. The params stream is rebuilt in full per
-    draw (the resident buffer is keyed for the raw egress); a uniform residency
-    is a follow-on, not this cut.
+    writes it into ``self`` via :func:`launch_uniform_draw`. The params stream
+    is rebuilt in full per direct draw (the resident buffer is keyed for the raw
+    egress); a uniform residency is a follow-on.
     """
+    import torch
+
     numel = int(self.numel())
     if numel < 0:
         raise ValueError(f"numel must be non-negative, got {numel}")
-    if numel > _RNG_MAX_UNIFORM_ELEMS:
-        raise SpyreRngError(
-            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements exceed the "
-            f"{_RNG_MAX_UNIFORM_ELEMS} words a single T=1 launch yields (one "
-            "32-lane tile producing u0,u1). Draw on the host, or split into "
-            "independent draws."
-        )
-    if numel == 0:
-        return self
-    if float(from_) != 0.0 or float(to) != 1.0:
-        raise SpyreRngError(
-            "device uniform_ serves only the identity map [0, 1): the witnessed "
-            "uniform egress writes the bare [0,1) fp32 grid and there is no "
-            f"on-device affine (from + u*(to-from)) kernel to produce "
-            f"[{float(from_)}, {float(to)}). Turn off TORCH_SPYRE_DEVICE_RNG for "
-            "the host-CPU offload, which honors arbitrary bounds."
-        )
+    action = _select_uniform_binding(
+        numel=numel,
+        from_=from_,
+        to=to,
+        is_float32=(self.dtype == torch.float32),
+        is_contiguous=self.is_contiguous(),
+        device_size=_device_stick_layout(self),
+    )
+    if action == "empty":
+        return True
+    if action == "fallback":
+        # Not a refusal: the caller takes today's host-map path (device bits ->
+        # host map -> self.copy_), which applies affine bounds / casts / strided.
+        return False
+    # action == "direct": a device draw. Same generator/registry guards the
+    # host path enforces, but raised (not silently host-drawn) for a device call.
     if not rng_pattern_registered():
         raise SpyreRngError(
             "device RNG is not wired yet: backend pattern 'rng_kat' is not "
@@ -2124,7 +2154,7 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> "object":
             "not registered); cannot reserve a draw offset. Refusing rather than "
             "falling back to a host draw."
         )
-    # Reserve one block per element so a second draw advances the offset.
+    # Reserve numel block-counters so a second draw advances the offset.
     offset = state.reserve(numel)
     plan = build_rng_launch_plan(
         seed=state.seed,
@@ -2138,7 +2168,7 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> "object":
         resident=False,
     )
     launch_uniform_draw(plan, out=self, device=self.device, use_resident=False)
-    return self
+    return True
 
 
 def reconstruct_raw_state_from_tensor(out) -> "tuple[np.ndarray, np.ndarray]":

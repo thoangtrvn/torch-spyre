@@ -192,22 +192,31 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     # Default (switch OFF): the documented host-CPU offload — draw on CPU, copy
     # to device. Reproducible only via the CPU stream; this is NOT device RNG.
     #
-    # Switch ON (TORCH_SPYRE_DEVICE_RNG): the device route writes DEVICE-
-    # generated uniforms straight into ``self`` — the silicon-witnessed T=1
-    # UNIFORM egress (binary d0930bd5…), bound to the caller tensor (or a
-    # (2,32) scratch + one device→device copy), with ZERO host round trip. The
-    # egress writes the bare [0,1) fp32 grid, so only the identity map is a
-    # device route; any other (from_, to) REFUSES TYPED (no on-device affine
-    # kernel). It also refuses typed beyond one T=1 tile (numel > 64, T-DV-34),
-    # a non-fp32 or non-contiguous caller, or an unregistered pattern. A caller
-    # who opted into device RNG never gets a host draw.
+    # Switch ON (TORCH_SPYRE_DEVICE_RNG): ``route_uniform_fill`` fills
+    # DEVICE-generated uniforms straight into ``self`` — the silicon-witnessed
+    # T=1 UNIFORM egress (binary d0930bd5…), DIRECT-bound to the caller tensor
+    # (float32, contiguous, 33<=numel<=64, device layout (2,32), identity map),
+    # with ZERO host round trip. For every other caller (non-identity (from_,to),
+    # non-fp32, non-contiguous / non-(2,32), and numel<=32 whose device scratch
+    # path is f32-blocked) it returns False and the caller takes TODAY's host-map
+    # path below — device bits still come from the device, but with a round trip;
+    # this is an optimisation of the common case, NOT a narrowing (doc 54 §4.1).
+    # Only numel > 64 (T-DV-34) is a typed refusal, unchanged from today. A
+    # caller who opted into device RNG never gets a HOST-RNG draw.
     from torch_spyre.rng import device_rng_enabled
 
     if device_rng_enabled():
-        from torch_spyre.rng import route_uniform_fill
+        from torch_spyre.rng import route_uniform_draw, route_uniform_fill
 
         _reject_per_call_generator(generator)
-        route_uniform_fill(self, from_, to)  # raises typed
+        if route_uniform_fill(self, from_, to):  # raises typed for numel>64
+            return self
+        # Fallback: TODAY's host-map path, unchanged (affine/cast/strided). The
+        # bits are device-generated (route_uniform_draw draws the raw kernel and
+        # maps on the host); this is a round trip, not a host RNG.
+        values = route_uniform_draw(from_, to, self.numel())
+        host = torch.from_numpy(values).to(dtype=self.dtype)
+        self.copy_(host.reshape(self.shape))
         return self
 
     # Create a new tensor on cpu
