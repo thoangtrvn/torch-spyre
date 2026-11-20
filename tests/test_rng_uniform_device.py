@@ -25,10 +25,15 @@ Two tiers:
 
 ``route_uniform_draw`` remains the host-map path (device raw bits, host map).
 The P5 route (``route_uniform_fill`` -> ``launch_uniform_draw``) writes the
-silicon-witnessed 2-stick UNIFORM egress straight into the caller tensor (or a
-(2,32) scratch + one device→device copy) with zero host round trip, only for
-the identity ``[0, 1)`` map. The pure binding rule, the route refusals, and the
-uniform binary digest are host-testable and run in the OFFLINE tier below.
+silicon-witnessed 2-stick UNIFORM egress straight into the caller tensor with
+zero host round trip, for the direct cell — float32, contiguous, identity
+``[0, 1)``, device layout ``(2,32)``, i.e. ``33 <= numel <= 64`` (doc 54 v5).
+A ``(2,32)`` scratch + device→device copy would cover ``numel <= 32`` but the
+f32 d2d copy is refused on 1p0 (pointer-grain gate), so those callers fall back
+to the host map. Every other caller (1..32, non-identity bounds, non-fp32,
+non-contiguous) also falls back; only ``numel > 64`` refuses. The pure binding
+rule, the route refusals, and the uniform binary digest are host-testable and
+run in the OFFLINE tier below.
 """
 
 import numpy as np
