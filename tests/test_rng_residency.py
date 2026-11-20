@@ -714,7 +714,13 @@ def test_resident_plan_refuses_nonzero_stream_typed(monkeypatch):
             egress=hr.EgressMode.RAW_STATE,
             resident=True,
         )
-    assert "stream" in str(excinfo.value).lower()
+    msg = str(excinfo.value)
+    assert "stream" in msg.lower()
+    # The remedy must name the ONLY correct alternative: `resident=False` alone
+    # is not enough — the launcher still takes the resident branch and the
+    # resource builds with its own _stream, discarding the plan's stream-N
+    # words. A nonzero stream needs use_resident=False (or a per-stream key).
+    assert "use_resident=False" in msg
 
 
 def test_resident_plan_stream_zero_is_still_accepted(monkeypatch):

@@ -1439,8 +1439,9 @@ def build_rng_launch_plan(
                 "resident plan construction cannot honour a nonzero stream: "
                 "RngDrawSpec carries no stream index, so the resident key would "
                 f"silently serve stream-0 params for a stream-{stream} request. "
-                "Use a non-resident draw (resident=False) or a separate "
-                "resources/device key for the desired stream."
+                "A nonzero stream requires launching with use_resident=False "
+                "(until the launcher honours plan.stream / a stream key exists), "
+                "or a separate resources key per stream."
             )
         # Resident path: the launcher reads the device tensor, so build only the
         # declared ABI — no params words. Shape derives from the LOCAL
