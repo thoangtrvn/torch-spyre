@@ -135,18 +135,20 @@ def spyre_ones(
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])  # type:ignore
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
-    # Honest draw path: device RNG has no normal-distribution kernel at all (its
-    # only witnessed artifact is the T=1 raw-state Threefry KAT). With the
-    # device-RNG switch ON we REFUSE typed rather than silently offload; with it
-    # OFF (the default) this stays the documented host-CPU offload.
+    # Honest draw path: the device has no normal-distribution kernel and no
+    # on-device uniform->normal transform — its witnessed egresses are the
+    # uniform fp32 grid and the raw Threefry state, both uniform-derived. With
+    # the device-RNG switch ON we REFUSE typed rather than silently offload;
+    # with it OFF (the default) this stays the documented host-CPU offload.
     from torch_spyre.rng import SpyreRngError, device_rng_enabled
 
     if device_rng_enabled():
         raise SpyreRngError(
-            "device RNG has no normal-distribution path: the only witnessed "
-            "artifact is the T=1 raw-state Threefry KAT (uniform-derived). "
-            "Turn off TORCH_SPYRE_DEVICE_RNG to use the documented host-CPU "
-            "offload, or draw normals from a uniform stream on the host."
+            "device RNG has no normal-distribution path: the witnessed "
+            "egresses are uniform-derived (the uniform fp32 grid and the raw "
+            "Threefry state), and there is no on-device uniform->normal "
+            "transform. Turn off TORCH_SPYRE_DEVICE_RNG to use the documented "
+            "host-CPU offload, or draw normals from a uniform stream on the host."
         )
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.
@@ -194,15 +196,19 @@ def spyre__uniform_(self, from_=0.0, to=1.0, generator=None):
     #
     # Switch ON (TORCH_SPYRE_DEVICE_RNG): ``route_uniform_fill`` fills
     # DEVICE-generated uniforms straight into ``self`` — the silicon-witnessed
-    # T=1 UNIFORM egress (binary d0930bd5…), DIRECT-bound to the caller tensor
-    # (float32, contiguous, numel==64, device layout (2,32), identity map),
-    # with ZERO host round trip. For every other caller (non-identity (from_,to),
-    # non-fp32, non-contiguous / non-(2,32), and 1<=numel<=63 whose device scratch
-    # path is f32-blocked) it returns False and the caller takes TODAY's host-map
-    # path below — device bits still come from the device, but with a round trip;
-    # this is an optimisation of the common case, NOT a narrowing (doc 54 §4.1).
-    # Only numel > 64 (T-DV-34) is a typed refusal, unchanged from today. A
-    # caller who opted into device RNG never gets a HOST-RNG draw.
+    # uniform egress, DIRECT-bound to the caller tensor (float32, contiguous,
+    # a whole number of 64-word tiles up to _RNG_UNIFORM_TILES_CAP, device
+    # layout (2n, 32), identity map), with ZERO host round trip. For every
+    # other caller (non-identity (from_,to), non-fp32, non-contiguous /
+    # non-(2n,32), and 1<=numel<=63 whose device scratch path is f32-blocked)
+    # it returns False and the caller takes TODAY's host-map path below —
+    # device bits still come from the device, but with a round trip; this is an
+    # optimisation of the common case, NOT a narrowing (doc 54 §4.1).
+    # Typed refusals: numel > 64 that is not a whole number of 64-word tiles,
+    # a tile count above _RNG_UNIFORM_TILES_CAP, and any per-call
+    # generator=<obj> (_reject_per_call_generator — the device path uses the
+    # single per-device default generator). A caller who opted into device RNG
+    # never gets a HOST-RNG draw.
     from torch_spyre.rng import device_rng_enabled
 
     if device_rng_enabled():

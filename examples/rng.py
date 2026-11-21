@@ -36,8 +36,11 @@ Honest bounds (doc 54) — do not read past them
   bits mapped to floats on the host). That is **not** a refusal and must not
   be turned into one.
 * Typed refusals: ``numel > 64`` that is not a whole number of tiles, more
-  than 63 tiles, and any use without the ``rng_kat`` pattern registered.
-* There is no device ``normal_``.
+  than 63 tiles, any per-call ``generator=<obj>`` (the device path uses the
+  single per-device default generator — multi-stream is unbuilt), and any use
+  without the ``rng_kat`` pattern registered.
+* There is no device ``normal_``, so ``torch.randn(..., device="spyre")``
+  refuses with the switch on and host-offloads with it off.
 """
 
 import torch
