@@ -14,9 +14,17 @@
 
 """Random numbers on the AIU — the short version.
 
-Run with the device path switched on:
+Run with the device path switched on, from an installed torch-spyre:
 
     TORCH_SPYRE_DEVICE_RNG=1 python examples/rng.py
+
+Running it from this source tree instead needs BOTH trees on PYTHONPATH — the
+torch-spyre tree so the aten kernels register from source, and the codegen tree
+so the backend registers the ``rng_kat`` pattern the direct draw launches
+(verified device-clean 2026-11-21, exit 0):
+
+    PYTHONPATH=<this-tree>:<spyre-knowledgebase>/codegen \
+      TORCH_SPYRE_DEVICE_RNG=1 python examples/rng.py
 
 What you get
 ------------
