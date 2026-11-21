@@ -576,8 +576,9 @@ def draw_params_stream(
     device: int = 0,
     stream: int = 0,
     egress: EgressMode = EgressMode.RAW_STATE,
+    n_tiles: int = 1,
 ) -> tuple[StreamWord, ...]:
-    """Derive the full params stream for one T=1 tile from ``(seed, offset)``.
+    """Derive the params stream for ``n_tiles`` tiles from ``(seed, offset)``.
 
     Applies the doc 43 §3.1 host chain: ``seed -> seed_key -> epoch key k' ->
     fold -> (x0_base, x1)`` plus ``injection_words_2x32(k', rounds)`` and
@@ -594,15 +595,37 @@ def draw_params_stream(
     x0_base, x1 = fold_key_schedule_2x32(k_prime, offset)
     injections = injection_words_2x32(k_prime, rounds)
     rotations = [ROTATIONS_2X32[r % 8] for r in range(rounds)]
-    return build_band_lxlu_stream(
-        blocks,
-        x0_base=x0_base,
-        x1=x1,
-        rotations=rotations,
-        injections=injections,
-        rounds=rounds,
-        egress=egress,
-    )
+    if n_tiles == 1:
+        return build_band_lxlu_stream(
+            blocks,
+            x0_base=x0_base,
+            x1=x1,
+            rotations=rotations,
+            injections=injections,
+            rounds=rounds,
+            egress=egress,
+        )
+    if n_tiles < 1:
+        raise SpyreRngError(f"draw_params_stream: n_tiles must be >= 1, got {n_tiles}")
+    # Device tile loop: tile t advances the counter base by t (counter_stride=1),
+    # byte-identical to the codegen owner's build_band_lxlu_stream_multitile.
+    # All tiles share the epoch key (k_prime/injections/rotations); a fill that
+    # crossed an epoch boundary would need re-keying — out of scope here (the same
+    # single-epoch assumption the T=1 path makes).
+    out: list = []
+    for t in range(n_tiles):
+        out.extend(
+            build_band_lxlu_stream(
+                blocks,
+                x0_base=x0_base + t,
+                x1=x1,
+                rotations=rotations,
+                injections=injections,
+                rounds=rounds,
+                egress=egress,
+            )
+        )
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -1371,6 +1394,11 @@ class RngLaunchPlan:
     declared_segment_count: int
     #: Raw-egress reconstruction: x0 = (x0h<<16)|x0l, x1 = (x1h<<16)|x1l.
     output_sticks: int
+    #: Device tile-loop trip count this plan covers (1 = single tile; the
+    #: witnessed UNIFORM widths 2/4/16 are the multi-tile plans). The launcher
+    #: builds the matching ``n_tiles`` binary and binds a ``(2*n_tiles, 32)``
+    #: output region.
+    n_tiles: int = 1
     #: The draw spec this plan was derived from (Option 1 residency). ``None`` on
     #: a hand-built plan; the launcher then falls back to the baked-in params.
     spec: "RngDrawSpec | None" = None
@@ -1392,6 +1420,7 @@ def build_rng_launch_plan(
     stream: int = 0,
     egress: EgressMode = EgressMode.RAW_STATE,
     resident: bool = False,
+    n_tiles: int = 1,
 ) -> RngLaunchPlan:
     """Build the T=1 params stream + ABI, refusing every unwired path, typed.
 
@@ -1419,13 +1448,28 @@ def build_rng_launch_plan(
     """
     if not isinstance(egress, EgressMode):
         raise TypeError(f"egress must be an EgressMode, got {egress!r}")
-    # T>=2 guard: one tile is 32 lanes. More elements => T>=2 => unbuilt.
-    tiles = (int(numel) + RNG_KAT_LANES - 1) // RNG_KAT_LANES
-    if tiles >= 2:
+    # Tile guard: multi-tile is wired only for the UNIFORM egress, at any width
+    # 1.._RNG_UNIFORM_TILES_CAP; every other multi-tile request (raw, or a width
+    # above the cap / above the ISA bound) is a typed refusal (T-DV-34).
+    if n_tiles < 1:
         raise SpyreRngError(
-            f"device RNG T>=2 is unbuilt (T-DV-34): this request covers {numel} "
-            f"elements = {tiles} tiles; only the single 32-lane T=1 tile is "
-            f"witnessed. Draw on the host, or split into independent T=1 draws."
+            f"build_rng_launch_plan: n_tiles must be >= 1, got {n_tiles}"
+        )
+    if n_tiles > _RNG_TILE_LOOP_MAX:
+        raise SpyreRngError(
+            f"device RNG: n_tiles={n_tiles} exceeds the MVLOOPCNT 8-bit trip "
+            f"bound {_RNG_TILE_LOOP_MAX} (a static count of 0 wraps to 256); "
+            "split into multiple launches."
+        )
+    if n_tiles >= 2 and not (
+        egress is EgressMode.UNIFORM and n_tiles <= _RNG_UNIFORM_TILES_CAP
+    ):
+        raise SpyreRngError(
+            f"device RNG T>=2 is unbuilt (T-DV-34): {n_tiles} tiles requested; "
+            "only the UNIFORM egress at width 1.."
+            f"{_RNG_UNIFORM_TILES_CAP} is multi-tile-wired (the silicon-"
+            f"witnessed head is {_RNG_WITNESSED_UNIFORM_TILES_MAX}). Draw on the "
+            "host, or use a width within the cap."
         )
     # Pre-registration guard (lane B not landed yet).
     if not rng_pattern_registered():
@@ -1456,7 +1500,7 @@ def build_rng_launch_plan(
         # ``band_lxlu_pop_count`` mirror (== the stream length; drift-guarded
         # against the codegen owner in test_rng_host) and the lane constant.
         params = None
-        sticks = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=egress)
+        sticks = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=egress) * n_tiles
         lanes = RNG_KAT_LANES
     else:
         params_stream = draw_params_stream(
@@ -1466,6 +1510,7 @@ def build_rng_launch_plan(
             device=device,
             stream=stream,
             egress=egress,
+            n_tiles=n_tiles,
         )
         params = stream_to_sticks(params_stream)
         sticks = int(params.shape[0])
@@ -1478,16 +1523,41 @@ def build_rng_launch_plan(
         rounds=RNG_KAT_ROUNDS,
         xlat_segments={"input": 0, "output": 1},
         declared_segment_count=2,
-        output_sticks=band_egress_stick_count(RNG_KAT_ROUNDS, egress=egress),
+        output_sticks=band_egress_stick_count(RNG_KAT_ROUNDS, egress=egress) * n_tiles,
         spec=spec,
         stream=int(stream),
+        n_tiles=n_tiles,
     )
 
 
 #: One T=1 launch reconstructs ``x0`` and ``x1`` — 32 lanes each, full 32-bit
 #: words — so a single launch yields ``2 * RNG_KAT_LANES`` = 64 uniform words.
-#: That bounds the T=1 device uniform fill: ``numel <= 64``.
+#: That bounds a single T=1 tile: ``numel == 64`` per tile.
 _RNG_MAX_UNIFORM_ELEMS = 2 * RNG_KAT_LANES
+
+#: ISA bound on a single ``MVLOOPCNT`` trip: the LCCR is an 8-bit decrementing
+#: counter, so a static count is 0..255 and **0 WRAPS to 256**
+#: (``sentient_codegen.isa.constraints.validate_loop_count``; ISA "loop count: 0
+#: means 256"). 256 (``imm=0``) is excluded until the wrap encoding is emitted
+#: and witnessed, so the clean single-launch tile-loop ceiling is 255. Mirrors
+#: ``sentient_codegen.scheduler.rng._RNG_TILE_LOOP_MAX``.
+_RNG_TILE_LOOP_MAX = 255
+#: Silicon-witnessed head of the device tile loop (UNIFORM egress). 2/4/16/32/63
+#: tiles read back bit-exact vs host ``threefry2x32_20`` on 2026-11-20 (claims
+#: rng-multitile-{2,4,16,32,63}tile — the same witnessed binaries the codegen
+#: route emits). The loop body is tile-invariant and its only per-tile variables
+#: (counter +1, egress stride 2n) are linear, so ANY width
+#: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind. 63 is ALSO
+#: the hard LX block-load ceiling: 64 tiles' params (16448 sticks) overflow the
+#: 2 MB / 16384-stick LX scratchpad, the block load wraps, and the leading tiles
+#: come back garbage (witnessed at 64/128/255 — bit-exact at 63). So the width
+#: ceiling and the witness head coincide; going beyond needs per-tile params
+#: streaming (not built), NOT another witness. Mirrors
+#: ``sentient_codegen.scheduler.rng._RNG_WITNESSED_UNIFORM_TILES_MAX``.
+_RNG_WITNESSED_UNIFORM_TILES_MAX = 63
+#: The widest tile count a route will admit now: the witness head, clamped to the
+#: ISA trip bound.
+_RNG_UNIFORM_TILES_CAP = min(_RNG_WITNESSED_UNIFORM_TILES_MAX, _RNG_TILE_LOOP_MAX)
 
 
 def raw_words_to_uniform(words, from_: float = 0.0, to: float = 1.0) -> np.ndarray:
@@ -1698,23 +1768,26 @@ def build_rng_kat_binary(target: "str | None" = None) -> "tuple[bytes, object]":
 #: binary is the silicon-witnessed ``d0930bd5…`` (receipt ``rng-p5-uniform-kat``);
 #: the plan declares the output symbol's fp32 dtype/layout so the T-LR-7 gate
 #: fires on the caller tensor (design 53 Q3.2). Distinct from the raw cache.
-_UNIFORM_KAT_CACHE: "tuple[bytes, object] | None" = None
+_UNIFORM_KAT_CACHE: "dict[int, tuple[bytes, object]]" = {}
 
 
-def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, object]":
-    """Compile (once) the registered ``rng_kat`` T=1 UNIFORM binary + plan.
+def build_rng_kat_uniform_binary(
+    target: "str | None" = None, *, n_tiles: int = 1
+) -> "tuple[bytes, object]":
+    """Compile (once, per tile count) the registered ``rng_kat`` UNIFORM binary.
 
-    The UNIFORM analogue of :func:`build_rng_kat_binary` (2 egress sticks, 257
-    params sticks, the one-stick egress stride seed). For a rcudd1a target the
-    binary is the silicon-witnessed ``d0930bd5…`` (4608 B, receipt
-    ``rng-p5-uniform-kat``). The XLAT plan is derived from the SAME scheduled
-    program AND declares the output symbol (segment 1) as ``f32``/``IEEE_FP32``
-    /32-bit/contiguous (T-LR-7) — the raw build passes no ``symbol_dtypes`` and
-    so leaves that gate unfired; the uniform caller-tensor binding needs it
-    armed (design 53 Q3.2). Raises ``SpyreRngError`` on a non-witnessed target
-    or if the backend has not registered ``rng_kat``.
+    The UNIFORM analogue of :func:`build_rng_kat_binary`. ``n_tiles == 1`` is the
+    silicon-witnessed ``d0930bd5…`` (2 egress sticks, 257 params sticks); the
+    device tile loop (n_tiles ∈ the witnessed 2/4/16) emits the multi-tile
+    binaries the codegen route now admits (``a8c85caa`` / ``5c7bc0e6`` /
+    ``70c8e03e`` — the same silicon-witnessed bytes). The XLAT plan is derived
+    from the SAME scheduled program AND declares the output symbol (segment 1)
+    as ``f32``/``IEEE_FP32``/32-bit/contiguous (T-LR-7) with extents scaled to
+    ``n_tiles``. ``n_tiles`` 1..``_RNG_UNIFORM_TILES_CAP`` is
+    admitted in kind; a count above the cap or above the ISA trip bound raises
+    ``SpyreRngError``, as does a non-witnessed target or a backend that has not
+    registered ``rng_kat``.
     """
-    global _UNIFORM_KAT_CACHE
     from sentient_codegen.gen.registry import get_default_target, get_generation
 
     tgt = get_default_target() if target is None else target
@@ -1723,8 +1796,23 @@ def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, o
             f"device RNG has no witnessed kernel for target {tgt!r}; it is 1p0 "
             f"({sorted(_RNG_WITNESSED_TARGETS)})-only (1p5 RNG is unbuilt)"
         )
-    if _UNIFORM_KAT_CACHE is not None:
-        return _UNIFORM_KAT_CACHE
+    if n_tiles < 1:
+        raise SpyreRngError(
+            f"build_rng_kat_uniform_binary: n_tiles must be >= 1, got {n_tiles}"
+        )
+    if n_tiles > _RNG_TILE_LOOP_MAX:
+        raise SpyreRngError(
+            f"build_rng_kat_uniform_binary: n_tiles={n_tiles} exceeds the "
+            f"MVLOOPCNT 8-bit trip bound {_RNG_TILE_LOOP_MAX}; split the launch."
+        )
+    if n_tiles > _RNG_UNIFORM_TILES_CAP:
+        raise SpyreRngError(
+            f"build_rng_kat_uniform_binary: n_tiles={n_tiles} exceeds the "
+            f"silicon-witnessed cap {_RNG_UNIFORM_TILES_CAP}; witness a wider "
+            "count on silicon to raise the cap."
+        )
+    if n_tiles in _UNIFORM_KAT_CACHE:
+        return _UNIFORM_KAT_CACHE[n_tiles]
     if not rng_pattern_registered():
         raise SpyreRngError(
             "device RNG is not wired: backend pattern 'rng_kat' is not registered"
@@ -1738,8 +1826,9 @@ def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, o
     )
     from sentient_codegen.scheduler.rng import rng_kat_pattern_registered
 
-    out_sticks = _rm.band_egress_stick_count(
-        RNG_KAT_ROUNDS, egress=_rm.EgressMode.UNIFORM
+    out_sticks = (
+        _rm.band_egress_stick_count(RNG_KAT_ROUNDS, egress=_rm.EgressMode.UNIFORM)
+        * n_tiles
     )
     tiling = TilingConfig(
         M=out_sticks,
@@ -1760,7 +1849,9 @@ def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, o
     scheduled = finalize_pattern_program(pattern, tiling, tgt)
     binary = compile_scheduled_program(scheduled, target=tgt)
     sb = _stick_bytes(tgt)
-    params_bytes = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM) * sb
+    params_bytes = (
+        band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM) * n_tiles * sb
+    )
     out_bytes = out_sticks * sb
     # Declare the fp32 output symbol so the T-LR-7 dtype/layout gate fires on
     # the caller tensor. DERIVED from the generation's own dtype map, not typed.
@@ -1781,8 +1872,8 @@ def build_rng_kat_uniform_binary(target: "str | None" = None) -> "tuple[bytes, o
         symbol_extents={0: params_bytes, 1: out_bytes},
         symbol_dtypes=symbol_dtypes,
     )
-    _UNIFORM_KAT_CACHE = (binary, xlat_plan)
-    return _UNIFORM_KAT_CACHE
+    _UNIFORM_KAT_CACHE[n_tiles] = (binary, xlat_plan)
+    return _UNIFORM_KAT_CACHE[n_tiles]
 
 
 def _resolve_launch_params(plan: "RngLaunchPlan", dev, use_resident):
@@ -1965,34 +2056,61 @@ def _select_uniform_binding(
       option B "is the correct first cut if the scratch path proves
       unavailable".
 
-    Raises typed (``SpyreRngError``) ONLY for ``numel > 64`` (T-DV-34, one T=1
-    tile) — every other case is a device path or the unchanged host path, never
-    a new refusal (doc 54 §4.1 / §5).
+    Raises typed (``SpyreRngError``) for ``numel > 64`` only when it is not a
+    whole number of 64-word tiles, or the tile count is above the silicon-
+    witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
+    ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
+    in kind; the witnessed head is 16 tiles = numel 1024). An admitted whole-tile
+    fill is a direct device bind or the unchanged host fallback — never a new
+    refusal.
     """
     if numel == 0:
         return "empty"
     if numel > _RNG_MAX_UNIFORM_ELEMS:
-        raise SpyreRngError(
-            f"device RNG T>=2 is unbuilt (T-DV-34): {numel} elements exceed the "
-            f"{_RNG_MAX_UNIFORM_ELEMS} words a single T=1 launch yields (one "
-            "32-lane tile producing u0,u1). Draw on the host, or split into "
-            "independent draws."
-        )
+        # Wider-than-one-tile fills: only a whole number of 64-word tiles whose
+        # tile count is within the witnessed cap is expressible on device;
+        # everything else is a typed refusal (never a silent split).
+        if numel % _RNG_MAX_UNIFORM_ELEMS != 0:
+            raise SpyreRngError(
+                f"device RNG: numel={numel} is not a whole number of "
+                f"{_RNG_MAX_UNIFORM_ELEMS}-word tiles (T-DV-34). Draw on the "
+                "host, or split into whole 64-word draws."
+            )
+        _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
+        if _n_tiles > _RNG_TILE_LOOP_MAX:
+            raise SpyreRngError(
+                f"device RNG: a {_n_tiles}-tile fill (numel={numel}) exceeds the "
+                f"MVLOOPCNT 8-bit trip bound {_RNG_TILE_LOOP_MAX}; split into "
+                "multiple launches."
+            )
+        if _n_tiles > _RNG_UNIFORM_TILES_CAP:
+            raise SpyreRngError(
+                f"device RNG: a {_n_tiles}-tile fill (numel={numel}) exceeds the "
+                f"silicon-witnessed cap {_RNG_UNIFORM_TILES_CAP} (any 1.."
+                f"{_RNG_UNIFORM_TILES_CAP} is admitted in kind; "
+                f"{_RNG_WITNESSED_UNIFORM_TILES_MAX} is the deepest count run on "
+                "silicon). Witness a wider count on silicon to raise the cap, or "
+                "split into narrower draws."
+            )
     if float(from_) != 0.0 or float(to) != 1.0:
         return "fallback"
     if not is_float32:
         return "fallback"
     if not is_contiguous:
         return "fallback"
-    # Direct bind ONLY at numel == 64 (the extent-EXACT (2,32) cell: logical
-    # nbytes 256 == the binary's 2-stick write, stick-aligned). A 1-D 33..63
-    # caller is allocation-safe (its device allocation is two sticks) but its
-    # LOGICAL byte extent (numel*4) is not stick-aligned, so the launch ABI
-    # window gate refuses the direct bind; and 1..32 is one stick. Both take the
-    # host path. (Passing a padded physical extent to force 33..63 through was
-    # considered and rejected: this cut binds only the extent-exact cell.)
-    if numel == _RNG_MAX_UNIFORM_ELEMS and device_size == (2, RNG_KAT_LANES):
-        return "direct"
+    # Direct bind at a whole, witnessed number of tiles with the exact
+    # ``(2n, 32)`` device layout: logical nbytes == the binary's 2n-stick write,
+    # stick-aligned. numel == 64 (n=1) is the historical T=1 cell; n=2/4/16 are
+    # the silicon-witnessed device tile-loop widths. Anything else (1..63 — a
+    # non-stick-aligned logical extent, or a multi-tile caller whose device
+    # layout is not exactly (2n,32)) takes the host-map fallback.
+    if numel % _RNG_MAX_UNIFORM_ELEMS == 0:
+        _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
+        if 1 <= _n_tiles <= _RNG_UNIFORM_TILES_CAP and device_size == (
+            2 * _n_tiles,
+            RNG_KAT_LANES,
+        ):
+            return "direct"
     return "fallback"
 
 
@@ -2025,7 +2143,7 @@ def launch_uniform_draw(
             "launch_uniform_draw only launches the UNIFORM KAT egress; got "
             f"{plan.egress!r}"
         )
-    binary, xlat_plan = build_rng_kat_uniform_binary()
+    binary, xlat_plan = build_rng_kat_uniform_binary(n_tiles=plan.n_tiles)
     dev = torch.device("spyre") if device is None else device
     params = _resolve_launch_params(plan, dev, use_resident)
 
@@ -2150,16 +2268,21 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
         )
     # Reserve numel block-counters so a second draw advances the offset.
     offset = state.reserve(numel)
+    # A whole, witnessed number of 64-word tiles (the direct decision above
+    # guarantees numel % 64 == 0 and the tile count is witnessed).
+    n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
     plan = build_rng_launch_plan(
         seed=state.seed,
         offset=offset,
-        # ONE counter block = 32 lanes; a single launch yields u0,u1 = 64 words.
+        # ONE counter block = 32 lanes per tile; n_tiles launches yield
+        # n_tiles * 64 words.
         numel=RNG_KAT_LANES,
         device=_device_index(self.device),
         egress=EgressMode.UNIFORM,
         # Full params build (not the raw-keyed resident buffer); the values
         # themselves never round-trip through the host.
         resident=False,
+        n_tiles=n_tiles,
     )
     launch_uniform_draw(plan, out=self, device=self.device, use_resident=False)
     return True
