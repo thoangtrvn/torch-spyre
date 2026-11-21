@@ -40,21 +40,26 @@ WHAT THIS MODULE OWNS (the torch-spyre / host half)
    ``key_schedule_2x32`` and ``injection_words_2x32`` (owner:
    ``sentient_codegen.emulator.threefry_reference``).
 3. **The route scaffold.** ``build_rng_launch_plan`` turns a draw into the
-   params stream and a launch ABI, and REFUSES TYPED (``SpyreRngError``) until
-   lane B registers the ``rng_kat`` pattern. It also refuses, typed, the
-   unwitnessed uniform fp32 grid and every T≥2 request.
+   params stream and a launch ABI, and REFUSES TYPED (``SpyreRngError``) when
+   the ``rng_kat`` pattern is not registered. A whole number of 64-word tiles
+   is admitted, up to ``_RNG_UNIFORM_TILES_CAP`` tiles per launch; a non-whole
+   ``numel > 64``, a tile count above that cap, and any count above the ISA
+   MVLOOPCNT bound are refused typed.
 
 WHAT IS AND IS NOT CONNECTED (honesty bounds — do not blur these)
 ----------------------------------------------------------------
-- The device draw path is NOT live on its own. It needs (a) lane B's ``rng_kat``
-  registration AND (b) the integration step that launches the kernel and reads
-  the raw egress. Until both land, the user-facing ``uniform_``/``normal_``
-  kernels stay the DOCUMENTED host-CPU offload (``torch_spyre/ops/eager.py``);
-  with the device-RNG switch on they REFUSE typed instead of pretending.
-- The raw-state egress (4 sticks, ``e697b657…``) is the silicon-witnessed
-  artifact. The uniform fp32 grid ``u = hi*2^-16 + floor(lo/256)*2^-24`` is
-  UNWITNESSED (P5 owed) and is refused — never claimed.
-- T=1, C=1, 32 lanes, rounds=20 only. T≥2 is unbuilt (T-DV-34) and refused.
+- The device draw path needs (a) the ``rng_kat`` pattern registered in the
+  running codegen tree and (b) the real flex runtime. Without them, a
+  device-directed draw REFUSES typed rather than silently host-drawing. With
+  the device-RNG switch off, the user-facing ``uniform_``/``normal_`` kernels
+  remain the DOCUMENTED host-CPU offload (``torch_spyre/ops/eager.py``).
+- Both egresses are silicon-witnessed: the raw state (4 sticks,
+  ``e697b657…``) and the uniform fp32 grid (2 sticks, P5). The uniform grid is
+  the device direct-bind path for a whole-tile identity fill; every other
+  caller takes the host map of device-generated raw bits.
+- C=1, 32 lanes, rounds=20; one launch carries 1..``_RNG_UNIFORM_TILES_CAP``
+  tiles (witnessed head 63, the LX block-load ceiling). Wider counts and C>1
+  refuse typed. There is no device ``normal_``.
 
 TERMINOLOGY: this is AIU 1.0 (RCUDD1A). The RNG state/recipe is format-neutral
 here (32-bit words, not DL16/BF16).
@@ -2214,21 +2219,23 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
     """Device route for a switch-ON ``uniform_`` fill (doc 54 §4.1).
 
     Returns ``True`` when the fill was performed ON DEVICE (zero host round
-    trip, direct-bind): the caller tensor is float32, contiguous, its device
-    layout is exactly ``(2,32)`` (a 1-D ``numel == 64``), and the map is
-    the identity ``[0,1)``. Returns ``False`` when the caller must take the
+    trip, direct-bind): the caller tensor is float32, contiguous, a whole
+    number of 64-word tiles (1..``_RNG_UNIFORM_TILES_CAP``), its device layout
+    is exactly ``(2n, 32)``, and the map is the identity ``[0,1)``. Returns
+    ``False`` when the caller must take the
     EXISTING host-map path — every other case (non-identity ``(from_, to)``,
     non-fp32, non-contiguous / non-``(2,32)``, and ``numel <= 32`` whose scratch
     path is f32-blocked). See :func:`_select_uniform_binding`.
 
-    Raises typed (``SpyreRngError``) ONLY for ``numel > 64`` (T-DV-34). For the
-    direct path the device generator must be reachable (registration + state),
-    exactly as today's ``route_uniform_draw`` requires; a direct phone with the
+    Raises typed (``SpyreRngError``) for a ``numel > 64`` that is not a whole
+    number of tiles, for a tile count above ``_RNG_UNIFORM_TILES_CAP``, and for
+    a direct call whose device generator is unreachable (registration + state)
+    — exactly as today's ``route_uniform_draw`` requires; a direct call with the
     generator unreachable raises rather than silently host-drawing.
 
     Reserves ``numel`` block-counters from the device generator (successive
-    draws differ, a fixed seed reproduces), draws ONE T=1 counter block and
-    writes it into ``self`` via :func:`launch_uniform_draw`. The params stream
+    draws differ, a fixed seed reproduces), draws ``n_tiles`` counter blocks and
+    writes them into ``self`` via :func:`launch_uniform_draw`. The params stream
     is rebuilt in full per direct draw (the resident buffer is keyed for the raw
     egress); a uniform residency is a follow-on.
     """
