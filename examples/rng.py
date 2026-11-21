@@ -106,10 +106,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except NotImplementedError:
-        raise SystemExit(
-            "No spyre runtime in this environment (the spyre kernels are not "
-            "registered). Run this on the AIU box."
-        ) from None
+    # No catch-all here on purpose: SpyreRngError IS a NotImplementedError
+    # (torch_spyre/rng.py:133), so a broad `except NotImplementedError` would
+    # swallow a typed refusal and relabel it. Let the real traceback out.
+    main()
