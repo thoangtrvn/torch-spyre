@@ -45,7 +45,13 @@ Honest bounds (doc 54) — do not read past them
 
 import torch
 
-import torch_spyre  # noqa: F401  - registers the "spyre" device and kernels
+import torch_spyre  # noqa: F401  - registers the "spyre" device
+import torch_spyre.ops.eager  # noqa: F401  - registers the aten kernels on spyre
+# The explicit ops.eager import matters when this tree is imported from source
+# (PYTHONPATH) rather than as an installed distribution: torch's device-backend
+# autoload resolves the INSTALLED torch_spyre, so the source tree's aten
+# kernels would otherwise never be registered and torch.rand would raise
+# "Could not run 'aten::uniform_' with arguments from the 'spyre' backend".
 from torch_spyre.rng import SpyreRngError, device_rng_enabled
 
 DEVICE = "spyre"
