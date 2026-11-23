@@ -2065,9 +2065,12 @@ def _select_uniform_binding(
     whole number of 64-word tiles, or the tile count is above the silicon-
     witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
     ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
-    in kind; the witnessed head is 16 tiles = numel 1024). An admitted whole-tile
-    fill is a direct device bind or the unchanged host fallback — never a new
-    refusal.
+    in kind; the witnessed head is ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` = 63
+    tiles = numel 4032, the LX block-load ceiling recorded at that constant's
+    definition in this module: 64 tiles' params overflow the 2 MB /
+    16384-stick LX scratchpad and the block load wraps, bit-exact at 63). An
+    admitted whole-tile fill is a direct device bind or the unchanged host
+    fallback — never a new refusal.
     """
     if numel == 0:
         return "empty"
