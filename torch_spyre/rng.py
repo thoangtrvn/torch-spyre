@@ -58,7 +58,9 @@ WHAT IS AND IS NOT CONNECTED (honesty bounds — do not blur these)
   the device direct-bind path for a whole-tile identity fill; every other
   caller takes the host map of device-generated raw bits.
 - C=1, 32 lanes, rounds=20; one launch carries 1..``_RNG_UNIFORM_TILES_CAP``
-  tiles (witnessed head 63, the LX block-load ceiling). Wider counts and C>1
+  tiles (witnessed head 63, the LX physical address-space (streaming) ceiling:
+  the n·257 params is a 32-stick burst stream whose LX address wraps at the
+  physical 16,384 sticks; codegen wiki/design/56 §3). Wider counts and C>1
   refuse typed. There is no device ``normal_``.
 
 TERMINOLOGY: this is AIU 1.0 (RCUDD1A). The RNG state/recipe is format-neutral
@@ -1553,11 +1555,14 @@ _RNG_TILE_LOOP_MAX = 255
 #: route emits). The loop body is tile-invariant and its only per-tile variables
 #: (counter +1, egress stride 2n) are linear, so ANY width
 #: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind. 63 is ALSO
-#: the hard LX block-load ceiling: 64 tiles' params (16448 sticks) overflow the
-#: 2 MB / 16384-stick LX scratchpad, the block load wraps, and the leading tiles
-#: come back garbage (witnessed at 64/128/255 — bit-exact at 63). So the width
-#: ceiling and the witness head coincide; going beyond needs per-tile params
-#: streaming (not built), NOT another witness. Mirrors
+#: the LX physical address-space (streaming) ceiling: the n·257 params is a
+#: 32-stick burst stream whose LX address wraps at the physical 16,384 sticks
+#: (63 = 16,191 < 16,384 < 64 = 16,448), a streaming ceiling, not a resident one
+#: (a resident tensor at 16,191 sticks would collide with the reserved band);
+#: the wrap clobbers stick 0 upward, so the leading tiles come back garbage
+#: (witnessed at 64/128/255 — bit-exact at 63; codegen wiki/design/56 §3). So the
+#: width ceiling and the witness head coincide; going beyond needs per-tile
+#: params streaming (not built), NOT another witness. Mirrors
 #: ``sentient_codegen.scheduler.rng._RNG_WITNESSED_UNIFORM_TILES_MAX``.
 _RNG_WITNESSED_UNIFORM_TILES_MAX = 63
 #: The widest tile count a route will admit now: the witness head, clamped to the
@@ -2071,9 +2076,11 @@ def _select_uniform_binding(
     witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
     ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
     in kind; the witnessed head is ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` = 63
-    tiles = numel 4032, the LX block-load ceiling recorded at that constant's
-    definition in this module: 64 tiles' params overflow the 2 MB /
-    16384-stick LX scratchpad and the block load wraps, bit-exact at 63). An
+    tiles = numel 4032, the LX physical address-space (streaming) ceiling
+    recorded at that constant's definition in this module: the n·257 params is
+    a 32-stick burst stream whose LX address wraps at the physical 16,384
+    sticks (63 = 16,191 < 16,384 < 64 = 16,448), a streaming ceiling, not a
+    resident one (codegen wiki/design/56 §3)). An
     admitted whole-tile fill is a direct device bind or the unchanged host
     fallback — never a new refusal.
     """
