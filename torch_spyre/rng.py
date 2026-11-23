@@ -1400,9 +1400,9 @@ class RngLaunchPlan:
     #: Raw-egress reconstruction: x0 = (x0h<<16)|x0l, x1 = (x1h<<16)|x1l.
     output_sticks: int
     #: Device tile-loop trip count this plan covers (1 = single tile; the
-    #: witnessed UNIFORM widths 2/4/16 are the multi-tile plans). The launcher
-    #: builds the matching ``n_tiles`` binary and binds a ``(2*n_tiles, 32)``
-    #: output region.
+    #: witnessed UNIFORM widths 2/4/16/32/63, up to ``_RNG_UNIFORM_TILES_CAP``,
+    #: are the multi-tile plans). The launcher builds the matching ``n_tiles``
+    #: binary and binds a ``(2*n_tiles, 32)`` output region.
     n_tiles: int = 1
     #: The draw spec this plan was derived from (Option 1 residency). ``None`` on
     #: a hand-built plan; the launcher then falls back to the baked-in params.
@@ -1783,9 +1783,11 @@ def build_rng_kat_uniform_binary(
 
     The UNIFORM analogue of :func:`build_rng_kat_binary`. ``n_tiles == 1`` is the
     silicon-witnessed ``d0930bd5…`` (2 egress sticks, 257 params sticks); the
-    device tile loop (n_tiles ∈ the witnessed 2/4/16) emits the multi-tile
-    binaries the codegen route now admits (``a8c85caa`` / ``5c7bc0e6`` /
-    ``70c8e03e`` — the same silicon-witnessed bytes). The XLAT plan is derived
+    device tile loop (n_tiles 1..``_RNG_UNIFORM_TILES_CAP``; the witnessed
+    widths 2/4/16/32/63 — the ``rng-multitile-{2,4,16,32,63}tile-20261120-001``
+    claim family) emits the multi-tile binaries the codegen route now admits
+    (the 2/4/16-tile ``a8c85caa`` / ``5c7bc0e6`` / ``70c8e03e`` — the same
+    silicon-witnessed bytes). The XLAT plan is derived
     from the SAME scheduled program AND declares the output symbol (segment 1)
     as ``f32``/``IEEE_FP32``/32-bit/contiguous (T-LR-7) with extents scaled to
     ``n_tiles``. ``n_tiles`` 1..``_RNG_UNIFORM_TILES_CAP`` is
@@ -2134,7 +2136,9 @@ def launch_uniform_draw(
 
     Requires a real ``spyre`` device and the flex runtime. Binds the caller
     tensor ``out`` as segment 1 per :func:`_select_uniform_binding` — the
-    silicon-witnessed DIRECT 2-stick binding (numel==64, dense (2,32)) — with
+    silicon-witnessed DIRECT binding (a whole 1..``_RNG_UNIFORM_TILES_CAP``
+    tiles at dense ``(2n, 32)``; ``numel == 64``/``(2,32)`` is the n=1 cell) —
+    with
     the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
     round trip of the generated floats. A caller outside that cell never reaches
     this function — ``route_uniform_fill`` takes the unchanged host-map path
@@ -2195,8 +2199,9 @@ def launch_uniform_draw(
         xlat_plan.symbols[0].symbol_id: params,
         xlat_plan.symbols[1].symbol_id: target,
     }
-    # Direct bind is extent-exact (numel==64 -> 256 B, stick-aligned), so the
-    # logical nbytes IS the window the ABI gate needs.
+    # Direct bind is extent-exact (numel a whole multiple of 64 -> ``numel*4``
+    # == the binary's 2n-stick write, stick-aligned), so the logical nbytes IS
+    # the window the ABI gate needs.
     specs = {
         sym.symbol_id: (
             int(
