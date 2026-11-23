@@ -727,7 +727,7 @@ def spyre__sdpa_overrideable(
     # slice view is the _C segfault class; silicon finding 2026-11-23,
     # cell e1 — the old decomposition's clone-first preamble existed to
     # keep every device-side tensor whole).
-    out = torch.ops.spyre.attention(query, key, value)
+    out = torch.ops.spyre.attention(query, key, value, None, scale)
 
     # The overrideable contract's 9-tuple: the dummies are unpopulated
     # (the v1 route returns no debug artifacts — return_debug_mask

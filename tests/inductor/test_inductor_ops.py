@@ -2126,15 +2126,19 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             },
             # attention-aten-exposure (2026-11-23): F.sdpa on spyre now
             # routes through the attention program (spyre::attention) and
-            # REFUSES TYPED outside the v1 decode envelope (the predicate's
-            # clause names) instead of CPU-falling-back. Every param set
-            # here is outside that envelope (prefill rows>32 -> [row-budget];
-            # explicit mask -> [mask-mode]; GQA -> [gqa-group]; kv=257
-            # ragged -> [kv-len]) — strict xfail pins the refusal. The
-            # in-envelope contract is pinned off-box in
-            # torch_spyre/tests/test_attention_aten_mapping.py and on
-            # silicon by the exposure KAT; adding an in-envelope cell here
-            # is a follow-up once the KAT lands.
+            # REFUSES TYPED outside the v1 decode envelope instead of
+            # CPU-falling-back. Clause attribution per param set (the
+            # predicate's own vocabulary; is_causal is irrelevant at
+            # rows>32 — row-budget fires first): mha_prefill* ->
+            # [row-budget] (rows=256 > 32); mha_prefill_mask -> also
+            # [mask-mode] (explicit bias); gqa_* -> [gqa-group]
+            # (H=32 != Hkv=8); mha_decode/gqa_decode (rows=1, kv=257)
+            # -> [kv-len] (ragged context). STRICT xfail is green for
+            # ANY failure — the per-clause refusal-reason teeth live in
+            # torch_spyre/tests/test_attention_aten_mapping.py (each cell
+            # asserts the clause name in the message); adding them to
+            # THIS harness would need a refusal-asserting variant of
+            # compare_with_cpu (owed, not silently skipped).
             "expect_fail": [
                 "mha_prefill",
                 "mha_prefill_causal",

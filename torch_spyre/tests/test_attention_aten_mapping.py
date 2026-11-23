@@ -48,15 +48,20 @@ def _qkv(batch=1, heads=1, kv_heads=None, rows=8, kv=64, d=64, dtype=torch.float
 
 
 def test_mapping_admits_the_witnessed_cell():
+    """is_causal=False at rows=8: the ATen seam admits the full-visibility
+    form (mask none) — the construction the route actually computes. At
+    rows > 1, is_causal=True is ATen's bottom-right tril, which this
+    route does NOT compute (M4), so it refuses (see the gate pin below).
+    """
     mapping = _mapping()
     q, k, v = _qkv()
-    calls = mapping(q, k, v, None, 0.0, True, False, None)
+    calls = mapping(q, k, v, None, 0.0, False, False, None)
     assert len(calls) == 1  # B=1, H=1
     call = calls[0]
     assert call["rows"] == 8
     assert call["head_dim"] == 64
     assert call["kv_len"] == 64
-    assert call["mask_mode"] == "causal"
+    assert call["mask_mode"] == "none"
     assert call["gqa_group"] == 1
     assert call["dtype_bits"] == 16
     assert call["scale"] == pytest.approx(1.0 / 8.0)
@@ -73,10 +78,24 @@ def test_mapping_multiblock_and_batch_iteration():
     assert all(c["mask_mode"] == "none" for c in calls)
 
 
+def test_mapping_causal_admitted_only_at_decode_rows1():
+    """The M4 gate: is_causal=True is ATen's bottom-right-aligned tril —
+    faithful to this route's full-visibility construction ONLY at
+    rows == 1 (pure decode). rows > 1 refuses typed [mask-mode]."""
+    mapping = _mapping()
+    q, k, v = _qkv(rows=1)
+    calls = mapping(q, k, v, None, 0.0, True, False, None)
+    assert calls[0]["mask_mode"] == "causal"
+    q, k, v = _qkv(rows=8)
+    with pytest.raises(NotImplementedError) as ei:
+        mapping(q, k, v, None, 0.0, True, False, None)
+    assert "[mask-mode]" in str(ei.value)
+
+
 def test_mapping_explicit_scale():
     mapping = _mapping()
     q, k, v = _qkv()
-    calls = mapping(q, k, v, None, 0.0, True, False, 0.5)
+    calls = mapping(q, k, v, None, 0.0, False, False, 0.5)
     assert calls[0]["scale"] == 0.5
 
 
@@ -99,7 +118,7 @@ def test_refusal_sweep_envelope(make_kwargs, clause):
     mapping = _mapping()
     q, k, v = _qkv(**make_kwargs)
     with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
+        mapping(q, k, v, None, 0.0, False, False, None)
     assert f"[{clause}]" in str(ei.value)
 
 
@@ -107,7 +126,7 @@ def test_refusal_fp32():
     mapping = _mapping()
     q, k, v = _qkv(dtype=torch.float32)
     with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
+        mapping(q, k, v, None, 0.0, False, False, None)
     assert "[dtype]" in str(ei.value)
 
 
@@ -115,7 +134,7 @@ def test_refusal_bf16():
     mapping = _mapping()
     q, k, v = _qkv(dtype=torch.bfloat16)
     with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
+        mapping(q, k, v, None, 0.0, False, False, None)
     assert "[dtype]" in str(ei.value)
 
 
@@ -132,7 +151,7 @@ def test_refusal_gqa():
     mapping = _mapping()
     q, k, v = _qkv(heads=4, kv_heads=2)
     with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
+        mapping(q, k, v, None, 0.0, False, False, None)
     assert "[gqa-group]" in str(ei.value)
 
 
@@ -156,7 +175,7 @@ def test_refusal_ragged_head_count():
     mapping = _mapping()
     q, k, v = _qkv(heads=3, kv_heads=2)
     with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
+        mapping(q, k, v, None, 0.0, False, False, None)
     assert "[gqa-group]" in str(ei.value)
 
 

@@ -195,6 +195,25 @@ def sdpa_attention_mapping(
     if attn_bias is not None:
         mask_mode = "explicit_bias"  # never admitted; the owner refuses
     elif is_causal:
+        # ATen's is_causal is the bottom-right-aligned tril: at rows > 1
+        # an early q row must NOT see the trailing kv positions, and this
+        # route's construction is full-visibility (faithful only at
+        # rows == 1, pure decode). The decode-tail-with-row-block form
+        # (q chunk after the whole KV context) is a CALLER convention the
+        # ATen seam cannot verify — it stays reachable through the
+        # custom op's declared mask_mode, never through is_causal.
+        # (Gauntlet R1 M4: previously admitted then computed wrong.)
+        if rows > 1:
+            raise NotImplementedError(
+                f"attention clause [mask-mode]: is_causal=True at "
+                f"rows={rows} > 1 — ATen's causal mask is the "
+                f"bottom-right-aligned tril and this route computes "
+                f"full visibility (faithful only at rows == 1, decode); "
+                f"the row-block decode-tail form is a caller convention "
+                f"(spyre::attention's declared mask_mode), not ATen "
+                f"semantics. Refusing typed rather than computing the "
+                f"wrong mask."
+            )
         mask_mode = "causal"
     else:
         mask_mode = "none"
@@ -336,7 +355,9 @@ def _run_container(plan, q2d, k2d, v2d, block_table, dev):
         tbl = block_table.tolist()
         k_gathers = kv_len // 32
         phys_rows = max(max(r) for r in tbl) + 1
-        kv_rows_cpu = torch.zeros((phys_rows, head_dim), dtype=q2d.dtype)
+        # SENTINEL FILL 7.0 (the a5p convention): an unaddressed row
+        # reads back VISIBLE, never silently zero
+        kv_rows_cpu = torch.full((phys_rows, head_dim), 7.0, dtype=q2d.dtype)
         for r in range(kv_len):
             g, off = divmod(r, 32)
             kv_rows_cpu[tbl[g][off]] = k_rows[r]
@@ -355,7 +376,7 @@ def _run_container(plan, q2d, k2d, v2d, block_table, dev):
         return (n, _ELEMENTS_PER_STICK)
 
     p_out = torch.zeros(sticks(segmap.qp_p_sticks), dtype=q2d.dtype, device=dev)
-    q_or_out = _to_dev_rows(q_rows, spt, dev).clone()
+    q_or_out = _to_dev_rows(q_rows, spt, dev)
     k_scratch = torch.zeros(
         sticks(segmap.k_scratch_sticks), dtype=q2d.dtype, device=dev
     )
@@ -383,12 +404,15 @@ def _run_host_serial(plan, q2d, k2d, v2d, block_table, dev):
     # The scores B operand is staged HOST-SIDE on this path — the
     # scores_b_layout host-contract axis is ASSERTED, never assumed (the
     # a5 silicon finding: the gather's row-major K is the exact
-    # transposed-product failure).
-    assert plan.scores_b_layout == "k_on_stick_axis", (
-        f"attention host contract [scores-b-layout]: this executor stages "
-        f"the scores B operand with the contraction dim on the stick axis; "
-        f"the plan declares {plan.scores_b_layout!r}"
-    )
+    # transposed-product failure). Typed raise, never a bare assert
+    # (which dies under python -O).
+    if plan.scores_b_layout != "k_on_stick_axis":
+        raise AttentionHostError(
+            f"attention host contract [scores-b-layout]: this executor "
+            f"stages the scores B operand with the contraction dim on the "
+            f"stick axis; the plan declares "
+            f"{plan.scores_b_layout!r}"
+        )
 
     rows, head_dim, kv_len = plan.rows, plan.head_dim, plan.kv_len
     block_kv = plan.block_kv
@@ -402,9 +426,16 @@ def _run_host_serial(plan, q2d, k2d, v2d, block_table, dev):
     v_rows = _host_rows(v2d)
     q_rows = _host_rows(q2d)
 
-    # contiguous sources: logical row r at physical row r; paged: the
-    # table's rows (per gather, K tables first then V — the plan's step
-    # order), separate K and V sources (the a4p KAT form).
+    # contiguous sources: logical row r at physical row r.
+    #
+    # PAGED — THE ONE ORDER CONTRACT (gauntlet R1 M2): the block_table's
+    # rows are in the PLAN'S OWN INGRESS STEP ORDER (block{b}:k_ingress_0,
+    # k_ingress_1, v_ingress_0, v_ingress_1, block{b+1}:...). The staging
+    # scatter below conforms to that SAME order, and the executor
+    # consumes the rows in that SAME order — one declared order, three
+    # conforming sites, pinned by the executor-execution round-trip test
+    # (the first cut scattered kind-major while consuming step-order,
+    # silently feeding K slots to V gathers).
     if block_table is None:
         k_phys = k_rows
         v_phys = v_rows
@@ -412,22 +443,49 @@ def _run_host_serial(plan, q2d, k2d, v2d, block_table, dev):
         v_cache_rows = kv_len
     else:
         tbl = block_table.tolist()
-        k_gathers = kv_len // 32
-        k_cache_rows = max(max(r) for r in tbl[:k_gathers]) + 1
-        v_cache_rows = max(max(r) for r in tbl[k_gathers:]) + 1
-        k_phys = torch.zeros((k_cache_rows, head_dim), dtype=q2d.dtype)
-        v_phys = torch.zeros((v_cache_rows, head_dim), dtype=q2d.dtype)
-        for r in range(kv_len):
-            g, off = divmod(r, 32)
-            k_phys[tbl[g][off]] = k_rows[r]
-            v_phys[tbl[k_gathers + g][off]] = v_rows[r]
+        # split the step-ordered rows back into per-kind lists (for the
+        # cache extents and the scatter), WITHOUT re-ordering the table:
+        # per block, the first (kv_len//32) rows are K gathers, the next
+        # (kv_len//32) are V gathers — the plan's own phase order
+        # gathers per tensor PER BLOCK (the IBR-file split of ONE
+        # block — never the whole context)
+        gathers_per_tensor = block_kv // 32
+        gathers_per_block = gathers_per_tensor * 2
+        k_step_rows, v_step_rows = [], []
+        for b in range(kv_len // block_kv):
+            base = b * gathers_per_block
+            k_step_rows.extend(tbl[base : base + gathers_per_tensor])
+            v_step_rows.extend(
+                tbl[base + gathers_per_tensor : base + gathers_per_block]
+            )
+        if len(tbl) != (kv_len // block_kv) * gathers_per_block:
+            raise AttentionHostError(
+                f"attention executor wiring drift: block_table has "
+                f"{len(tbl)} rows but the plan's HOST_SERIAL form has "
+                f"{(kv_len // block_kv) * gathers_per_block} ingress "
+                f"steps — the table and the plan have drifted"
+            )
+        k_cache_rows = max(max(r) for r in k_step_rows) + 1
+        v_cache_rows = max(max(r) for r in v_step_rows) + 1
+        # SENTINEL FILL 7.0 (a5p convention): an unaddressed row reads
+        # back VISIBLE, never silently zero
+        k_phys = torch.full((k_cache_rows, head_dim), 7.0, dtype=q2d.dtype)
+        v_phys = torch.full((v_cache_rows, head_dim), 7.0, dtype=q2d.dtype)
+        for b in range(kv_len // block_kv):
+            for t in range(block_kv):
+                gather, off = divmod(t, 32)
+                k_phys[k_step_rows[b * gathers_per_tensor + gather][off]] = k_rows[
+                    b * block_kv + t
+                ]
+                v_phys[v_step_rows[b * gathers_per_tensor + gather][off]] = v_rows[
+                    b * block_kv + t
+                ]
 
     k_src = _to_dev_rows(k_phys, spt, dev)
     v_src = _to_dev_rows(v_phys, spt, dev)
 
     q_dev = _to_dev_rows(q_rows, spt, dev)
     qp_dev = torch.zeros((rows * spt, _ELEMENTS_PER_STICK), dtype=q2d.dtype, device=dev)
-    scratch = torch.zeros(plan.softmax_scratch, dtype=q2d.dtype, device=dev)
 
     state = neutral_attention_state(rows, head_dim)
     vf = v_rows.float().numpy().astype("float64")
@@ -480,6 +538,10 @@ def _run_host_serial(plan, q2d, k2d, v2d, block_table, dev):
             _launch(step.binary, [qp_dev, kt.to(dev), s_dev])
             continue
         if phase == "softmax":
+            # FRESH zeroed scratch per block — the a4 KAT's witnessed
+            # construction (gauntlet R1 M5: reuse was unwitnessed; match
+            # the KAT rather than prove write-before-read)
+            scratch = torch.zeros(plan.softmax_scratch, dtype=q2d.dtype, device=dev)
             p_dev = torch.zeros((rows, block_kv), dtype=q2d.dtype, device=dev)
             _launch(step.binary, [scratch, s_dev, p_dev])
             continue
@@ -539,7 +601,7 @@ def _to_cpu_contiguous(t: torch.Tensor) -> torch.Tensor:
     return t.detach().cpu()
 
 
-def _attention_batched(q, k, v, block_table, dev):
+def _attention_batched(q, k, v, block_table, dev, scale=None):
     """The op body: whole-tensor D2H once, host-side (b, h) slicing, per-
     call 2-D execution, CPU assembly, ONE H2D. NO device-side slicing or
     strided D2H anywhere (the e1 silicon finding)."""
@@ -618,6 +680,7 @@ def attention(
     k: torch.Tensor,
     v: torch.Tensor,
     block_table: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Attention on the spyre device through the attention program.
 
@@ -647,7 +710,7 @@ def attention(
         raise ValueError(
             f"spyre attention: block_table must be int32/int64, got {block_table.dtype}"
         )
-    return _attention_batched(q, k, v, block_table, q.device)
+    return _attention_batched(q, k, v, block_table, q.device, scale)
 
 
 @attention.register_fake
@@ -656,5 +719,6 @@ def _(
     k: torch.Tensor,
     v: torch.Tensor,
     block_table: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
