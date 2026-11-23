@@ -37,13 +37,18 @@ values; successive draws advance the generator's offset.
 Honest bounds (doc 54) — do not read past them
 ----------------------------------------------
 * The on-device direct bind needs: float32, contiguous, the identity map
-  ``[0, 1)``, and a whole number of 64-word tiles (1..63) whose device layout
-  is ``(2n, 32)``. Then the values never round-trip through the host.
+  ``[0, 1)``, and a device layout of exactly ``(2n, 32)`` for ``n`` tiles.
+  ``n`` is ``numel // 64`` for a whole number of 64-word tiles (1..63), or
+  ``ceil(numel / 64)`` for a TAIL fill (``numel > 64``, not a multiple of 64)
+  whose stick-padded allocation already covers the tile write — the tile loop
+  writes whole tiles, so the slots past ``numel`` are padding outside the
+  logical view. Then the values never round-trip through the host.
 * Everything else — ``numel`` 1..63, non-fp32, an affine ``(from_, to)``, a
   non-``(2n, 32)`` device layout — takes the unchanged host-map path (device
   bits mapped to floats on the host). That is **not** a refusal and must not
   be turned into one.
-* Typed refusals: ``numel > 64`` that is not a whole number of tiles, more
+* Typed refusals: a ``numel > 64`` tail whose allocation does not cover the
+  tile write (a stick-only-padded tail, or a slice into a larger buffer), more
   than 63 tiles, any per-call ``generator=<obj>`` (the device path uses the
   single per-device default generator — multi-stream is unbuilt), and any use
   without the ``rng_kat`` pattern registered.
@@ -55,6 +60,7 @@ import torch
 
 import torch_spyre  # noqa: F401  - registers the "spyre" device
 import torch_spyre.ops.eager  # noqa: F401  - registers the aten kernels on spyre
+
 # The explicit ops.eager import matters when this tree is imported from source
 # (PYTHONPATH) rather than as an installed distribution: torch's device-backend
 # autoload resolves the INSTALLED torch_spyre, so the source tree's aten
@@ -104,13 +110,25 @@ def main() -> None:
     print(f"16 tiles (1024 values, torch.rand):       {bc[:8].tolist()}")
     print(f"affine [-1, 1) (host-map fallback):       {dc[:8].tolist()}")
 
-    # A fill that is not a whole number of 64-word tiles refuses, typed.
+    # A TAIL fill (not a whole number of 64-word tiles) draws on device when the
+    # caller's stick-padded allocation covers the tile write: torch.rand(100)
+    # allocates (4,32) and the 2-tile loop writes 4 sticks, so it is direct.
+    # Exact values are NOT comparable to torch.rand(128)[:100]: the tail draw
+    # reserves a different generator offset than a 128-word draw would.
+    tail = torch.rand(100, device=DEVICE)
+    assert tuple(tail.shape) == (100,), tail.shape
+    tv = tail.cpu().tolist()
+    assert all(0.0 <= v < 1.0 for v in tv), "tail values must lie in [0, 1)"
+    print(f"tail     (100 values, torch.rand):        {tv[:8]}")
+
+    # A tail whose allocation is one stick SHORT of the tile write refuses,
+    # typed: torch.rand(96) allocates (3,32) but ceil(96/64) = 2 tiles = 4 sticks.
     try:
-        torch.rand(100, device=DEVICE)
+        torch.rand(96, device=DEVICE)
     except SpyreRngError as exc:
         print(f"refused, as documented: {exc}")
     else:
-        raise AssertionError("numel=100 must refuse typed, not draw")
+        raise AssertionError("numel=96 on a (3,32) allocation must refuse typed")
 
 
 if __name__ == "__main__":
