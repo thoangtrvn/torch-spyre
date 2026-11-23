@@ -76,6 +76,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 from torch_spyre._runtime import require_runtime
@@ -347,7 +348,8 @@ def _run_container(plan, q2d, k2d, v2d, block_table, dev):
             return int(tbl[kind_idx * (kv_len // 32) + g][off]) * spt
 
     kv_src = _to_dev_rows(kv_rows_cpu, spt, dev)
-    tables = torch.from_numpy(build_gather_tables(segmap, phys)).to(dev)
+    tables_np = np.array(build_gather_tables(segmap, phys), dtype=np.int32)
+    tables = torch.from_numpy(tables_np).to(dev)
 
     def sticks(n: int) -> tuple:
         return (n, _ELEMENTS_PER_STICK)
