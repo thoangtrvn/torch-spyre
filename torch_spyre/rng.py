@@ -2031,13 +2031,16 @@ def _select_uniform_binding(
     * ``"empty"`` — ``numel == 0`` (nothing to write; a no-op).
     * ``"direct"`` — bind the caller tensor itself as segment 1, ZERO host
       round trip. Requires the identity map (``[0,1)``), float32, contiguous,
-      ``numel == 64``, and a device layout of exactly the 2 dense sticks
-      ``(2, 32)`` the egress writes (logical 256 B == the binary's 2-stick
-      write, stick-aligned). This is the extent-EXACT, silicon-witnessed
-      binding. A 33..63 caller is allocation-safe (two sticks physically) but
-      its logical ``numel*4`` extent is not stick-aligned, so the launch-ABI
-      window gate refuses the direct bind — it takes the fallback instead (we do
-      NOT force a padded extent through; this cut binds only the exact cell).
+      ``numel`` a whole multiple of 64 (``n = numel // 64`` whole 64-word
+      tiles, ``1 <= n <= _RNG_UNIFORM_TILES_CAP``), and a device layout of
+      exactly the ``(2n, 32)`` dense sticks the egress writes (logical
+      ``numel*4`` == the binary's ``2n``-stick write, stick-aligned). This is
+      the extent-EXACT, silicon-witnessed binding; the admission rule is the
+      ``numel % 64 == 0`` / ``(2n, 32)`` / cap test at ``rng.py:2118-2124``. A
+      non-whole-tile caller (``1..63``), and a whole-tile caller whose device
+      layout is not exactly ``(2n, 32)``, both take the fallback instead (we do
+      NOT force a padded extent through; this cut binds only the exact
+      layout).
     * ``"fallback"`` — take the EXISTING host-map path (device bits ->
       ``raw_words_to_uniform`` -> ``self.copy_``), unchanged from today. This is
       the answer for EVERY non-direct caller, with no new refusal (doc 54 §4.1
