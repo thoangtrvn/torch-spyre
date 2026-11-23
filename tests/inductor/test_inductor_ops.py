@@ -2124,7 +2124,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
+            # attention-aten-exposure (2026-11-23): F.sdpa on spyre now
+            # routes through the attention program (spyre::attention) and
+            # REFUSES TYPED outside the v1 decode envelope instead of
+            # CPU-falling-back. Clause attribution per param set (the
+            # predicate's own vocabulary; is_causal is irrelevant at
+            # rows>32 — row-budget fires first): mha_prefill* ->
+            # [row-budget] (rows=256 > 32); mha_prefill_mask -> also
+            # [mask-mode] (explicit bias); gqa_* -> [gqa-group]
+            # (H=32 != Hkv=8); mha_decode/gqa_decode (rows=1, kv=257)
+            # -> [kv-len] (ragged context). STRICT xfail is green for
+            # ANY failure — the per-clause refusal-reason teeth live in
+            # torch_spyre/tests/test_attention_aten_mapping.py (each cell
+            # asserts the clause name in the message); adding them to
+            # THIS harness would need a refusal-asserting variant of
+            # compare_with_cpu (owed, not silently skipped).
+            "expect_fail": [
+                "mha_prefill",
+                "mha_prefill_causal",
+                "mha_prefill_mask",
+                "gqa_prefill",
+                "gqa_prefill_causal",
+                "mha_decode",
+                "gqa_decode",
+            ],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {

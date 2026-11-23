@@ -117,6 +117,19 @@ _SANCTIONED_CALLERS = {
         "relocation plan (IBR-indirect addressing, recorded deferral), "
         "so the positional call binds nothing a plan would describe"
     ),
+    "ops/attention.py": (
+        "SPLIT classification (attention-aten-exposure): the CONTAINER "
+        "path is a plan-validating caller — the 7-tensor list is gated by "
+        "validate_positional_launch with named specs derived from the "
+        "runtime allocations and roles read from the container dispatch's "
+        "own segment classification (the softmax T-LR-2B pattern, "
+        "_launch_container_validated); the HOST_SERIAL path is a recorded "
+        "planless legacy caller — the multiblock owner's per-phase "
+        "binaries (q_scale, kv_paged_read ingress, SP1 matmuls, the "
+        "softmax bundle) are compiled via compile_scheduled_program and "
+        "carry no relocation plan (the a4 KAT's witnessed launch form, "
+        "recorded deferral until per-phase plans exist)"
+    ),
 }
 
 

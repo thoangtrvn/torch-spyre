@@ -14,7 +14,6 @@
 
 from contextlib import contextmanager
 
-import math
 from typing import Optional, Union, Sequence, Callable, TypeVar
 from typing_extensions import ParamSpec
 import torch
@@ -109,13 +108,15 @@ def register_spyre_decomposition(
 # Decompositions that produce spyre.* custom ops, which then trigger SDSC-specific
 # lowerings. These must be excluded in the Triton path so that Inductor's standard
 # decompositions produce standard aten ops that TritonScheduling can handle.
-_TRITON_INCOMPATIBLE_DECOMPOSITIONS = frozenset({
-    torch.ops.aten.layer_norm.default,   # → spyre.layernormscale + spyre.layernormnorm
-    torch.ops.aten.rms_norm.default,     # → spyre.exx2
-    torch.ops.aten.gelu.default,         # → spyre.gelu
-    torch.ops.aten.softplus.default,     # → spyre.softplus
-    torch.ops.aten.topk,                 # → spyre.topkvalue + spyre.topkindex
-})
+_TRITON_INCOMPATIBLE_DECOMPOSITIONS = frozenset(
+    {
+        torch.ops.aten.layer_norm.default,  # → spyre.layernormscale + spyre.layernormnorm
+        torch.ops.aten.rms_norm.default,  # → spyre.exx2
+        torch.ops.aten.gelu.default,  # → spyre.gelu
+        torch.ops.aten.softplus.default,  # → spyre.softplus
+        torch.ops.aten.topk,  # → spyre.topkvalue + spyre.topkindex
+    }
+)
 
 
 # Context manager that enables spyre specific decompositions in addition to PyTorch in-tree decompositions
@@ -166,7 +167,9 @@ def enable_spyre_decompositions(
             return _removed
 
         # 1. Add/override spyre-specific decompositions
-        excluded_decomps = _TRITON_INCOMPATIBLE_DECOMPOSITIONS if triton_path else frozenset()
+        excluded_decomps = (
+            _TRITON_INCOMPATIBLE_DECOMPOSITIONS if triton_path else frozenset()
+        )
         saved_intree_decompositions = {}
         for (
             spyre_decompositions_op,
@@ -632,7 +635,8 @@ def spyre_softmax(
     if half_to_float:
         raise NotImplementedError(
             "spyre softmax: half_to_float=True (fp32 output from a half input) is "
-            "unsupported — the device kernel produces DL16.")
+            "unsupported — the device kernel produces DL16."
+        )
     return torch.ops.spyre.softmax(self, dim)
 
 
@@ -687,64 +691,56 @@ def spyre__sdpa_overrideable(
     torch.Tensor,
     torch.Tensor,
 ]:
-    batch_size = query.size(0)
-    num_heads = query.size(1)
-    num_kvheads = key.size(1)
-    max_seqlen_q = query.size(2)
-    max_seqlen_kv = key.size(2)
+    """SDPA on spyre through the attention program (the PyTorch last mile).
 
-    query = query.clone(memory_format=torch.contiguous_format)
-    key = key.clone(memory_format=torch.contiguous_format)
-    value = value.clone(memory_format=torch.contiguous_format)
+    DELEGATING SURFACE (plans/PLAN_attention_aten_exposure.md): admission,
+    orchestration, and launch are owned by the attention route's existing
+    owners (the codegen predicate's clause-named refusals surface here
+    verbatim — this decomposition invents no refusal of its own beyond
+    the ATen flags the mapping refuses). Within the v1 decode envelope
+    (rows <= 32, whole-stick head_dim <= 512, DL16, causal-at-decode-tail,
+    kv_len a whole number of 64-position blocks) the call routes to
+    ``spyre::attention`` — the fused container for single-block calls,
+    the multiblock owner's HOST_SERIAL sequence for longer contexts.
+    Outside it: typed refusal, never a CPU fallback (the #70 law; the
+    pre-exposure form decomposed to matmul/softmax primitives, which is
+    superseded by this route for eager AND compiled dispatch).
+    """
+    from torch_spyre.ops.attention import sdpa_attention_mapping
 
-    scaling_factor = scale
-    if scaling_factor is None:
-        scaling_factor = 1.0 / math.sqrt(query.shape[-1])
-    scaling_factor = math.sqrt(scaling_factor)
-
-    query = query * scaling_factor
-    key = key * scaling_factor
-
-    expansion = num_heads // num_kvheads
-    if expansion != 1:
-        key = key.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-        value = value.unsqueeze(2).expand(-1, -1, expansion, -1, -1).flatten(1, 2)
-    key_t = key.transpose(-2, -1).clone(memory_format=torch.contiguous_format)
-
-    attn = torch.matmul(query, key_t)
-
-    if is_causal:
-        assert attn_bias is None
-        attn_bias = torch.full_like(attn, float("-inf"))
-        attn_bias = attn_bias.triu(diagonal=1)
-
-    if attn_bias is not None:
-        attn = attn + attn_bias
-
-    # TODO (aviros): Switch to _safe_softmax
-    attn = torch.softmax(attn, -1)
-
-    if dropout_p > 0.0:
-        # TODO(aviros): Implement
-        raise Unsupported("Attention dropout not implemented for Spyre")
-
-    # Unused for now
-    logsumexp = torch.empty(
-        (batch_size, num_heads, max_seqlen_q), dtype=torch.float32, device="spyre"
+    # admission is DELEGATED: the mapping derives the per-(b,h) specs
+    # through the codegen predicate and refuses clause-named outside the
+    # envelope (its return value is consumed by the op itself)
+    sdpa_attention_mapping(
+        query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale
     )
-    philox_seed = torch.empty((1,), dtype=torch.float16, device="spyre")
-    philox_offset = torch.empty((1,), dtype=torch.float16, device="spyre")
 
-    # B, H, S, E
-    out = torch.matmul(attn, value)
+    batch, heads, max_seqlen_q = (
+        int(query.size(0)),
+        int(query.size(1)),
+        int(query.size(2)),
+    )
+    max_seqlen_kv = int(key.size(2))
 
-    # B, S, H, E
-    # This is needed to maintain the API promise from SDPA (attn needs to have same size+stride as q)
-    out = out.transpose(1, 2).clone(memory_format=torch.contiguous_format)
+    # The op owns the whole-tensor D2H, host (b, h) slicing, and the
+    # single H2D — NO device-side slicing anywhere (a D2H of a device
+    # slice view is the _C segfault class; silicon finding 2026-11-23,
+    # cell e1 — the old decomposition's clone-first preamble existed to
+    # keep every device-side tensor whole).
+    out = torch.ops.spyre.attention(query, key, value, None, scale)
 
-    # Returns (Tensor output, Tensor logsumexp, Tensor cum_seq_q, Tensor cum_seq_k, SymInt max_q, SymInt max_k, Tensor philox_seed, Tensor philox_offset, Tensor debug_attn_mask)
+    # The overrideable contract's 9-tuple: the dummies are unpopulated
+    # (the v1 route returns no debug artifacts — return_debug_mask
+    # refuses in the mapping).
+    logsumexp = torch.empty(
+        (batch, heads, max_seqlen_q),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    philox_seed = torch.empty((1,), dtype=torch.float16, device=query.device)
+    philox_offset = torch.empty((1,), dtype=torch.float16, device=query.device)
     return (
-        out.transpose(1, 2),
+        out,
         logsumexp,
         None,
         None,
@@ -948,11 +944,13 @@ def _conv2d_one_by_one_core(
         raise Unsupported(
             f"conv2d 1x1 alias: transposed convolution (transposed="
             f"{transposed}) — only the 1x1/stride-1/no-padding/no-dilation/"
-            f"groups-1 form aliases to matmul")
+            f"groups-1 form aliases to matmul"
+        )
     if groups != 1:
         raise Unsupported(
             f"conv2d 1x1 alias: grouped convolution (groups={groups}) — "
-            f"only groups=1 aliases to matmul")
+            f"only groups=1 aliases to matmul"
+        )
     # Rank check BEFORE the parameter gates: a conv1d/conv3d-shaped input
     # must be told it is the wrong rank, not get a stride refusal naming a
     # rank-3 list it legitimately carries.
@@ -960,7 +958,9 @@ def _conv2d_one_by_one_core(
         raise Unsupported(
             f"conv2d 1x1 alias: only 4D NCHW convolution aliases to "
             f"matmul, got input.dim()={input.dim()}, "
-            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)"
+        )
+
     # Canonicalize the ATen len-1 shorthand ([1]/[0]/[1] == [1, 1]/[0, 0]/
     # [1, 1] at spatial rank 2) BEFORE the equality gate. Any other wrong
     # length refuses loud rather than reaching the gate with a shape it
@@ -974,7 +974,8 @@ def _conv2d_one_by_one_core(
                 f"conv2d 1x1 alias: {name}={list(values)} has length "
                 f"{len(list(values))} — a 4D convolution takes exactly 2 "
                 f"values per parameter (the ATen len-1 shorthand is "
-                f"canonicalized; conv1d/conv3d are refused)")
+                f"canonicalized; conv1d/conv3d are refused)"
+            )
         return _values
 
     _stride = _spatial_list(stride, "stride")
@@ -985,40 +986,47 @@ def _conv2d_one_by_one_core(
         raise Unsupported(
             f"conv2d 1x1 alias: stride={_stride}, padding={_padding}, "
             f"dilation={_dilation} — only stride=(1, 1)/padding=(0, 0)/"
-            f"dilation=(1, 1) aliases to matmul")
+            f"dilation=(1, 1) aliases to matmul"
+        )
     if any(p != 0 for p in _output_padding):
         raise Unsupported(
             f"conv2d 1x1 alias: output_padding={_output_padding} is only "
-            f"meaningful for transposed convolution, which is refused")
+            f"meaningful for transposed convolution, which is refused"
+        )
     out_channels, in_channels, kh, kw = weight.shape
     if kh != 1 or kw != 1:
         raise Unsupported(
             f"conv2d 1x1 alias: kernel ({kh}, {kw}) — only 1x1 aliases "
             f"directly to matmul (general kernels route through "
             f"_conv2d_im2col_core; reaching this arm with k>1 means a "
-            f"direct call bypassing the _conv2d_core router)")
+            f"direct call bypassing the _conv2d_core router)"
+        )
     n, c_in, h, w = input.shape
     if c_in != in_channels:
         raise Unsupported(
             f"conv2d 1x1 alias: input channels {c_in} != weight input "
-            f"channels {in_channels}")
+            f"channels {in_channels}"
+        )
     elems_per_stick = 128 // input.element_size()
     if in_channels % elems_per_stick != 0:
         raise Unsupported(
             f"conv2d 1x1 alias: channel extent C={in_channels} is not "
             f"stick-aligned ({elems_per_stick} elements per "
             f"{input.dtype} stick) — the matmul K dimension would sit off "
-            f"stick boundaries")
+            f"stick boundaries"
+        )
     if not input.is_contiguous():
         raise Unsupported(
             f"conv2d 1x1 alias: input is not dense-contiguous NCHW "
             f"(stride={tuple(input.stride())}, shape={tuple(input.shape)}) "
-            f"— non-contiguous layouts are refused, never silently copied")
+            f"— non-contiguous layouts are refused, never silently copied"
+        )
     if not weight.is_contiguous():
         raise Unsupported(
             f"conv2d 1x1 alias: weight is not dense-contiguous OIHW "
             f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
-            f"— non-contiguous layouts are refused, never silently copied")
+            f"— non-contiguous layouts are refused, never silently copied"
+        )
     # Dtype uniformity: plain tensor ops would silently PROMOTE a mixed
     # dtype (e.g. an f64 bias over fp32 tensors) where the conv2d
     # reference refuses — the alias must match the reference, refuse
@@ -1027,7 +1035,8 @@ def _conv2d_one_by_one_core(
         raise Unsupported(
             f"conv2d 1x1 alias: weight dtype {weight.dtype} != input "
             f"dtype {input.dtype} — mixed dtypes are refused, never "
-            f"silently promoted")
+            f"silently promoted"
+        )
     # Dtype IDENTITY, not just uniformity: torch_spyre maps bfloat16 to
     # DataFormats.BFLOAT16 (torch_spyre/_C.py:113) — the 1p5 format. On a
     # 1p0 target a bf16 tensor's bits are consumed as DL16 (silent-wrong),
@@ -1036,22 +1045,26 @@ def _conv2d_one_by_one_core(
     if input.dtype is torch.bfloat16:
         raise Unsupported(
             f"conv2d 1x1 alias: dtype {input.dtype} unsupported (1p0 is "
-            f"DL16, i.e. torch.float16; bfloat16 is 1p5)")
+            f"DL16, i.e. torch.float16; bfloat16 is 1p5)"
+        )
     if bias is not None:
         if bias.dim() != 1:
             raise Unsupported(
                 f"conv2d 1x1 alias: bias must be 1-dimensional of length "
                 f"{out_channels}, got shape {tuple(bias.shape)} — matching "
-                f"the conv2d reference, which refuses non-1D bias")
+                f"the conv2d reference, which refuses non-1D bias"
+            )
         if bias.dtype != input.dtype:
             raise Unsupported(
                 f"conv2d 1x1 alias: bias dtype {bias.dtype} != input "
                 f"dtype {input.dtype} — mixed dtypes are refused, never "
-                f"silently promoted")
+                f"silently promoted"
+            )
         if bias.numel() != out_channels:
             raise Unsupported(
                 f"conv2d 1x1 alias: bias has length {bias.numel()}, "
-                f"expected {out_channels} (one per output channel)")
+                f"expected {out_channels} (one per output channel)"
+            )
 
     # The gated rewrite. The 2D weight sits on the LEFT of the batched
     # matmul (matmul((O, C), (N, C, P)) broadcasts the weight over the
@@ -1060,8 +1073,7 @@ def _conv2d_one_by_one_core(
     # surprise raises instead of silently copying; the contiguity gates
     # above are what make the views legal.
     spatial = h * w
-    out = weight.view(out_channels, in_channels) @ input.view(
-        n, in_channels, spatial)
+    out = weight.view(out_channels, in_channels) @ input.view(n, in_channels, spatial)
     out = out.view(n, out_channels, h, w)
     if bias is not None:
         # Separate pointwise add (default D-disposition) — never fold
@@ -1124,11 +1136,13 @@ def _conv2d_im2col_core(
         raise Unsupported(
             f"conv2d im2col: transposed convolution (transposed="
             f"{transposed}) — only the stride-1/no-dilation/groups-1 "
-            f"form rewrites to host im2col + matmul")
+            f"form rewrites to host im2col + matmul"
+        )
     if groups != 1:
         raise Unsupported(
             f"conv2d im2col: grouped convolution (groups={groups}) — "
-            f"only groups=1 rewrites to host im2col + matmul")
+            f"only groups=1 rewrites to host im2col + matmul"
+        )
     # Rank check BEFORE the parameter gates (the fold's rank-first
     # rule): a conv1d/conv3d-shaped input must be told it is the wrong
     # rank, not get a stride refusal naming the rank-3 list it
@@ -1137,7 +1151,9 @@ def _conv2d_im2col_core(
         raise Unsupported(
             f"conv2d im2col: only 4D NCHW convolution rewrites to host "
             f"im2col + matmul, got input.dim()={input.dim()}, "
-            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)")
+            f"weight.dim()={weight.dim()} (conv1d/conv3d are refused)"
+        )
+
     # Canonicalize the ATen len-1 shorthand ([1]/[0]/[1] == [1, 1]/
     # [0, 0]/[1, 1] at spatial rank 2) BEFORE the equality gate — a
     # traced RAW op call delivers the lists un-normalized (eager
@@ -1153,7 +1169,8 @@ def _conv2d_im2col_core(
                 f"conv2d im2col: {name}={list(values)} has length "
                 f"{len(list(values))} — a 4D convolution takes exactly 2 "
                 f"values per parameter (the ATen len-1 shorthand is "
-                f"canonicalized; conv1d/conv3d are refused)")
+                f"canonicalized; conv1d/conv3d are refused)"
+            )
         return _values
 
     _stride = _spatial_list(stride, "stride")
@@ -1165,28 +1182,32 @@ def _conv2d_im2col_core(
             f"conv2d im2col: stride={_stride}, dilation={_dilation} — "
             f"only stride=(1, 1)/dilation=(1, 1) rewrites to host "
             f"im2col + matmul (strided and dilated convolution are out "
-            f"of v0 scope by tier row)")
+            f"of v0 scope by tier row)"
+        )
     if any(p != 0 for p in _output_padding):
         raise Unsupported(
             f"conv2d im2col: output_padding={_output_padding} is only "
-            f"meaningful for transposed convolution, which is refused")
+            f"meaningful for transposed convolution, which is refused"
+        )
     out_channels, in_channels, kh, kw = weight.shape
     n, c_in, h, w = input.shape
     if c_in != in_channels:
         raise Unsupported(
             f"conv2d im2col: input channels {c_in} != weight input "
-            f"channels {in_channels}")
+            f"channels {in_channels}"
+        )
     # Per-dim symmetric-valid padding: 0 or kernel//2 (the "same"
     # extent for odd kernels; 3x3 -> p=1, 5x5 -> p=2). Anything else —
     # including asymmetric or arbitrary padding — refuses loud.
     if _padding != [0, 0] and (
-            _padding[0] not in (0, kh // 2)
-            or _padding[1] not in (0, kw // 2)):
+        _padding[0] not in (0, kh // 2) or _padding[1] not in (0, kw // 2)
+    ):
         raise Unsupported(
             f"conv2d im2col: padding={_padding} — only padding=0 or "
             f"padding=kernel//2 per dim (kernel=({kh}, {kw})) rewrites "
             f"to host im2col + matmul; arbitrary or asymmetric padding "
-            f"is out of v0 scope by tier row")
+            f"is out of v0 scope by tier row"
+        )
     h_out = h + 2 * _padding[0] - kh + 1
     w_out = w + 2 * _padding[1] - kw + 1
     if h_out < 1 or w_out < 1:
@@ -1194,17 +1215,20 @@ def _conv2d_im2col_core(
             f"conv2d im2col: kernel ({kh}, {kw}) over input extent "
             f"({h}, {w}) with padding={_padding} leaves a degenerate "
             f"window (output extent ({h_out}, {w_out})) — the window "
-            f"must fit at least once")
+            f"must fit at least once"
+        )
     if not input.is_contiguous():
         raise Unsupported(
             f"conv2d im2col: input is not dense-contiguous NCHW "
             f"(stride={tuple(input.stride())}, shape={tuple(input.shape)}) "
-            f"— non-contiguous layouts are refused, never silently copied")
+            f"— non-contiguous layouts are refused, never silently copied"
+        )
     if not weight.is_contiguous():
         raise Unsupported(
             f"conv2d im2col: weight is not dense-contiguous OIHW "
             f"(stride={tuple(weight.stride())}, shape={tuple(weight.shape)}) "
-            f"— non-contiguous layouts are refused, never silently copied")
+            f"— non-contiguous layouts are refused, never silently copied"
+        )
     # Dtype uniformity and bias shape (the fold conventions, same
     # contract as the 1x1 alias): plain tensor ops would silently
     # PROMOTE a mixed dtype where the conv2d reference refuses, and a
@@ -1214,29 +1238,34 @@ def _conv2d_im2col_core(
         raise Unsupported(
             f"conv2d im2col: weight dtype {weight.dtype} != input "
             f"dtype {input.dtype} — mixed dtypes are refused, never "
-            f"silently promoted")
+            f"silently promoted"
+        )
     if bias is not None:
         if bias.dim() != 1:
             raise Unsupported(
                 f"conv2d im2col: bias must be 1-dimensional of length "
                 f"{out_channels}, got shape {tuple(bias.shape)} — matching "
-                f"the conv2d reference, which refuses non-1D bias")
+                f"the conv2d reference, which refuses non-1D bias"
+            )
         if bias.dtype != input.dtype:
             raise Unsupported(
                 f"conv2d im2col: bias dtype {bias.dtype} != input "
                 f"dtype {input.dtype} — mixed dtypes are refused, never "
-                f"silently promoted")
+                f"silently promoted"
+            )
         if bias.numel() != out_channels:
             raise Unsupported(
                 f"conv2d im2col: bias has length {bias.numel()}, "
-                f"expected {out_channels} (one per output channel)")
+                f"expected {out_channels} (one per output channel)"
+            )
         if not bias.is_contiguous():
             raise Unsupported(
                 f"conv2d im2col: bias is non-contiguous (strides "
                 f"{tuple(bias.stride())} for shape "
                 f"{tuple(bias.shape)}) — matching the input/weight "
                 f"contiguity contract; the decomposition never "
-                f"silently .contiguous()-copies")
+                f"silently .contiguous()-copies"
+            )
 
     # The envelope boundary: fail-loud BEFORE any tensor is built.
     # Delegated to the codegen-side predicate (single source of truth,
@@ -1249,18 +1278,23 @@ def _conv2d_im2col_core(
         )
     except ImportError as exc:
         raise Unsupported(
-            f"conv2d im2col: the envelope admission predicate "
-            f"(sentient_codegen.scheduler.conv_predicate) is not "
-            f"importable — the envelope check is never silently "
-            f"skipped, so the route refuses (source env.sh so codegen "
-            f"is on the path)") from exc
+            "conv2d im2col: the envelope admission predicate "
+            "(sentient_codegen.scheduler.conv_predicate) is not "
+            "importable — the envelope check is never silently "
+            "skipped, so the route refuses (source env.sh so codegen "
+            "is on the path)"
+        ) from exc
     try:
         # dtype IDENTITY, not element width: 16 bits cannot distinguish
         # 1p0's DL16 (torch.float16) from 1p5's bf16, and the predicate
         # is the authority that refuses the latter NAMED.
         assert_conv_im2col_envelope(
-            in_channels=in_channels, kh=kh, kw=kw,
-            out_channels=out_channels, dtype=input.dtype)
+            in_channels=in_channels,
+            kh=kh,
+            kw=kw,
+            out_channels=out_channels,
+            dtype=input.dtype,
+        )
     # Typed catch ONLY: a bug inside the predicate must surface as
     # itself, never masquerade as an envelope refusal.
     except UnsupportedConvIm2colError as exc:
@@ -1279,10 +1313,10 @@ def _conv2d_im2col_core(
     # are what make the views legal.
     elems_per_stick = 128 // input.element_size()
     k = in_channels * kh * kw
-    k_padded = ((k + elems_per_stick - 1) // elems_per_stick) \
-        * elems_per_stick
+    k_padded = ((k + elems_per_stick - 1) // elems_per_stick) * elems_per_stick
     cols = torch.nn.functional.unfold(
-        input, (kh, kw), padding=(_padding[0], _padding[1]))
+        input, (kh, kw), padding=(_padding[0], _padding[1])
+    )
     if k_padded != k:
         # Zero-pad K by appending structural-zero columns to BOTH
         # operands. Built with new_zeros + slice-copy rather than
@@ -1328,11 +1362,27 @@ def _conv2d_core(
     everything outside their gates."""
     if weight.dim() == 4 and weight.shape[2] == 1 and weight.shape[3] == 1:
         return _conv2d_one_by_one_core(
-            input, weight, bias, stride, padding, dilation, transposed,
-            output_padding, groups)
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            dilation,
+            transposed,
+            output_padding,
+            groups,
+        )
     return _conv2d_im2col_core(
-        input, weight, bias, stride, padding, dilation, transposed,
-        output_padding, groups)
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.convolution.default])
@@ -1352,8 +1402,16 @@ def conv2d_decomp(
     ``_conv2d_core`` for the kernel-extent routing, the gated 1x1 ->
     matmul alias, and the general-conv host im2col rewrite."""
     return _conv2d_core(
-        input, weight, bias, stride, padding, dilation, transposed,
-        output_padding, groups)
+        input,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        transposed,
+        output_padding,
+        groups,
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.conv2d.default])
@@ -1371,8 +1429,8 @@ def conv2d_alias_decomp(
     separate entry point): eager dispatch and pre-decomposition traces
     can present this overload directly. Same gated core."""
     return _conv2d_core(
-        input, weight, bias, stride, padding, dilation, False, (0, 0),
-        groups)
+        input, weight, bias, stride, padding, dilation, False, (0, 0), groups
+    )
 
 
 @register_spyre_decomposition([torch.ops.aten.bitwise_not])
