@@ -708,7 +708,10 @@ def spyre__sdpa_overrideable(
     """
     from torch_spyre.ops.attention import sdpa_attention_mapping
 
-    calls = sdpa_attention_mapping(
+    # admission is DELEGATED: the mapping derives the per-(b,h) specs
+    # through the codegen predicate and refuses clause-named outside the
+    # envelope (its return value is consumed by the op itself)
+    sdpa_attention_mapping(
         query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale
     )
 
@@ -719,17 +722,12 @@ def spyre__sdpa_overrideable(
     )
     max_seqlen_kv = int(key.size(2))
 
-    # CPU staging then ONE H2D (the embedding lane's law: device-side
-    # strided slice-assign ignores the start offset on spyre hardware —
-    # per-(b,h) device writes would land at 0 and corrupt the batch).
-    out_cpu = torch.empty(
-        (batch, heads, max_seqlen_q, int(query.size(3))), dtype=query.dtype
-    )
-    for idx in range(len(calls)):
-        b, h = divmod(idx, heads)
-        o2d = torch.ops.spyre.attention(query[b, h], key[b, h], value[b, h])
-        out_cpu[b, h] = o2d.cpu()
-    out = out_cpu.to(query.device)
+    # The op owns the whole-tensor D2H, host (b, h) slicing, and the
+    # single H2D — NO device-side slicing anywhere (a D2H of a device
+    # slice view is the _C segfault class; silicon finding 2026-11-23,
+    # cell e1 — the old decomposition's clone-first preamble existed to
+    # keep every device-side tensor whole).
+    out = torch.ops.spyre.attention(query, key, value)
 
     # The overrideable contract's 9-tuple: the dummies are unpopulated
     # (the v1 route returns no debug artifacts — return_debug_mask

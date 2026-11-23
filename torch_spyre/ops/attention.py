@@ -277,8 +277,11 @@ def _launch_container_validated(container_plan, tensors):
 
 
 def _host_rows(t: torch.Tensor) -> torch.Tensor:
-    """The (n, d) CPU fp16 rows of a 2-D (or (n, d)-shaped) tensor."""
-    return t.detach().cpu().reshape(t.shape[0], -1).contiguous()
+    """The (n, d) CPU fp16 rows of a 2-D input (already CPU — the op's
+    batched entry does the ONE whole-tensor D2H before slicing; a D2H of
+    a device-slice VIEW is the segfault the old decomposition's
+    clone-first preamble existed to prevent)."""
+    return t.detach().reshape(t.shape[0], -1).contiguous()
 
 
 def _to_dev_rows(rows_cpu: torch.Tensor, spt: int, dev) -> torch.Tensor:
@@ -504,6 +507,109 @@ def _run_host_serial(plan, q2d, k2d, v2d, block_table, dev):
 # ---------------------------------------------------------------------------
 
 
+def _dynamo_offline(fn):
+    """Keep the codegen plan build OUT of dynamo graphs: the plan builder
+    is an lru_cache-wrapped host computation (binary emission, numpy);
+    tracing it into the graph duplicates megabytes of IR per call for
+    zero benefit. A graph break here is correct and cheap."""
+    try:
+        return torch._dynamo.disable(fn)
+    except Exception:
+        return fn
+
+
+@_dynamo_offline
+def _build_plan_offline(
+    rows, head_dim, kv_len, mask_mode, paged, gqa_group, dtype_bits, scale
+):
+    return _codegen_attention_plan(
+        rows, head_dim, kv_len, mask_mode, paged, gqa_group, dtype_bits, scale
+    )
+
+
+def _to_cpu_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """ONE whole-tensor D2H (the supported form). A non-contiguous spyre
+    tensor is cloned contiguous ON DEVICE first — the old decomposition's
+    clone-first preamble, which exists because a strided/offset D2H is
+    the _C segfault class (silicon finding 2026-11-23, cell e1)."""
+    if t.device.type == "spyre" and not t.is_contiguous():
+        t = t.clone(memory_format=torch.contiguous_format)
+    return t.detach().cpu()
+
+
+def _attention_batched(q, k, v, block_table, dev):
+    """The op body: whole-tensor D2H once, host-side (b, h) slicing, per-
+    call 2-D execution, CPU assembly, ONE H2D. NO device-side slicing or
+    strided D2H anywhere (the e1 silicon finding)."""
+    if q.dim() == 2:
+        plan = _build_plan_offline(
+            int(q.shape[0]),
+            int(q.shape[1]),
+            int(k.shape[0]),
+            "causal",
+            block_table is not None,
+            1,
+            _DTYPE_BITS[q.dtype],
+            None,
+        )
+        return _attention_2d(plan, q, k, v, block_table, dev)
+
+    batch, heads, rows, head_dim = (
+        int(q.shape[0]),
+        int(q.shape[1]),
+        int(q.shape[2]),
+        int(q.shape[3]),
+    )
+    kv_len = int(k.shape[2])
+    if block_table is not None and batch * heads != 1:
+        raise NotImplementedError(
+            f"spyre attention: a paged block_table serves ONE (b, h) "
+            f"call (got B={batch} H={heads}) — batched paged tables are a "
+            f"caller composition this primitive does not model"
+        )
+    kv_heads = int(k.shape[1])
+    gqa_group = 1
+    if heads != kv_heads:
+        # the mapping already refused non-uniform head sharing; the
+        # primitive re-derives the same fact defensively
+        gqa_group = (
+            heads // kv_heads if (heads > kv_heads and heads % kv_heads == 0) else 0
+        )
+
+    q_cpu = _to_cpu_contiguous(q)
+    k_cpu = _to_cpu_contiguous(k)
+    v_cpu = _to_cpu_contiguous(v)
+
+    plan = _build_plan_offline(
+        rows,
+        head_dim,
+        kv_len,
+        "causal",
+        block_table is not None,
+        gqa_group,
+        _DTYPE_BITS[q.dtype],
+        None,
+    )
+
+    out_cpu = torch.empty((batch, heads, rows, head_dim), dtype=q.dtype)
+    for b in range(batch):
+        for h in range(heads):
+            h_kv = h if kv_heads == heads else 0
+            out_cpu[b, h] = _attention_2d(
+                plan, q_cpu[b, h], k_cpu[b, h_kv], v_cpu[b, h_kv], block_table, dev
+            )
+    return out_cpu.to(dev)
+
+
+def _attention_2d(plan, q2d, k2d, v2d, block_table, dev):
+    """One (rows, head_dim) call on CPU 2-D inputs: strategy dispatch to
+    the container or HOST_SERIAL executor (both take CPU rows and do
+    their own staged H2D/D2H — the KATs' witnessed forms)."""
+    if plan.strategy.value == "container":
+        return _run_container(plan, q2d, k2d, v2d, block_table, dev)
+    return _run_host_serial(plan, q2d, k2d, v2d, block_table, dev)
+
+
 @torch.library.custom_op("spyre::attention", mutates_args=(), device_types="spyre")
 def attention(
     q: torch.Tensor,
@@ -511,12 +617,14 @@ def attention(
     v: torch.Tensor,
     block_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Decode-path attention over one query row-block on the spyre device.
+    """Attention on the spyre device through the attention program.
 
-    ``q`` is (rows, head_dim) fp16; ``k``/``v`` are (kv_len, head_dim)
-    fp16 (contiguous form) or — with a ``block_table`` — the logical
-    rows whose physical placement the table's slot rows address. Returns
-    (rows, head_dim) fp16 on the device.
+    Accepts the ATen 4-D (B, H, S, E) form (whole-tensor D2H once, host
+    (b, h) slicing, CPU assembly, one H2D — no device-side slicing) or a
+    2-D (rows, head_dim) single-block form. ``block_table`` (int32/int64,
+    one 32-slot row per ingress step, the plan's step order) selects the
+    PAGED layout and serves exactly one (b, h) call. Returns q-shaped
+    fp16 on the device. Admission is codegen's (clause-named refusals).
     """
     require_runtime("spyre attention")
 
@@ -528,27 +636,16 @@ def attention(
                 f"spyre attention: {name} dtype {t.dtype} unsupported "
                 f"(1p0 is DL16, i.e. torch.float16; bfloat16 is 1p5)"
             )
-    if q.dim() != 2 or k.dim() != 2 or v.dim() != 2:
+    if q.dim() not in (2, 4) or k.dim() != q.dim() or v.dim() != q.dim():
         raise NotImplementedError(
-            f"spyre attention: 2-D (rows, head_dim)/(kv_len, head_dim) "
-            f"only — the ATen (B, H, S, E) mapping lives in "
-            f"sdpa_attention_mapping; got q{tuple(q.shape)}"
+            f"spyre attention: 2-D (rows, head_dim)/(kv_len, head_dim) or "
+            f"4-D (B, H, S, E) only — got q{tuple(q.shape)}"
         )
     if block_table is not None and block_table.dtype not in (torch.int32, torch.int64):
         raise ValueError(
             f"spyre attention: block_table must be int32/int64, got {block_table.dtype}"
         )
-
-    rows, head_dim = int(q.shape[0]), int(q.shape[1])
-    kv_len = int(k.shape[0])
-    paged = block_table is not None
-    plan = _codegen_attention_plan(
-        rows, head_dim, kv_len, "causal", paged, 1, _DTYPE_BITS[q.dtype], None
-    )
-    dev = q.device
-    if plan.strategy.value == "container":
-        return _run_container(plan, q, k, v, block_table, dev)
-    return _run_host_serial(plan, q, k, v, block_table, dev)
+    return _attention_batched(q, k, v, block_table, q.device)
 
 
 @attention.register_fake
