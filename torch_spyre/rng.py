@@ -2111,10 +2111,12 @@ def _select_uniform_binding(
         return "fallback"
     # Direct bind at a whole, witnessed number of tiles with the exact
     # ``(2n, 32)`` device layout: logical nbytes == the binary's 2n-stick write,
-    # stick-aligned. numel == 64 (n=1) is the historical T=1 cell; n=2/4/16 are
-    # the silicon-witnessed device tile-loop widths. Anything else (1..63 — a
-    # non-stick-aligned logical extent, or a multi-tile caller whose device
-    # layout is not exactly (2n,32)) takes the host-map fallback.
+    # stick-aligned. n=1 is the historical T=1 cell; the witnessed tile-loop
+    # widths are 2/4/16/32/63 up to ``_RNG_UNIFORM_TILES_CAP`` = 63 (the
+    # ``rng-multitile-{2,4,16,32,63}tile-20261120-001`` silicon-witness claim
+    # family). A numel that is not a whole multiple of 64, or a whole-tile
+    # caller whose device layout is not exactly (2n,32), takes the host-map
+    # fallback.
     if numel % _RNG_MAX_UNIFORM_ELEMS == 0:
         _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
         if 1 <= _n_tiles <= _RNG_UNIFORM_TILES_CAP and device_size == (
