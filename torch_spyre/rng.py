@@ -58,7 +58,9 @@ WHAT IS AND IS NOT CONNECTED (honesty bounds — do not blur these)
   the device direct-bind path for a whole-tile identity fill; every other
   caller takes the host map of device-generated raw bits.
 - C=1, 32 lanes, rounds=20; one launch carries 1..``_RNG_UNIFORM_TILES_CAP``
-  tiles (witnessed head 63, the LX block-load ceiling). Wider counts and C>1
+  tiles (witnessed head 63, the LX physical address-space (streaming) ceiling:
+  the n·257 params is a 32-stick burst stream whose LX address wraps at the
+  physical 16,384 sticks; codegen wiki/design/56 §3). Wider counts and C>1
   refuse typed. There is no device ``normal_``.
 
 TERMINOLOGY: this is AIU 1.0 (RCUDD1A). The RNG state/recipe is format-neutral
@@ -1400,9 +1402,9 @@ class RngLaunchPlan:
     #: Raw-egress reconstruction: x0 = (x0h<<16)|x0l, x1 = (x1h<<16)|x1l.
     output_sticks: int
     #: Device tile-loop trip count this plan covers (1 = single tile; the
-    #: witnessed UNIFORM widths 2/4/16 are the multi-tile plans). The launcher
-    #: builds the matching ``n_tiles`` binary and binds a ``(2*n_tiles, 32)``
-    #: output region.
+    #: witnessed UNIFORM widths 2/4/16/32/63, up to ``_RNG_UNIFORM_TILES_CAP``,
+    #: are the multi-tile plans). The launcher builds the matching ``n_tiles``
+    #: binary and binds a ``(2*n_tiles, 32)`` output region.
     n_tiles: int = 1
     #: The draw spec this plan was derived from (Option 1 residency). ``None`` on
     #: a hand-built plan; the launcher then falls back to the baked-in params.
@@ -1553,11 +1555,14 @@ _RNG_TILE_LOOP_MAX = 255
 #: route emits). The loop body is tile-invariant and its only per-tile variables
 #: (counter +1, egress stride 2n) are linear, so ANY width
 #: ``1 <= n <= _RNG_WITNESSED_UNIFORM_TILES_MAX`` is admitted in kind. 63 is ALSO
-#: the hard LX block-load ceiling: 64 tiles' params (16448 sticks) overflow the
-#: 2 MB / 16384-stick LX scratchpad, the block load wraps, and the leading tiles
-#: come back garbage (witnessed at 64/128/255 — bit-exact at 63). So the width
-#: ceiling and the witness head coincide; going beyond needs per-tile params
-#: streaming (not built), NOT another witness. Mirrors
+#: the LX physical address-space (streaming) ceiling: the n·257 params is a
+#: 32-stick burst stream whose LX address wraps at the physical 16,384 sticks
+#: (63 = 16,191 < 16,384 < 64 = 16,448), a streaming ceiling, not a resident one
+#: (a resident tensor at 16,191 sticks would collide with the reserved band);
+#: the wrap clobbers stick 0 upward, so the leading tiles come back garbage
+#: (witnessed at 64/128/255 — bit-exact at 63; codegen wiki/design/56 §3). So the
+#: width ceiling and the witness head coincide; going beyond needs per-tile
+#: params streaming (not built), NOT another witness. Mirrors
 #: ``sentient_codegen.scheduler.rng._RNG_WITNESSED_UNIFORM_TILES_MAX``.
 _RNG_WITNESSED_UNIFORM_TILES_MAX = 63
 #: The widest tile count a route will admit now: the witness head, clamped to the
@@ -1783,9 +1788,11 @@ def build_rng_kat_uniform_binary(
 
     The UNIFORM analogue of :func:`build_rng_kat_binary`. ``n_tiles == 1`` is the
     silicon-witnessed ``d0930bd5…`` (2 egress sticks, 257 params sticks); the
-    device tile loop (n_tiles ∈ the witnessed 2/4/16) emits the multi-tile
-    binaries the codegen route now admits (``a8c85caa`` / ``5c7bc0e6`` /
-    ``70c8e03e`` — the same silicon-witnessed bytes). The XLAT plan is derived
+    device tile loop (n_tiles 1..``_RNG_UNIFORM_TILES_CAP``; the witnessed
+    widths 2/4/16/32/63 — the ``rng-multitile-{2,4,16,32,63}tile-20261120-001``
+    claim family) emits the multi-tile binaries the codegen route now admits
+    (the 2/4/16-tile ``a8c85caa`` / ``5c7bc0e6`` / ``70c8e03e`` — the same
+    silicon-witnessed bytes). The XLAT plan is derived
     from the SAME scheduled program AND declares the output symbol (segment 1)
     as ``f32``/``IEEE_FP32``/32-bit/contiguous (T-LR-7) with extents scaled to
     ``n_tiles``. ``n_tiles`` 1..``_RNG_UNIFORM_TILES_CAP`` is
@@ -2031,13 +2038,16 @@ def _select_uniform_binding(
     * ``"empty"`` — ``numel == 0`` (nothing to write; a no-op).
     * ``"direct"`` — bind the caller tensor itself as segment 1, ZERO host
       round trip. Requires the identity map (``[0,1)``), float32, contiguous,
-      ``numel == 64``, and a device layout of exactly the 2 dense sticks
-      ``(2, 32)`` the egress writes (logical 256 B == the binary's 2-stick
-      write, stick-aligned). This is the extent-EXACT, silicon-witnessed
-      binding. A 33..63 caller is allocation-safe (two sticks physically) but
-      its logical ``numel*4`` extent is not stick-aligned, so the launch-ABI
-      window gate refuses the direct bind — it takes the fallback instead (we do
-      NOT force a padded extent through; this cut binds only the exact cell).
+      ``numel`` a whole multiple of 64 (``n = numel // 64`` whole 64-word
+      tiles, ``1 <= n <= _RNG_UNIFORM_TILES_CAP``), and a device layout of
+      exactly the ``(2n, 32)`` dense sticks the egress writes (logical
+      ``numel*4`` == the binary's ``2n``-stick write, stick-aligned). This is
+      the extent-EXACT, silicon-witnessed binding; the admission rule is the
+      ``numel % 64 == 0`` / ``(2n, 32)`` / cap test at ``rng.py:2118-2124``. A
+      non-whole-tile caller (``1..63``), and a whole-tile caller whose device
+      layout is not exactly ``(2n, 32)``, both take the fallback instead (we do
+      NOT force a padded extent through; this cut binds only the exact
+      layout).
     * ``"fallback"`` — take the EXISTING host-map path (device bits ->
       ``raw_words_to_uniform`` -> ``self.copy_``), unchanged from today. This is
       the answer for EVERY non-direct caller, with no new refusal (doc 54 §4.1
@@ -2065,9 +2075,14 @@ def _select_uniform_binding(
     whole number of 64-word tiles, or the tile count is above the silicon-
     witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
     ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
-    in kind; the witnessed head is 16 tiles = numel 1024). An admitted whole-tile
-    fill is a direct device bind or the unchanged host fallback — never a new
-    refusal.
+    in kind; the witnessed head is ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` = 63
+    tiles = numel 4032, the LX physical address-space (streaming) ceiling
+    recorded at that constant's definition in this module: the n·257 params is
+    a 32-stick burst stream whose LX address wraps at the physical 16,384
+    sticks (63 = 16,191 < 16,384 < 64 = 16,448), a streaming ceiling, not a
+    resident one (codegen wiki/design/56 §3)). An
+    admitted whole-tile fill is a direct device bind or the unchanged host
+    fallback — never a new refusal.
     """
     if numel == 0:
         return "empty"
@@ -2105,10 +2120,12 @@ def _select_uniform_binding(
         return "fallback"
     # Direct bind at a whole, witnessed number of tiles with the exact
     # ``(2n, 32)`` device layout: logical nbytes == the binary's 2n-stick write,
-    # stick-aligned. numel == 64 (n=1) is the historical T=1 cell; n=2/4/16 are
-    # the silicon-witnessed device tile-loop widths. Anything else (1..63 — a
-    # non-stick-aligned logical extent, or a multi-tile caller whose device
-    # layout is not exactly (2n,32)) takes the host-map fallback.
+    # stick-aligned. n=1 is the historical T=1 cell; the witnessed tile-loop
+    # widths are 2/4/16/32/63 up to ``_RNG_UNIFORM_TILES_CAP`` = 63 (the
+    # ``rng-multitile-{2,4,16,32,63}tile-20261120-001`` silicon-witness claim
+    # family). A numel that is not a whole multiple of 64, or a whole-tile
+    # caller whose device layout is not exactly (2n,32), takes the host-map
+    # fallback.
     if numel % _RNG_MAX_UNIFORM_ELEMS == 0:
         _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
         if 1 <= _n_tiles <= _RNG_UNIFORM_TILES_CAP and device_size == (
@@ -2126,7 +2143,9 @@ def launch_uniform_draw(
 
     Requires a real ``spyre`` device and the flex runtime. Binds the caller
     tensor ``out`` as segment 1 per :func:`_select_uniform_binding` — the
-    silicon-witnessed DIRECT 2-stick binding (numel==64, dense (2,32)) — with
+    silicon-witnessed DIRECT binding (a whole 1..``_RNG_UNIFORM_TILES_CAP``
+    tiles at dense ``(2n, 32)``; ``numel == 64``/``(2,32)`` is the n=1 cell) —
+    with
     the plan's fp32 output symbol declared (T-LR-7), so there is ZERO host
     round trip of the generated floats. A caller outside that cell never reaches
     this function — ``route_uniform_fill`` takes the unchanged host-map path
@@ -2187,8 +2206,9 @@ def launch_uniform_draw(
         xlat_plan.symbols[0].symbol_id: params,
         xlat_plan.symbols[1].symbol_id: target,
     }
-    # Direct bind is extent-exact (numel==64 -> 256 B, stick-aligned), so the
-    # logical nbytes IS the window the ABI gate needs.
+    # Direct bind is extent-exact (numel a whole multiple of 64 -> ``numel*4``
+    # == the binary's 2n-stick write, stick-aligned), so the logical nbytes IS
+    # the window the ABI gate needs.
     specs = {
         sym.symbol_id: (
             int(
