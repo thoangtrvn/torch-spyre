@@ -32,7 +32,11 @@ What you get
 float32 fill on a spyre tensor is then produced by the AIU: one
 Threefry2x32-20 kernel launch generates 64 words per tile, and one launch may
 carry 1..63 tiles (up to 4032 values). The same seed reproduces the same
-values; successive draws advance the generator's offset.
+values; successive draws advance the generator's offset. Same-seed draws after
+the first also reuse a resident copy of the key-schedule parameters on the
+device and patch only the offset-dependent rows, so drawing again is much
+cheaper than the first draw — an implementation detail, not an API guarantee
+(a seed change, or an offset advance across an epoch boundary, rebuilds it).
 
 Honest bounds (doc 54) — do not read past them
 ----------------------------------------------
@@ -84,7 +88,7 @@ def main() -> None:
 
     # The compact form: torch.rand is empty()+uniform_(0,1) fused by the
     # dispatcher, so it lands in the same spyre uniform_ kernel
-    # (torch_spyre/ops/eager.py:189).
+    # (torch_spyre/ops/eager.py:190).
     # One tile: 64 uniform float32 values, generated on the AIU.
     a = torch.rand(64, device=DEVICE)
 
@@ -105,6 +109,16 @@ def main() -> None:
     torch.spyre.manual_seed(SEED)  # type: ignore[attr-defined]
     c = torch.rand(64, device=DEVICE)
     assert torch.equal(ac, c.cpu()), "same seed must reproduce the same values"
+
+    # Successive draws advance the generator: the same seed reproduces, but two
+    # draws in a row must not. This is also the path that reuses the resident
+    # parameters and patches only the offset rows.
+    x1 = torch.rand(64, device=DEVICE).cpu()
+    x2 = torch.rand(64, device=DEVICE).cpu()
+    assert not torch.equal(x1, x2), "successive draws must advance the offset"
+    print(
+        f"draw, draw+1 (offset advances):           {x1[:4].tolist()} vs {x2[:4].tolist()}"
+    )
 
     print(f"1 tile   (64 values, torch.rand):         {ac[:8].tolist()}")
     print(f"16 tiles (1024 values, torch.rand):       {bc[:8].tolist()}")
@@ -133,6 +147,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     # No catch-all here on purpose: SpyreRngError IS a NotImplementedError
-    # (torch_spyre/rng.py:133), so a broad `except NotImplementedError` would
+    # (torch_spyre/rng.py:135), so a broad `except NotImplementedError` would
     # swallow a typed refusal and relabel it. Let the real traceback out.
     main()
