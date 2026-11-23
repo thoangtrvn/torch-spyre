@@ -605,6 +605,10 @@ def _attention_batched(q, k, v, block_table, dev, scale=None):
     """The op body: whole-tensor D2H once, host-side (b, h) slicing, per-
     call 2-D execution, CPU assembly, ONE H2D. NO device-side slicing or
     strided D2H anywhere (the e1 silicon finding)."""
+    # mask_mode is "causal" by the SEAM'S OWN REFUSALS: the ATen mapping
+    # has already refused every mask the construction cannot honor
+    # (explicit bias, is_causal at rows>1) — the op-level default is the
+    # decode-tail equivalence the predicate declares.
     if q.dim() == 2:
         plan = _build_plan_offline(
             int(q.shape[0]),
@@ -614,7 +618,7 @@ def _attention_batched(q, k, v, block_table, dev, scale=None):
             block_table is not None,
             1,
             _DTYPE_BITS[q.dtype],
-            None,
+            scale,
         )
         return _attention_2d(plan, q, k, v, block_table, dev)
 
@@ -652,13 +656,16 @@ def _attention_batched(q, k, v, block_table, dev, scale=None):
         block_table is not None,
         gqa_group,
         _DTYPE_BITS[q.dtype],
-        None,
+        scale,
     )
 
     out_cpu = torch.empty((batch, heads, rows, head_dim), dtype=q.dtype)
     for b in range(batch):
         for h in range(heads):
-            h_kv = h if kv_heads == heads else 0
+            # h // gqa_group: the kv head SHARED by q head h (correct the
+            # day GQA is admitted; today gqa_group == 1 reduces it to h
+            # and every other gqa_group refuses upstream)
+            h_kv = h // gqa_group
             out_cpu[b, h] = _attention_2d(
                 plan, q_cpu[b, h], k_cpu[b, h_kv], v_cpu[b, h_kv], block_table, dev
             )

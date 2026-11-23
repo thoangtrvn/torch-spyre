@@ -83,12 +83,16 @@ class _FakeDevice:
 
     def __init__(self, plan, scale, rows, head_dim):
         self.roles_by_binary = {}
-        for step in plan.steps:
-            self.roles_by_binary.setdefault(id(step.binary), step.roles)
+        if plan is not None:
+            self.add_plan(plan)
         self.scale = scale
         self.rows = rows
         self.head_dim = head_dim
         self.consumed_slots = []  # (roles, [slot per entry])
+
+    def add_plan(self, plan):
+        for step in plan.steps:
+            self.roles_by_binary.setdefault(id(step.binary), step.roles)
 
     def __call__(self, binary, tensors):
         roles = self.roles_by_binary[id(binary)]
@@ -304,3 +308,70 @@ def test_registered_decomposition_refuses_clause_named():
     with pytest.raises(NotImplementedError) as ei:
         spyre__sdpa_overrideable(q4, k4, v4, is_causal=True)
     assert "[mask-mode]" in str(ei.value)  # rows=4 > 1 causal gate (M4)
+
+
+# ---------------------------------------------------------------------------
+# The OP-LEVEL scale path (R2 M3): the scale must survive the op body's
+# own plan builds — the first fix round threaded it only into the
+# direct attention_aten_plan calls, so F.sdpa(scale=s) silently computed
+# at the default.
+# ---------------------------------------------------------------------------
+
+
+def test_op_level_scale_through_the_registered_route():
+    """The full ATen route with an explicit non-default scale: the
+    mapping admits it, and the OP BODY's own plan build carries it (the
+    executed math reflects the scale — asserted through the batched
+    entry with the phase simulator, the off-box stand-in for the device
+    run)."""
+    import torch_spyre.ops.attention as att
+    from torch_spyre.ops.attention import sdpa_attention_mapping
+
+    q, k, v = _data(ROWS, 64)
+    q4 = q.reshape(1, 1, ROWS, HEAD_DIM)
+    k4 = k.reshape(1, 1, 64, HEAD_DIM)
+    v4 = v.reshape(1, 1, 64, HEAD_DIM)
+    scale = 0.5
+
+    # (a) the mapping's plan carries the explicit scale (the admitted
+    # route — F.sdpa -> overrideable -> mapping)
+    calls = sdpa_attention_mapping(q4, k4, v4, None, 0.0, False, False, scale)
+    assert calls[0]["scale"] == 0.5
+
+    # (b) the OP BODY's own plan build carries it and the EXECUTED math
+    # reflects it: run _attention_batched with the fake launch and the
+    # fp64 reference AT the explicit scale. A default-scale plan (the
+    # R2 defect) computes softmax(q@k.T/8) and fails this band.
+    plans = []
+
+    real_build = att._build_plan_offline
+
+    def spy_build(*args):
+        plan = real_build(*args)
+        plans.append(plan)
+        fake.add_plan(plan)  # the op may build a distinct (cached) plan
+        return plan
+
+    # the plan the op will build is the lru-cached one the mapping
+    # already built — same key, same object; the fake dispatches on its
+    # step binaries
+    fake = _FakeDevice(calls[0]["plan"], scale, ROWS, HEAD_DIM)
+    real_launch = att._launch
+    att._build_plan_offline = spy_build
+    att._launch = fake
+    try:
+        # clones: the CPU harness's .to("cpu") no-op would alias the
+        # executor's output write onto the caller's tensors (the same
+        # simulator-only artifact _run guards against)
+        out = att._attention_batched(
+            q4.clone(), k4.clone(), v4.clone(), None, "cpu", scale
+        )
+    finally:
+        att._build_plan_offline = real_build
+        att._launch = real_launch
+    assert plans and plans[0].scale == 0.5, (
+        f"the op body's plan build dropped the explicit scale "
+        f"(plan.scale={plans[0].scale if plans else 'no plan'})"
+    )
+    # the fake needs the plan's binaries for role dispatch
+    _check(out, _flash(q, k, v, scale))
