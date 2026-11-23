@@ -752,6 +752,51 @@ def spyre__sdpa_overrideable(
     )
 
 
+@register_spyre_decomposition([torch.ops.aten.scaled_dot_product_attention.default])
+def spyre_scaled_dot_product_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    *,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """The TOP-LEVEL SDPA entry: route to the overrideable seam.
+
+    Why this exists: the eager C++ backend selection dispatches
+    ``aten::scaled_dot_product_attention`` on a spyre tensor to the
+    OVERRIDEABLE backend, whose dispatch hits the spyre kernel for
+    ``_scaled_dot_product_fused_attention_overrideable`` (the seam
+    ``spyre__sdpa_overrideable`` serves). Under ``torch.compile``, dynamo
+    traces the TOP-LEVEL op and aot has no table entry for it, so the C++
+    composite executes under FakeTensor and emits the MATH form (fp32
+    upcast, bmm, softmax, where) — which never reaches the attention
+    program and is refused typed by the Sentient codegen (f32 pointee, no
+    32-bit-grain route). Registering the top-level op here makes the
+    compiled entry take the SAME route the eager entry takes on the
+    device: the overrideable seam, whose decomposition owns admission (the
+    predicate's clause names) and the launch. No refusal or admission is
+    invented here — pure routing, mirroring the C++ selection.
+    ``enable_gqa`` is not forwarded (the overrideable has no such flag):
+    at H == H_kv it is a no-op, and any head-sharing the seam cannot serve
+    refuses through the mapping's own [gqa-group] clause.
+    """
+    out, *_ = torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default(
+        query,
+        key,
+        value,
+        attn_mask,
+        dropout_p,
+        is_causal,
+        False,
+        scale=scale,
+    )
+    return out
+
+
 ## TODO(imaihal): Need to fix scalar tensor shape mismatch during Spyre-to-CPU transfer.
 ## See: https://github.com/torch-spyre/torch-spyre/issues/1172
 ## This will be enabled after solving this.
