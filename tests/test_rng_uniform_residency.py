@@ -354,6 +354,32 @@ def test_transport_refusal_falls_back_to_full_upload():
     np.testing.assert_array_equal(bridge.to_host(tensor), _full(7, 256, 4))
 
 
+@_needs_codegen_patch
+def test_uniform_patch_set_excludes_counter():
+    """The offset-only patch set is the LO/HI pair, NOT the codegen owner's
+    full ``(blocks, x0_base)`` sensitivity set. ``offset_dependent_indices``
+    returns (COUNTER, X0_BASE_LO, X0_BASE_HI); COUNTER is sensitive to
+    ``blocks`` (fixed 0..31 per tile — the per-tile counter advance is baked
+    into ``x0_base + t``, not the COUNTER word), so feeding the full set into
+    the patch would rewrite every COUNTER row on every draw: correct bytes
+    but a third wider write, and it would mask the derivation this lane
+    rests on. This test FAILS if the patch set is ever replaced with the
+    owner's full three-slot result."""
+    res = _resources()
+    owner_indices = rm.offset_dependent_indices(
+        rounds=_ROUNDS, egress=rm.EgressMode.UNIFORM
+    )
+    assert owner_indices == (4, 5, 6), owner_indices
+    patch_rows = res._uniform_patch_rows()
+    # The offset-only set: the two X0_BASE words, COUNTER (position 0)
+    # explicitly dropped.
+    assert patch_rows == (5, 6), patch_rows
+    assert set(patch_rows) < set(owner_indices), (
+        "the offset patch set must be a PROPER subset of the (blocks, x0_base) "
+        "sensitivity set — equal sets mean COUNTER crept back in"
+    )
+
+
 def test_separate_devices_never_alias():
     res = _resources()
     bridge: _FakeDeviceBridge = res._device_bridge
