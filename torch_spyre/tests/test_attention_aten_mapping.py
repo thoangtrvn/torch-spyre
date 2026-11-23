@@ -78,18 +78,79 @@ def test_mapping_multiblock_and_batch_iteration():
     assert all(c["mask_mode"] == "none" for c in calls)
 
 
-def test_mapping_causal_admitted_only_at_decode_rows1():
-    """The M4 gate: is_causal=True is ATen's bottom-right-aligned tril —
-    faithful to this route's full-visibility construction ONLY at
-    rows == 1 (pure decode). rows > 1 refuses typed [mask-mode]."""
+def test_mapping_causal_refused_outside_alignment_coincidence():
+    """The M4-v2 gate (the blog-census defect): ATen's is_causal is the
+    TOP-LEFT tril (EXECUTION-VERIFIED: at q_len=1/kv_len=64 the torch
+    output equals v[0]) — the OPPOSITE of this route's full-visibility
+    decode-tail construction at decode. The alignments coincide only at
+    rows == kv_len, which the v1 envelope cannot reach (row-budget vs
+    kv-block) — so is_causal=True refuses typed everywhere in-envelope,
+    and decode passes is_causal=False (all-visible IS correct decode)."""
     mapping = _mapping()
-    q, k, v = _qkv(rows=1)
-    calls = mapping(q, k, v, None, 0.0, True, False, None)
-    assert calls[0]["mask_mode"] == "causal"
-    q, k, v = _qkv(rows=8)
-    with pytest.raises(NotImplementedError) as ei:
-        mapping(q, k, v, None, 0.0, True, False, None)
-    assert "[mask-mode]" in str(ei.value)
+    for rows, kv in ((1, 64), (8, 64), (8, 128), (32, 64)):
+        q, k, v = _qkv(rows=rows, kv=kv)
+        with pytest.raises(NotImplementedError) as ei:
+            mapping(q, k, v, None, 0.0, True, False, None)
+        assert "[mask-mode]" in str(ei.value)
+        assert "TOP-LEFT" in str(ei.value)
+        # and the decode form admits
+        calls = mapping(q, k, v, None, 0.0, False, False, None)
+        assert calls[0]["mask_mode"] == "none"
+
+
+def test_route_never_diverges_from_torch_sdpa():
+    """The DIFFERENTIAL test the blog census demanded: torch's own CPU
+    SDPA is the reference oracle. Every cell in the sweep either refuses
+    typed OR matches torch within the fp16 egress band — the route may
+    be narrower than ATen, never DIVERGENT from it."""
+    mapping = _mapping()
+    for rows, kv, causal in (
+        (8, 64, False),
+        (8, 128, False),
+        (1, 64, False),
+        (8, 64, True),
+        (1, 64, True),
+        (64, 64, True),
+    ):
+        q, k, v = _qkv(rows=rows, kv=kv)
+        try:
+            calls = mapping(q, k, v, None, 0.0, causal, False, None)
+        except NotImplementedError:
+            continue  # refused typed — legal
+        # admitted: execute through the phase simulator and compare
+        # against torch's own CPU SDPA at the same inputs
+        import torch_spyre.tests.test_attention_executor_execution as exe
+
+        plan = calls[0]["plan"]
+        out, _fake = exe._run(
+            plan,
+            q.reshape(rows, 64),
+            k.reshape(kv, 64),
+            v.reshape(kv, 64),
+            None,
+            calls[0]["scale"],
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal
+        )[0, 0].float()
+        md = (out.float() - ref).abs().max().item()
+        assert md <= 0.25, (rows, kv, causal, md)
+
+
+def test_admission_plan_gap_is_fail_loud():
+    """The predicate/plan disagreement (the census's item 1): the
+    predicate admits rows=4 and head_dim up to 512, but the plan build's
+    compute-phase admission refuses those cells — clause-named
+    [compute-phase], NEVER silent. The gap is NAMED (the served set is
+    narrower than the declared envelope; tightening the predicate would
+    restate the matmul route's admission inside the attention predicate
+    — a second spelling). This pin holds the fail-loud behavior."""
+    mapping = _mapping()
+    for rows, d in ((4, 64), (8, 128), (8, 512)):
+        q, k, v = _qkv(rows=rows, d=d)
+        with pytest.raises(NotImplementedError) as ei:
+            mapping(q, k, v, None, 0.0, False, False, None)
+        assert "[compute-phase]" in str(ei.value)
 
 
 def test_mapping_explicit_scale():

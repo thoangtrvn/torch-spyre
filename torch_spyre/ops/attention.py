@@ -195,24 +195,32 @@ def sdpa_attention_mapping(
     if attn_bias is not None:
         mask_mode = "explicit_bias"  # never admitted; the owner refuses
     elif is_causal:
-        # ATen's is_causal is the bottom-right-aligned tril: at rows > 1
-        # an early q row must NOT see the trailing kv positions, and this
-        # route's construction is full-visibility (faithful only at
-        # rows == 1, pure decode). The decode-tail-with-row-block form
-        # (q chunk after the whole KV context) is a CALLER convention the
-        # ATen seam cannot verify — it stays reachable through the
-        # custom op's declared mask_mode, never through is_causal.
-        # (Gauntlet R1 M4: previously admitted then computed wrong.)
-        if rows > 1:
+        # ATen's is_causal is the TOP-LEFT-aligned tril (row i attends
+        # keys j <= i — EXECUTION-VERIFIED on torch 2.13 CPU: at
+        # q_len=1/kv_len=64 the output equals v[0] exactly, and at
+        # q_len==kv_len it equals the plain tril). This route's
+        # construction is FULL VISIBILITY (the decode-tail contract).
+        # The two alignments coincide ONLY at rows == kv_len; anywhere
+        # else, admitting is_causal=True computes a DIFFERENT mask than
+        # ATen — silent wrong values inside the envelope (the blog-census
+        # defect: the R1 round's 'faithful at rows==1' framing was wrong;
+        # at rows==1 ATen attends ONLY key 0, the exact opposite of
+        # full visibility). Refuse unless the alignments coincide; DECODE
+        # PASSES is_causal=False (all-visible IS the correct decode
+        # semantics) or an explicit attn_mask. Top-left semantics in the
+        # device construction is a v2 widening, never this seam.
+        if rows != kv_len:
             raise NotImplementedError(
                 f"attention clause [mask-mode]: is_causal=True at "
-                f"rows={rows} > 1 — ATen's causal mask is the "
-                f"bottom-right-aligned tril and this route computes "
-                f"full visibility (faithful only at rows == 1, decode); "
-                f"the row-block decode-tail form is a caller convention "
-                f"(spyre::attention's declared mask_mode), not ATen "
-                f"semantics. Refusing typed rather than computing the "
-                f"wrong mask."
+                f"rows={rows} != kv_len={kv_len} — ATen's causal mask is "
+                f"the TOP-LEFT tril (row i attends keys j <= i) and this "
+                f"route computes full visibility (the decode-tail "
+                f"contract); the alignments coincide only at "
+                f"rows == kv_len. DECODE should pass is_causal=False "
+                f"(all-visible is the correct decode semantics) or an "
+                f"explicit attn_mask; top-left device semantics is a "
+                f"stated v2 widening. Refusing typed rather than "
+                f"computing a divergent mask."
             )
         mask_mode = "causal"
     else:
