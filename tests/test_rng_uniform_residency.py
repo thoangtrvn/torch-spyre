@@ -165,6 +165,48 @@ def test_resident_uniform_bytes_match_full_build_across_carry(seed, n_tiles):
 
 
 @_needs_codegen_patch
+def test_vectorized_patch_rows_match_patch_offset_words_per_tile():
+    """The vectorized fast patch (encode_rfp32_values owner) must equal the
+    per-tile ``patch_offset_words`` owner output for the LO/HI rows — the
+    guard that keeps the fast path a mirror, not a reimplementation."""
+    res = _resources()
+    seed = 4242
+    ks0 = hr.key_schedule_2x32(
+        hr.epoch_key_2x32(hr.seed_to_key(seed), 0, device=0, stream=0)
+    )[0]
+    carry = 0x10000 - (ks0 & 0xFFFF) - 3
+    for offset in (0, 64, carry, carry + 1):
+        spec = _spec(seed, offset)
+        res2 = hr.SpyreRngResources()
+        got = res2._advance_uniform(0, 4, spec).params
+        # Per-tile owner: patch a fresh single-tile stream at x0_base + t.
+        k_prime = hr.epoch_key_2x32(hr.seed_to_key(seed), spec.epoch, device=0, stream=0)
+        x0_base, _ = hr.fold_key_schedule_2x32(k_prime, spec.base_counter)
+        blocks = np.arange(_LANES, dtype=np.uint32)
+        for t in range(4):
+            tile = rm.build_band_lxlu_stream(
+                blocks,
+                x0_base=0,
+                x1=0,
+                rotations=[16] * _ROUNDS,
+                injections=[(0, 0)] * (_ROUNDS // 4),
+                rounds=_ROUNDS,
+                egress=rm.EgressMode.UNIFORM,
+            )
+            patched = rm.patch_offset_words(
+                tile, blocks=blocks, x0_base=x0_base + t
+            )
+            np.testing.assert_array_equal(
+                got[t * _STRIDE + 5], patched[5].words,
+                err_msg=f"offset={offset} tile={t} LO",
+            )
+            np.testing.assert_array_equal(
+                got[t * _STRIDE + 6], patched[6].words,
+                err_msg=f"offset={offset} tile={t} HI",
+            )
+
+
+@_needs_codegen_patch
 def test_carry_changes_only_the_carrying_tiles_hi_row():
     """At the carry, the device write still covers all 2n rows, but only the
     carrying tile's HI row VALUE differs from the pre-carry build."""
@@ -263,12 +305,14 @@ def test_host_params_of_the_wrong_shape_refuses_typed():
         )
 
 
-def test_no_patch_owner_falls_back_visibly_and_stays_correct():
-    """``patch_fn=None``: the HOST mirror rebuilds fully (unoptimized, marked
-    ``patch_source=None``), and the device stays byte-correct — via the row
-    write when the offset-index owner is present, via a full upload when it
-    is not. Never a cheaper wrong answer."""
-    res = hr.SpyreRngResources(patch_fn=None, device_bridge=_FakeDeviceBridge())
+def test_no_patch_owner_falls_back_visibly_and_stays_correct(monkeypatch):
+    """With the encoding owner unavailable, the HOST mirror rebuilds fully
+    (unoptimized, marked ``patch_source=None``) and the device stays
+    byte-correct. The vectorized uniform patch keys on
+    ``encode_rfp32_values``, not on the raw-egress ``patch_fn`` — killing the
+    encoder is what disables it. Never a cheaper wrong answer."""
+    monkeypatch.setattr(hr, "_load_codegen_encoder", lambda: None)
+    res = hr.SpyreRngResources(device_bridge=_FakeDeviceBridge())
     bridge: _FakeDeviceBridge = res._device_bridge
     res.ensure_uniform_device_params(_spec(7, 0), 4, 0)
     tensor = res.ensure_uniform_device_params(_spec(7, 256), 4, 0)
@@ -287,6 +331,26 @@ def test_no_offset_index_owner_uploads_in_full():
     res._offset_rows_resolved = True
     tensor = res.ensure_uniform_device_params(_spec(7, 256), 4, 0)
     assert len(bridge.uploads) == seen + 1
+    np.testing.assert_array_equal(bridge.to_host(tensor), _full(7, 256, 4))
+
+
+def test_transport_refusal_falls_back_to_full_upload():
+    """A device that refuses the row scatter (WITNESSED on silicon
+    2026-11-23: ``aten::index_copy_`` has no spyre kernel) gets the patched
+    host mirror as a full-tensor upload — byte-correct, and still skipping
+    the per-draw host rebuild."""
+
+    class _RefusingBridge(_FakeDeviceBridge):
+        def write_rows(self, resident, row_indices, host_rows):
+            raise NotImplementedError("aten::index_copy.out: no spyre kernel")
+
+    res = hr.SpyreRngResources(device_bridge=_RefusingBridge())
+    bridge: _RefusingBridge = res._device_bridge
+    res.ensure_uniform_device_params(_spec(7, 0), 4, 0)
+    tensor = res.ensure_uniform_device_params(_spec(7, 256), 4, 0)
+    assert bridge.uploads == [_STRIDE * 4, _STRIDE * 4]
+    assert bridge.writes == []
+    assert res.uniform_last_device_update(0, 4) == "upload"
     np.testing.assert_array_equal(bridge.to_host(tensor), _full(7, 256, 4))
 
 

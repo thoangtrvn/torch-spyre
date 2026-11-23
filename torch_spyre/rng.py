@@ -881,48 +881,6 @@ def _default_build_stream_multitile(
     return tuple(out)
 
 
-def _uniform_stream_from_params(
-    params: np.ndarray, n_tiles: int
-) -> "tuple[StreamWord, ...]":
-    """Re-label stacked UNIFORM params sticks as a ``StreamWord`` tuple.
-
-    Used when a resident is seeded from a plan's already-built ``host_params``
-    (no host stream mirror exists): the slot ORDER comes from the owner's own
-    dummy probe build — ``build_band_lxlu_stream`` validates its pop order
-    structurally against the declared slot sequence, so row ``i`` of a tile
-    carries the probe's slot ``i`` for any key arguments. The WORDS are the
-    resident's own rows, untouched. Raises typed if the params shape does not
-    match ``n_tiles`` tiles of the UNIFORM pop count.
-    """
-    params = np.asarray(params, dtype=np.uint32)
-    stride = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM)
-    if params.ndim != 2 or params.shape != (stride * n_tiles, RNG_KAT_LANES):
-        raise SpyreRngError(
-            f"params shape {tuple(params.shape)} is not {n_tiles} UNIFORM "
-            f"tiles of ({stride}, {RNG_KAT_LANES})"
-        )
-    probe = build_band_lxlu_stream(
-        np.arange(RNG_KAT_LANES, dtype=np.uint32),
-        x0_base=0,
-        x1=0,
-        rotations=[ROTATIONS_2X32[r % 8] for r in range(RNG_KAT_ROUNDS)],
-        injections=[(0, 0)] * (RNG_KAT_ROUNDS // 4),
-        rounds=RNG_KAT_ROUNDS,
-        egress=EgressMode.UNIFORM,
-    )
-    if len(probe) != stride:
-        raise SpyreRngError(
-            f"UNIFORM probe pop count {len(probe)} disagrees with the local "
-            f"mirror band_lxlu_pop_count {stride}"
-        )
-    out: list = []
-    for t in range(n_tiles):
-        out.extend(
-            StreamWord(probe[i].slot, params[t * stride + i]) for i in range(stride)
-        )
-    return tuple(out)
-
-
 def _load_codegen_patch_fn():
     """The codegen offset-patch owner, or ``None`` if that lane has not landed."""
     try:
@@ -939,6 +897,15 @@ def _load_codegen_offset_indices():
     except Exception:
         return None
     return getattr(_rm, "offset_dependent_indices", None)
+
+
+def _load_codegen_encoder():
+    """The codegen rfp32 encoding owner, or ``None`` if unavailable."""
+    try:
+        from sentient_codegen.emulator import threefry_recipe_model as _rm
+    except Exception:
+        return None
+    return getattr(_rm, "encode_rfp32_values", None)
 
 
 class _TorchDeviceBridge:
@@ -1279,8 +1246,22 @@ class SpyreRngResources:
                     t * stride + local for t in range(n_tiles) for local in rows
                 )
                 host_rows = np.ascontiguousarray(res.params[list(row_idx)])
-                bridge.write_rows(res.device_tensor, row_idx, host_rows)
-                res.last_device_update = "patch"
+                try:
+                    bridge.write_rows(res.device_tensor, row_idx, host_rows)
+                    res.last_device_update = "patch"
+                except NotImplementedError:
+                    # Transport refusal (A9 design note §5, WITNESSED on
+                    # silicon 2026-11-23: ``aten::index_copy_`` has no spyre
+                    # kernel). The host mirror is ALREADY patched and
+                    # byte-identical to a full rebuild, so the full-tensor
+                    # upload is the correct fallback — and it still skips the
+                    # expensive part (the per-draw host REBUILD of the whole
+                    # multitile stream). SpyreRngError is a
+                    # NotImplementedError subclass, so a typed refusal inside
+                    # the write path takes the same correct fallback rather
+                    # than crashing the draw.
+                    res.device_tensor = bridge.upload(res.params, device)
+                    res.last_device_update = "upload"
         else:
             # Seed change or epoch rollover vs what the device holds: the
             # key-derived words change, so the whole buffer is re-sent.
@@ -1380,47 +1361,42 @@ class SpyreRngResources:
     ) -> "_DeviceResident | None":
         """Patch ONLY the per-tile X0_BASE_{LO,HI} rows of the host mirror.
 
-        Returns ``None`` when the codegen patch owner or the offset-index
-        owner is unavailable (the caller then rebuilds fully). Byte-identity
-        to a fresh multitile build is the codegen owner's own per-tile
-        contract (``patch_offset_words``) plus concatenation.
+        The two row values per tile are the codegen owner's own
+        ``_offset_dependent_words`` form — ``rfp32(x0_base_t & 0xFFFF)`` and
+        ``rfp32((x0_base_t >> 16) - 128)`` splatted across the lanes —
+        computed here VECTORIZED through the encoding owner
+        (``encode_rfp32_values``), because calling ``patch_offset_words``
+        once per tile (257-word tuple rebuilds, n=63) costs tens of ms, which
+        is the very budget this lane removes. Byte-identity to a fresh
+        multitile build is guarded by the equivalence tests
+        (``tests/test_rng_uniform_residency.py``: patched resident vs
+        ``draw_params_stream`` rebuilds, across the 0x10000 carry) and by a
+        focused per-tile comparison against ``patch_offset_words`` itself.
+
+        Returns ``None`` when the encoding owner or the offset-index owner is
+        unavailable, or when a tile base would exceed the u32 word domain the
+        owner's ``_halves`` refuses (the caller then rebuilds fully).
         """
-        patch_fn, source = self._resolve_patch()
+        enc_fn = _load_codegen_encoder()
         rows = self._uniform_patch_rows()
-        if patch_fn is None or rows is None:
+        if enc_fn is None or rows is None:
             return None
         lo_local, hi_local = rows
         stride = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM)
         seed_key = (spec.seed_lo, spec.seed_hi)
         k_prime = epoch_key_2x32(seed_key, spec.epoch, device=dev, stream=self._stream)
         x0_base, _x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
-        blocks = np.arange(RNG_KAT_LANES, dtype=np.uint32)
-        if res.stream is None:
-            # Resident was seeded from ``host_params`` (a cold plan's already
-            # built words — no host stream mirror). Reconstruct the mirror
-            # from the params rows plus the owner's own slot ORDER (a dummy
-            # probe build): row i of a tile carries the probe's slot i, because
-            # the builder validates its pop order structurally
-            # (threefry_recipe_model.py:2321-2327). Without this, a cold first
-            # draw would force every later draw back onto the full host
-            # rebuild — the exact cost this lane removes.
-            res.stream = _uniform_stream_from_params(res.params, n_tiles)
+        if x0_base + n_tiles - 1 > 0xFFFFFFFF:
+            # The owner's ``_halves`` refuses a word above 2^32-1; a full
+            # rebuild hits the same refusal loudly instead of wrapping here.
+            return None
+        bases = x0_base + np.arange(n_tiles, dtype=np.uint64)
+        lo_words = enc_fn((bases & 0xFFFF).astype(np.float64))
+        hi_words = enc_fn(((bases >> 16).astype(np.int64) - 128).astype(np.float64))
         new_params = np.array(res.params, dtype=np.uint32, copy=True)
-        for t in range(n_tiles):
-            tile = res.stream[t * stride : (t + 1) * stride]
-            # The codegen owner keys its slot set on the CODEGEN StreamSlot
-            # enum, so hand it codegen StreamWords (a local enum compares
-            # unequal there — see _to_codegen_stream).
-            patched = patch_fn(
-                _to_codegen_stream(tile), blocks=blocks, x0_base=x0_base + t
-            )
-            patched_local = _from_codegen_stream(patched)
-            new_params[t * stride + lo_local] = np.asarray(
-                patched_local[lo_local].words, dtype=np.uint32
-            )
-            new_params[t * stride + hi_local] = np.asarray(
-                patched_local[hi_local].words, dtype=np.uint32
-            )
+        tile_rows = np.arange(n_tiles, dtype=np.int64) * stride
+        new_params[tile_rows + lo_local] = lo_words[:, None]
+        new_params[tile_rows + hi_local] = hi_words[:, None]
         patched_res = _DeviceResident(
             seed=seed_key,
             epoch=spec.epoch,
@@ -1428,7 +1404,7 @@ class SpyreRngResources:
             stream=None,
             params=new_params,
         )
-        patched_res.patch_source = source
+        patched_res.patch_source = "codegen"
         patched_res.device_tensor = res.device_tensor
         patched_res.device_reflects = res.device_reflects
         self._uniform_residents[(dev, n_tiles)] = patched_res
