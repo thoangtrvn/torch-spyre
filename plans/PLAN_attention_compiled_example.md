@@ -46,6 +46,29 @@ delegate, the predicate) owns everything downstream. Standard
 `register_spyre_decomposition` (table + PrivateUse1), the same convention as
 every other op in the table.
 
+## The routing mechanism (fix-round R1, executed evidence — receipts/)
+
+The PrivateUse1 kernel registration is what makes COMPILE work, not the
+table entry: dynamo INLINES the Python dispatch kernel at trace time, so
+the traced graph contains `spyre.attention` directly and the dispatcher
+is never consulted during the compiled run (instrumented at b396ebbb:
+zero OPWrapper dispatch calls, 15 launches, aot forward graph = the
+single `torch.ops.spyre.attention.default` node —
+`receipts/b396_compiled_path_mechanism.log`).
+
+A TABLE-ONLY variant (decomposition table entry, no PrivateUse1 kernel —
+the R1 reviewers' preferred branch, preserving eager dispatch) was built
+and REFUTED BY EXECUTION: without the kernel, dynamo executes the C++
+composite under FakeTensor before any aot table applies, the graph
+degrades to the math form, and the Sentient codegen refuses
+`F32PointerElementGrainError` (`receipts/table_only_refutation.log`).
+The eager reroute is therefore ACCEPTED, not chosen: registering the
+kernel reroutes EAGER `F.scaled_dot_product_attention` through the Spyre
+seam (the C++ composite and its fp16→fp32 prelude are bypassed). The
+destination is the same overrideable backend the composite selects on
+the device, but the route differs from the pre-change e-cell path —
+the box cell must RE-WITNESS eager F.sdpa (see Box cell below).
+
 ## Off-box execution law (the codegen-only stand-ins, all documented)
 
 The local env is codegen-only (no runtime extension, no device bytes). The
@@ -73,21 +96,56 @@ exact form the e-cell's C++ selection reaches; disclosed in the receipts.
 witnessed envelope (rows=8, head_dim=64, kv_len=128 — the HOST_SERIAL path;
 DL16), eager + `torch.compile(dynamic=False)` runs, grades vs the fp64 flash
 reference (band 0.25, the e2 0.0294-class observed), the refusal surface
-(rows=33 → typed [row-budget]), graph-break count printed.
+(rows=33 → typed [row-budget]). The example PRINTS its grades and the
+refusal; the load-bearing ASSERTIONS (anti-fallback pins, tolerances,
+typed-refusal classes) live in the test, not the example — a user copies
+the file, the suite gates it. Its docstring discloses: compiled path
+off-box-verified/silicon-unwitnessed, the eager reroute, and
+inference-only.
 
 ## Tests
 
-`torch_spyre/tests/test_attention_compiled_execution.py`:
-- compiled EXECUTES through dynamo (frames compiled > 0 — fails on a silent
-  eager fallback), values vs the fp64 reference at the simulator.
-- the compiled GRAPH routes through spyre::attention (no math-fp32 kernel).
-- out-of-envelope refuses typed under compile.
+`torch_spyre/tests/test_attention_compiled_execution.py` (fix-round R1 —
+the original frame-counter pin was mutation-proven VACUOUS: with the
+user compile removed, all four original tests passed, because the
+counted frame was the seam OPWrapper's OWN inner torch.compile during
+eager dispatch):
+- compiled EXECUTES through dynamo AT THE USER LEVEL:
+  `torch.compiler.is_compiling()` recorded at the user function's entry
+  must be True (False on a silent eager fallback — including one through
+  the OPWrapper inner compile, which compiles the decomposition, never
+  the user function), values vs the fp64 reference at the simulator.
+- the compiled path routes through spyre::attention: the traced dynamo
+  graph contains the top-level SDPA op, and the EXECUTED launch roles
+  are the attention plan's own phase vocabulary with the launch count
+  derived from the plan's step count (not a hand-counted constant).
+- mutation-proven teeth: with the user compile removed the two compile
+  tests FAIL (`receipts/mutationA_user_compile_removed.log`); with the
+  OPWrapper inner compile neutralized they still pass — expected, the
+  inner compile is off the compiled path (dynamo inlines the kernel at
+  trace time) and off the is_compiling pin (recorded at user-fn entry
+  before any dispatch) — `receipts/mutationB_inner_compile_neutralized.log`.
+- eager F.sdpa reroutes through the seam (the R1-required committed
+  eager test: the top-level PrivateUse1 wrapper records an EAGER
+  dispatch, values correct).
+- negative dropout_p refuses typed (the ATen range the C++ composite
+  validated before dispatch; the compiled path bypasses the composite).
+- out-of-envelope refuses typed under compile (the predicate's own
+  UnsupportedAttentionError, chain-traversed — not a bare Exception).
+
+Dynamo note (R1 correction): only `_build_plan_offline` is
+`@_dynamo_offline`; the admission mapping (`sdpa_attention_mapping`) IS
+traced — it executes under dynamo tracing inside the inlined kernel.
+The zero-graph-breaks fact is measured (counters), not implied by any
+dynamo-disabled claim.
 
 ## Box cell (USER-gated; only if off-box is green)
 
 Sync checksum-mode (replaces the box's untracked attention.py drop), claim
-per hw-probe-coordination, control-first (a1p3 bdcde582), then eager e2-form
-- the compiled example, L-190 LAUNCH-STATE pin with launched binary hashes.
+per hw-probe-coordination, control-first (a1p3 bdcde582), then the compiled
+example AND an eager F.sdpa re-witness (the eager route changed with the
+kernel registration — see The routing mechanism), L-190 LAUNCH-STATE pin
+with launched binary hashes.
 
 ## Not in scope
 

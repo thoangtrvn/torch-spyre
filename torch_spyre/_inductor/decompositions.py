@@ -705,6 +705,14 @@ def spyre__sdpa_overrideable(
     Outside it: typed refusal, never a CPU fallback (the #70 law; the
     pre-exposure form decomposed to matmul/softmax primitives, which is
     superseded by this route for eager AND compiled dispatch).
+
+    TRAINING / AUTOGRAD: this route is INFERENCE-ONLY.
+    ``torch.ops.spyre.attention`` is a ``custom_op`` with no autograd
+    formula, and the overrideable contract's aux outputs (logsumexp,
+    philox seed/offset, debug mask) are unpopulated dummies — training
+    that consumes them (e.g. flash backward) gets garbage, and gradients
+    do not flow. Callers must not build training graphs through this
+    seam.
     """
     from torch_spyre.ops.attention import sdpa_attention_mapping
 
@@ -766,20 +774,30 @@ def spyre_scaled_dot_product_attention(
 ) -> torch.Tensor:
     """The TOP-LEVEL SDPA entry: route to the overrideable seam.
 
-    Why this exists: the eager C++ backend selection dispatches
-    ``aten::scaled_dot_product_attention`` on a spyre tensor to the
-    OVERRIDEABLE backend, whose dispatch hits the spyre kernel for
-    ``_scaled_dot_product_fused_attention_overrideable`` (the seam
-    ``spyre__sdpa_overrideable`` serves). Under ``torch.compile``, dynamo
-    traces the TOP-LEVEL op and aot has no table entry for it, so the C++
-    composite executes under FakeTensor and emits the MATH form (fp32
-    upcast, bmm, softmax, where) — which never reaches the attention
-    program and is refused typed by the Sentient codegen (f32 pointee, no
-    32-bit-grain route). Registering the top-level op here makes the
-    compiled entry take the SAME route the eager entry takes on the
-    device: the overrideable seam, whose decomposition owns admission (the
-    predicate's clause names) and the launch. No refusal or admission is
-    invented here — pure routing, mirroring the C++ selection.
+    Why this exists: under ``torch.compile``, dynamo traces the TOP-LEVEL
+    ``aten::scaled_dot_product_attention`` and executes its C++ composite
+    under FakeTensor, emitting the MATH form (fp32 upcast, bmm, softmax,
+    where) — which never reaches the attention program and is refused
+    typed by the Sentient codegen (f32 pointee, no 32-bit-grain route).
+    The PrivateUse1 kernel registered here is what makes compile work:
+    dynamo INLINES the Python dispatch kernel at trace time, so the
+    traced graph contains ``spyre.attention`` directly. A table-only
+    registration (decomposition table, no PrivateUse1 kernel) was probed
+    and REFUTED by execution: without the kernel, dynamo executes the
+    C++ composite under FakeTensor before any aot table applies, and the
+    graph degrades to the math form (F32PointerElementGrainError) — see
+    the lane receipts.
+
+    EAGER REROUTE (disclosed, intentional): registering the kernel also
+    intercepts EAGER dispatch — ``F.scaled_dot_product_attention`` on a
+    spyre tensor now runs this Python function (then the overrideable
+    seam) instead of the C++ composite's backend selection. The seam is
+    the same destination the composite's selection reaches on the device,
+    but the C++ composite's own prelude (an fp16->fp32 device-side
+    ``_to_copy``) is bypassed, so the eager route is NOT identical to the
+    pre-change e-cell path: any silicon cell must re-witness eager
+    ``F.scaled_dot_product_attention`` through this route before the
+    eager claim is reused.
     ``enable_gqa`` is not forwarded (the overrideable has no such flag):
     at H == H_kv it is a no-op, and any head-sharing the seam cannot serve
     refuses through the mapping's own [gqa-group] clause.
