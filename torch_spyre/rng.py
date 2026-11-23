@@ -841,6 +841,46 @@ def _default_build_stream(
     )
 
 
+def _default_build_stream_multitile(
+    spec: RngDrawSpec,
+    device_index: int,
+    *,
+    rounds: int,
+    egress: EgressMode,
+    stream: int,
+    n_tiles: int,
+) -> "tuple[StreamWord, ...]":
+    """Full multitile params stream for ``spec`` (the UNIFORM resident build).
+
+    Byte-identical to :func:`draw_params_stream` for the same
+    ``(seed, offset, egress, n_tiles)``: same host chain, same per-tile
+    ``x0_base + t`` counter advance (counter_stride=1). The A9 derivation
+    (``codegen/docs/rng-a9-uniform-params-residency.md`` §1) keys on this
+    identity — the resident first build must be the bytes the per-draw full
+    upload path would have shipped.
+    """
+    seed_key = (spec.seed_lo, spec.seed_hi)
+    k_prime = epoch_key_2x32(seed_key, spec.epoch, device=device_index, stream=stream)
+    x0_base, x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
+    injections = injection_words_2x32(k_prime, rounds)
+    rotations = [ROTATIONS_2X32[r % 8] for r in range(rounds)]
+    blocks = np.arange(RNG_KAT_LANES, dtype=np.uint32)
+    out: list = []
+    for t in range(n_tiles):
+        out.extend(
+            build_band_lxlu_stream(
+                blocks,
+                x0_base=x0_base + t,
+                x1=x1,
+                rotations=rotations,
+                injections=injections,
+                rounds=rounds,
+                egress=egress,
+            )
+        )
+    return tuple(out)
+
+
 def _load_codegen_patch_fn():
     """The codegen offset-patch owner, or ``None`` if that lane has not landed."""
     try:
@@ -857,6 +897,15 @@ def _load_codegen_offset_indices():
     except Exception:
         return None
     return getattr(_rm, "offset_dependent_indices", None)
+
+
+def _load_codegen_encoder():
+    """The codegen rfp32 encoding owner, or ``None`` if unavailable."""
+    try:
+        from sentient_codegen.emulator import threefry_recipe_model as _rm
+    except Exception:
+        return None
+    return getattr(_rm, "encode_rfp32_values", None)
 
 
 class _TorchDeviceBridge:
@@ -888,6 +937,15 @@ class _TorchDeviceBridge:
     def write_rows(self, resident, row_indices, host_rows):
         import torch
 
+        # A launch already in flight reads the resident tensor (segment 0 of
+        # the frozen 2-segment ABI), so the in-place row write must be ordered
+        # after every prior launch on the device. A drained synchronize() is
+        # 0.9 us (receipt rng-launch-terms-20261123). Without the runtime
+        # (offline tests inject a fake bridge, so this branch is not reached)
+        # there is no in-flight launch to order against.
+        from torch_spyre.streams import synchronize
+
+        synchronize(resident.device)
         rows = tuple(int(r) for r in row_indices)
         idx = torch.as_tensor(rows, dtype=torch.long, device=resident.device)
         src = np.ascontiguousarray(host_rows.view(np.int32))
@@ -989,6 +1047,11 @@ class SpyreRngResources:
         self._egress = egress
         self._stream = int(stream)
         self._residents: dict[int, _DeviceResident] = {}
+        # UNIFORM multitile residents, keyed by (device index, n_tiles): the
+        # row layout (X0_BASE_{LO,HI} at 5/6 + 257*t) is width-specific, so a
+        # width change is a DIFFERENT resident, never a patch of the old one
+        # (A9 design note §3 rule 6).
+        self._uniform_residents: "dict[tuple[int, int], _DeviceResident]" = {}
         # Partition allocator cursor: (epoch, next_counter). Starts at epoch 0.
         self._alloc_epoch = 0
         self._alloc_counter = 0
@@ -1105,6 +1168,261 @@ class SpyreRngResources:
             res.last_device_update = "upload"
         res.device_reflects = target
         return res.device_tensor
+
+    # -- UNIFORM multitile residency (A9) -------------------------------------
+
+    def ensure_uniform_device_params(
+        self,
+        spec: RngDrawSpec,
+        n_tiles: int,
+        device=None,
+        *,
+        bridge=None,
+        host_params=None,
+    ):
+        """Return the RESIDENT UNIFORM multitile device tensor for ``spec``.
+
+        The A9 win: the ``(257·n_tiles, 32)`` params tensor lives in device
+        memory once, and a same-seed + same-epoch offset advance writes ONLY
+        the rows that move — every tile's ``X0_BASE_LO`` (row ``5 + 257·t``)
+        plus the ``X0_BASE_HI`` rows (row ``6 + 257·t``) of the tiles whose
+        16-bit half carries — instead of rebuilding the whole stream on the
+        host (57 ms of the 58.5 ms ``torch.rand(4032)`` path). Row VALUES and
+        row POSITIONS both come from the codegen owners
+        (``patch_offset_words`` / ``offset_dependent_indices``); no encoding
+        formula is reimplemented here.
+
+        ``host_params`` (optional): the full params array a plan already
+        built for this exact spec. On a cold cache it is uploaded AS the
+        first resident (byte-identical by construction — same spec, same
+        builder), so a cold draw never pays the host build twice.
+
+        Invalidation (A9 design note §3): first draw / width change -> full
+        build + upload; seed change / epoch rollover -> full rebuild (the
+        key-derived words change); same seed + epoch -> row patch; repeated
+        spec -> nothing written. Every fallback is the full build — correct,
+        visibly unoptimized — never a cheaper wrong answer.
+        """
+        if not isinstance(spec, RngDrawSpec):
+            raise TypeError(
+                f"ensure_uniform_device_params expects an RngDrawSpec, got {type(spec)!r}"
+            )
+        n_tiles = int(n_tiles)
+        if n_tiles < 1:
+            raise SpyreRngError(
+                f"ensure_uniform_device_params: n_tiles must be >= 1, got {n_tiles}"
+            )
+        dev = _device_index(device)
+        res = self._advance_uniform(dev, n_tiles, spec, host_params=host_params)
+        bridge = self._device_bridge if bridge is None else bridge
+        target = res.reflected_key()
+
+        if res.device_tensor is None:
+            res.device_tensor = bridge.upload(res.params, device)
+            res.last_device_update = "upload"
+        elif res.device_reflects == target:
+            res.last_device_update = "cached"
+            return res.device_tensor
+        elif (
+            res.device_reflects is not None
+            and res.device_reflects[0] == res.seed
+            and res.device_reflects[1] == res.epoch
+        ):
+            rows = self._uniform_patch_rows()
+            if rows is None:
+                # No offset-index owner: full re-upload keeps this CORRECT,
+                # merely unoptimized (the same fallback semantics as the raw
+                # resident path).
+                res.device_tensor = bridge.upload(res.params, device)
+                res.last_device_update = "upload"
+            else:
+                # Write every tile's LO and HI row (2n rows, 16 KB at n=63 vs
+                # the 2 MB full stream). The HI rows that did not carry are
+                # rewritten with byte-identical values, so the write is
+                # correct whether or not a tile carried; no old-value diff is
+                # needed and none is guessed.
+                stride = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM)
+                row_idx = tuple(
+                    t * stride + local for t in range(n_tiles) for local in rows
+                )
+                host_rows = np.ascontiguousarray(res.params[list(row_idx)])
+                try:
+                    bridge.write_rows(res.device_tensor, row_idx, host_rows)
+                    res.last_device_update = "patch"
+                except NotImplementedError:
+                    # Transport refusal (A9 design note §5, WITNESSED on
+                    # silicon 2026-11-23: ``aten::index_copy_`` has no spyre
+                    # kernel). The host mirror is ALREADY patched and
+                    # byte-identical to a full rebuild, so the full-tensor
+                    # upload is the correct fallback — and it still skips the
+                    # expensive part (the per-draw host REBUILD of the whole
+                    # multitile stream). SpyreRngError is a
+                    # NotImplementedError subclass, so a typed refusal inside
+                    # the write path takes the same correct fallback rather
+                    # than crashing the draw.
+                    res.device_tensor = bridge.upload(res.params, device)
+                    res.last_device_update = "upload"
+        else:
+            # Seed change or epoch rollover vs what the device holds: the
+            # key-derived words change, so the whole buffer is re-sent.
+            res.device_tensor = bridge.upload(res.params, device)
+            res.last_device_update = "upload"
+        res.device_reflects = target
+        return res.device_tensor
+
+    def has_uniform_device_resident(self, device=None, n_tiles: int = 1) -> bool:
+        """True iff a UNIFORM multitile device tensor exists for the width.
+
+        This is the residency query ``build_rng_launch_plan`` consults for a
+        UNIFORM plan: when a resident of the REQUESTED width exists the plan
+        can skip the full params build (``params=None``) because the launcher
+        reads the resident tensor. A cold cache (or a different width)
+        returns ``False`` and the plan builds in full, byte-identical to the
+        pre-A9 behaviour.
+        """
+        res = self._uniform_residents.get((_device_index(device), int(n_tiles)))
+        return res is not None and res.device_tensor is not None
+
+    def _advance_uniform(
+        self, dev: int, n_tiles: int, spec: RngDrawSpec, *, host_params=None
+    ) -> _DeviceResident:
+        """Advance the HOST UNIFORM resident for ``spec`` at width ``n_tiles``."""
+        key = (dev, n_tiles)
+        res = self._uniform_residents.get(key)
+        seed = (spec.seed_lo, spec.seed_hi)
+        if res is None:
+            return self._full_build_uniform(dev, n_tiles, spec, host_params=host_params)
+        same_seed = res.seed == seed
+        same_epoch = res.epoch == spec.epoch
+        if same_seed and same_epoch and res.base_counter == spec.base_counter:
+            return res
+        if same_seed and same_epoch:
+            patched = self._patch_offset_uniform(dev, n_tiles, res, spec)
+            if patched is not None:
+                return patched
+            return self._full_build_uniform(dev, n_tiles, spec)
+        return self._full_build_uniform(dev, n_tiles, spec)
+
+    def _full_build_uniform(
+        self, dev: int, n_tiles: int, spec: RngDrawSpec, *, host_params=None
+    ) -> _DeviceResident:
+        if host_params is not None:
+            host_params = np.asarray(host_params, dtype=np.uint32)
+            expected = (
+                band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM)
+                * n_tiles,
+                RNG_KAT_LANES,
+            )
+            if tuple(host_params.shape) != expected:
+                raise SpyreRngError(
+                    "host_params shape "
+                    f"{tuple(host_params.shape)} disagrees with the UNIFORM "
+                    f"{n_tiles}-tile resident {expected}; refusing to seed a "
+                    "resident from words built for a different plan"
+                )
+            stream: "tuple[StreamWord, ...] | None" = None
+            params = np.array(host_params, dtype=np.uint32, copy=True)
+        else:
+            stream = _default_build_stream_multitile(
+                spec,
+                dev,
+                rounds=self._rounds,
+                egress=EgressMode.UNIFORM,
+                stream=self._stream,
+                n_tiles=n_tiles,
+            )
+            params = stream_to_sticks(stream)
+        prev = self._uniform_residents.get((dev, n_tiles))
+        # Same rule as the raw resident: a rebuild that keeps the SAME
+        # (seed, epoch) leaves the device buffer valid for the key-derived
+        # rows, so it can be carried for a 2-row-per-tile patch.
+        carry_device = (
+            prev is not None
+            and prev.device_tensor is not None
+            and prev.seed == (spec.seed_lo, spec.seed_hi)
+            and prev.epoch == spec.epoch
+        )
+        res = _DeviceResident(
+            seed=(spec.seed_lo, spec.seed_hi),
+            epoch=spec.epoch,
+            base_counter=spec.base_counter,
+            stream=stream,
+            params=params,
+        )
+        res.patch_source = None
+        if carry_device and prev is not None:
+            res.device_tensor = prev.device_tensor
+            res.device_reflects = prev.device_reflects
+        self._uniform_residents[(dev, n_tiles)] = res
+        return res
+
+    def _patch_offset_uniform(
+        self, dev: int, n_tiles: int, res: _DeviceResident, spec: RngDrawSpec
+    ) -> "_DeviceResident | None":
+        """Patch ONLY the per-tile X0_BASE_{LO,HI} rows of the host mirror.
+
+        The two row values per tile are the codegen owner's own
+        ``_offset_dependent_words`` form — ``rfp32(x0_base_t & 0xFFFF)`` and
+        ``rfp32((x0_base_t >> 16) - 128)`` splatted across the lanes —
+        computed here VECTORIZED through the encoding owner
+        (``encode_rfp32_values``), because calling ``patch_offset_words``
+        once per tile (257-word tuple rebuilds, n=63) costs tens of ms, which
+        is the very budget this lane removes. Byte-identity to a fresh
+        multitile build is guarded by the equivalence tests
+        (``tests/test_rng_uniform_residency.py``: patched resident vs
+        ``draw_params_stream`` rebuilds, across the 0x10000 carry) and by a
+        focused per-tile comparison against ``patch_offset_words`` itself.
+
+        Returns ``None`` when the encoding owner or the offset-index owner is
+        unavailable, or when a tile base would exceed the u32 word domain the
+        owner's ``_halves`` refuses (the caller then rebuilds fully).
+        """
+        enc_fn = _load_codegen_encoder()
+        rows = self._uniform_patch_rows()
+        if enc_fn is None or rows is None:
+            return None
+        lo_local, hi_local = rows
+        stride = band_lxlu_pop_count(RNG_KAT_ROUNDS, egress=EgressMode.UNIFORM)
+        seed_key = (spec.seed_lo, spec.seed_hi)
+        k_prime = epoch_key_2x32(seed_key, spec.epoch, device=dev, stream=self._stream)
+        x0_base, _x1 = fold_key_schedule_2x32(k_prime, spec.base_counter)
+        if x0_base + n_tiles - 1 > 0xFFFFFFFF:
+            # The owner's ``_halves`` refuses a word above 2^32-1; a full
+            # rebuild hits the same refusal loudly instead of wrapping here.
+            return None
+        bases = x0_base + np.arange(n_tiles, dtype=np.uint64)
+        lo_words = enc_fn((bases & 0xFFFF).astype(np.float64))
+        hi_words = enc_fn(((bases >> 16).astype(np.int64) - 128).astype(np.float64))
+        new_params = np.array(res.params, dtype=np.uint32, copy=True)
+        tile_rows = np.arange(n_tiles, dtype=np.int64) * stride
+        new_params[tile_rows + lo_local] = lo_words[:, None]
+        new_params[tile_rows + hi_local] = hi_words[:, None]
+        patched_res = _DeviceResident(
+            seed=seed_key,
+            epoch=spec.epoch,
+            base_counter=spec.base_counter,
+            stream=None,
+            params=new_params,
+        )
+        patched_res.patch_source = "codegen"
+        patched_res.device_tensor = res.device_tensor
+        patched_res.device_reflects = res.device_reflects
+        self._uniform_residents[(dev, n_tiles)] = patched_res
+        return patched_res
+
+    def _uniform_patch_rows(self) -> "tuple[int, int] | None":
+        """Per-tile local rows (X0_BASE_LO, X0_BASE_HI) for the UNIFORM patch.
+
+        Derived from the codegen owner ``offset_dependent_indices`` —
+        positions 1 and 2 of its (COUNTER, X0_BASE_LO, X0_BASE_HI) result;
+        COUNTER (position 0) does not move with offset (A9 design note §1).
+        Returns ``None`` when the owner is unavailable or its shape is not
+        the expected three-slot form (never a guessed row set).
+        """
+        indices = self._offset_dependent_rows()
+        if indices is None or len(indices) != 3:
+            return None
+        return int(indices[1]), int(indices[2])
 
     # -- invalidation core ---------------------------------------------------
 
@@ -1303,6 +1621,16 @@ class SpyreRngResources:
         """Public view of the rows the device patch writes (``None`` if absent)."""
         return self._offset_dependent_rows()
 
+    def uniform_last_device_update(self, device=None, n_tiles: int = 1) -> "str | None":
+        """Last UNIFORM-resident device write kind: ``upload``/``patch``/``cached``."""
+        res = self._uniform_residents.get((_device_index(device), int(n_tiles)))
+        return None if res is None else res.last_device_update
+
+    def uniform_patch_source(self, device=None, n_tiles: int = 1) -> "str | None":
+        """Which owner last advanced the UNIFORM resident (``codegen``/``injected``)."""
+        res = self._uniform_residents.get((_device_index(device), int(n_tiles)))
+        return None if res is None else res.patch_source
+
 
 #: The process-wide resources instance. Per-device state lives inside it, keyed
 #: by device index — this is a process handle, NOT a bare module-global buffer.
@@ -1450,8 +1778,9 @@ def build_rng_launch_plan(
     ``RNG_KAT_LANES``, not hardcoded). On a COLD cache — no resident buffer —
     this falls back to the
     ordinary full build, so the default (and cold) path is byte-identical to
-    the pre-residency behaviour. ``draw_raw_state`` opts in; every other caller
-    keeps the default ``resident=False``.
+    the pre-residency behaviour. ``draw_raw_state`` opts in (raw egress); from
+    A9 ``route_uniform_fill`` opts in too (UNIFORM egress, width-keyed
+    resident — a width with no resident falls back to the full build here).
     """
     if not isinstance(egress, EgressMode):
         raise TypeError(f"egress must be an EgressMode, got {egress!r}")
@@ -1487,7 +1816,15 @@ def build_rng_launch_plan(
             "until registration + integration land."
         )
     spec = RngDrawSpec.from_seed_offset(seed, offset)
-    if resident and get_rng_resources().has_device_resident(device):
+    # Egress-aware residency query: a RAW_STATE plan consults the raw
+    # resident, a UNIFORM plan the UNIFORM resident OF THE REQUESTED WIDTH
+    # (a width change is a different resident, never a patch of the old one
+    # — A9 design note §3 rule 6).
+    if resident and (
+        get_rng_resources().has_uniform_device_resident(device, n_tiles)
+        if egress is EgressMode.UNIFORM
+        else get_rng_resources().has_device_resident(device)
+    ):
         if stream != 0:
             # Silent-wrong guard: RngDrawSpec does NOT carry ``stream``, so the
             # resident invalidation key cannot distinguish stream 0 from stream
@@ -1912,7 +2249,19 @@ def _resolve_launch_params(plan: "RngLaunchPlan", dev, use_resident):
                 f"stream-{plan.stream} params, or keep a separate "
                 "SpyreRngResources per stream (the multi-generator direction)."
             )
-        params = resources.ensure_device_params(plan.spec, dev)
+        if plan.egress is EgressMode.UNIFORM:
+            # A9: the UNIFORM multitile resident, keyed by (device, n_tiles).
+            # ``plan.params`` (a cold, full-build plan) seeds the resident so
+            # the first draw never pays the host build twice; a resident-only
+            # plan (params is None) passes nothing and the resident serves.
+            params = resources.ensure_uniform_device_params(
+                plan.spec,
+                plan.n_tiles,
+                dev,
+                host_params=plan.params,
+            )
+        else:
+            params = resources.ensure_device_params(plan.spec, dev)
         # Validate against the plan's DECLARED ABI (sticks, lanes), not the
         # words: a resident-only plan (``params is None``) declares them from
         # the local band-count mirror (drift-guarded vs the codegen owner) so
@@ -2314,9 +2663,11 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
 
     Reserves ``numel`` block-counters from the device generator (successive
     draws differ, a fixed seed reproduces), draws ``n_tiles`` counter blocks and
-    writes them into ``self`` via :func:`launch_uniform_draw`. The params stream
-    is rebuilt in full per direct draw (the resident buffer is keyed for the raw
-    egress); a uniform residency is a follow-on.
+    writes them into ``self`` via :func:`launch_uniform_draw`. From A9 the
+    params stream is device-resident per ``(device, n_tiles)``: the first
+    direct draw builds and uploads it in full (byte-identical to the
+    pre-A9 path), and every later same-seed draw patches only the per-tile
+    ``X0_BASE_{LO,HI}`` rows into the resident tensor.
     """
     import torch
 
@@ -2366,12 +2717,17 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
         numel=RNG_KAT_LANES,
         device=_device_index(self.device),
         egress=EgressMode.UNIFORM,
-        # Full params build (not the raw-keyed resident buffer); the values
-        # themselves never round-trip through the host.
-        resident=False,
+        # A9: when a UNIFORM resident of this width already exists the plan
+        # skips the full params build entirely (params=None); the launcher
+        # patches only the per-tile X0_BASE rows into the resident. A cold
+        # cache builds in full (byte-identical to the pre-A9 path) and that
+        # build seeds the resident, so the first draw pays the host build
+        # once, not twice. The values themselves never round-trip through
+        # the host on any path.
+        resident=True,
         n_tiles=n_tiles,
     )
-    launch_uniform_draw(plan, out=self, device=self.device, use_resident=False)
+    launch_uniform_draw(plan, out=self, device=self.device)
     return True
 
 
