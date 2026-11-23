@@ -2039,15 +2039,26 @@ def _select_uniform_binding(
     * ``"direct"`` — bind the caller tensor itself as segment 1, ZERO host
       round trip. Requires the identity map (``[0,1)``), float32, contiguous,
       ``numel`` a whole multiple of 64 (``n = numel // 64`` whole 64-word
-      tiles, ``1 <= n <= _RNG_UNIFORM_TILES_CAP``), and a device layout of
-      exactly the ``(2n, 32)`` dense sticks the egress writes (logical
-      ``numel*4`` == the binary's ``2n``-stick write, stick-aligned). This is
-      the extent-EXACT, silicon-witnessed binding; the admission rule is the
-      ``numel % 64 == 0`` / ``(2n, 32)`` / cap test at ``rng.py:2118-2124``. A
-      non-whole-tile caller (``1..63``), and a whole-tile caller whose device
-      layout is not exactly ``(2n, 32)``, both take the fallback instead (we do
-      NOT force a padded extent through; this cut binds only the exact
-      layout).
+      tiles, ``1 <= n <= _RNG_UNIFORM_TILES_CAP``), OR a TAIL tile (``numel >
+      64`` and ``numel % 64 != 0``) whose device allocation already covers the
+      tile write; and a device layout of exactly the ``(2·n_tiles, 32)`` dense
+      sticks the tile loop writes (``n_tiles = ceil(numel / 64)`` above 64).
+      For a whole-tile caller this is the extent-EXACT, silicon-witnessed
+      binding (logical ``numel*4`` == the binary's ``2·n_tiles``-stick write,
+      stick-aligned); the admission rule is the ``rng.py:2118-2124`` test. For a
+      TAIL tile the loop writes ``n_tiles`` whole tiles — MORE slots than
+      ``numel`` occupies — so the direct bind is admitted only when the caller's
+      device allocation is already those ``2·n_tiles`` sticks (A6 slice-2,
+      ``docs/rng-tail-tile-design.md``): every written slot then lies inside the
+      tensor's own stick-padded allocation and the slots past ``numel`` are
+      padding outside the logical view. The launch ABI is fed the
+      DEVICE-ALLOCATION extent, which gate 8 accepts as ``>=`` the required
+      window (``launch_abi.py:1348``); for a whole-tile caller the two extents
+      are equal, so whole-tile launches are byte-unchanged. A caller with
+      ``numel <= 64`` (including ``1..63``) and a whole-tile caller whose device
+      layout is not exactly ``(2n, 32)`` take the fallback; a tail tile whose
+      allocation does not cover the tile write REFUSES typed (see Raises). (We
+      do NOT force a padded extent through; the bind is only the exact layout.)
     * ``"fallback"`` — take the EXISTING host-map path (device bits ->
       ``raw_words_to_uniform`` -> ``self.copy_``), unchanged from today. This is
       the answer for EVERY non-direct caller, with no new refusal (doc 54 §4.1
@@ -2071,32 +2082,29 @@ def _select_uniform_binding(
       option B "is the correct first cut if the scratch path proves
       unavailable".
 
-    Raises typed (``SpyreRngError``) for ``numel > 64`` only when it is not a
-    whole number of 64-word tiles, or the tile count is above the silicon-
-    witnessed cap (any width ``1.._RNG_UNIFORM_TILES_CAP`` — cap
-    ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` clamped to the ISA bound — is admitted
-    in kind; the witnessed head is ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` = 63
-    tiles = numel 4032, the LX physical address-space (streaming) ceiling
-    recorded at that constant's definition in this module: the n·257 params is
-    a 32-stick burst stream whose LX address wraps at the physical 16,384
-    sticks (63 = 16,191 < 16,384 < 64 = 16,448), a streaming ceiling, not a
-    resident one (codegen wiki/design/56 §3)). An
-    admitted whole-tile fill is a direct device bind or the unchanged host
-    fallback — never a new refusal.
+    Raises typed (``SpyreRngError``) for ``numel > 64`` when it is a TAIL tile
+    whose allocation does not cover the tile write (``device_size !=
+    (2·ceil(numel/64), 32)`` — a stick-only-padded tail or a slice into a larger
+    buffer), or when the tile count is above the silicon-witnessed cap (any width
+    ``1.._RNG_UNIFORM_TILES_CAP`` — cap ``_RNG_WITNESSED_UNIFORM_TILES_MAX``
+    clamped to the ISA bound — is admitted in kind; the witnessed head is
+    ``_RNG_WITNESSED_UNIFORM_TILES_MAX`` = 63 tiles = numel 4032, the LX
+    physical address-space (streaming) ceiling recorded at that constant's
+    definition in this module: the n·257 params is a 32-stick burst stream whose
+    LX address wraps at the physical 16,384 sticks (63 = 16,191 < 16,384 <
+    64 = 16,448), a streaming ceiling, not a resident one (codegen
+    wiki/design/56 §3)), and above the ISA trip bound. An admitted fill —
+    whole-tile OR allocation-safe tail — is a direct device bind, or (for whole
+    tiles only) the unchanged host fallback — never a silent split.
     """
     if numel == 0:
         return "empty"
     if numel > _RNG_MAX_UNIFORM_ELEMS:
-        # Wider-than-one-tile fills: only a whole number of 64-word tiles whose
-        # tile count is within the witnessed cap is expressible on device;
-        # everything else is a typed refusal (never a silent split).
-        if numel % _RNG_MAX_UNIFORM_ELEMS != 0:
-            raise SpyreRngError(
-                f"device RNG: numel={numel} is not a whole number of "
-                f"{_RNG_MAX_UNIFORM_ELEMS}-word tiles (T-DV-34). Draw on the "
-                "host, or split into whole 64-word draws."
-            )
-        _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
+        # Wider-than-one-tile fills. The device tile loop covers n_tiles tiles,
+        # each writing one full 64-word (2-stick) egress; the trip-bound and
+        # witnessed-cap refusals are unchanged. ceil (not floor) so a tail tile
+        # is counted as the tile the kernel actually writes.
+        _n_tiles = -(-numel // _RNG_MAX_UNIFORM_ELEMS)  # ceil(numel / 64)
         if _n_tiles > _RNG_TILE_LOOP_MAX:
             raise SpyreRngError(
                 f"device RNG: a {_n_tiles}-tile fill (numel={numel}) exceeds the "
@@ -2112,6 +2120,37 @@ def _select_uniform_binding(
                 "silicon). Witness a wider count on silicon to raise the cap, or "
                 "split into narrower draws."
             )
+        if numel % _RNG_MAX_UNIFORM_ELEMS != 0:
+            # TAIL TILE (A6 slice-2). The tile loop writes ceil(numel/64) whole
+            # tiles = 2*ceil(numel/64) sticks, MORE slots than `numel` occupies
+            # logically. Admit the padded direct bind ONLY when the caller's
+            # device allocation already IS that many sticks AND the map is the
+            # on-device-expressible identity/fp32/contiguous cell. Then every
+            # written slot lies inside the tensor's own stick-padded allocation
+            # (its real storage is sized to device_size, spyre_mem.cpp:449), the
+            # tile-rounded write is in-bounds, and slots past `numel` are padding
+            # outside the logical view. A stick-only-padded tail (numel % 64 in
+            # [1,32], e.g. numel=96 -> device_size (3,32)) is one stick short of
+            # the 2*ceil(numel/64)-stick write and refuses typed rather than
+            # overrun; a slice into a larger buffer reports the parent's larger
+            # device_size (e.g. big[0:100] -> (7,32)) and refuses the same way.
+            if (
+                float(from_) == 0.0
+                and float(to) == 1.0
+                and is_float32
+                and is_contiguous
+                and device_size == (2 * _n_tiles, RNG_KAT_LANES)
+            ):
+                return "direct"
+            raise SpyreRngError(
+                f"device RNG: numel={numel} is a tail tile ({numel % 64} past "
+                f"{_n_tiles - 1} whole 64-word tiles; T-DV-34). The tile loop "
+                f"writes {2 * _n_tiles} sticks, but the caller allocation is "
+                f"{device_size!r}, not {(2 * _n_tiles, RNG_KAT_LANES)!r}, so a "
+                "direct bind would write past the allocation. Allocate a "
+                "whole-tile-padded tensor, split into whole 64-word draws, or "
+                "draw on the host."
+            )
     if float(from_) != 0.0 or float(to) != 1.0:
         return "fallback"
     if not is_float32:
@@ -2123,9 +2162,9 @@ def _select_uniform_binding(
     # stick-aligned. n=1 is the historical T=1 cell; the witnessed tile-loop
     # widths are 2/4/16/32/63 up to ``_RNG_UNIFORM_TILES_CAP`` = 63 (the
     # ``rng-multitile-{2,4,16,32,63}tile-20261120-001`` silicon-witness claim
-    # family). A numel that is not a whole multiple of 64, or a whole-tile
-    # caller whose device layout is not exactly (2n,32), takes the host-map
-    # fallback.
+    # family). A ``numel <= 64`` that is not a whole multiple of 64 (1..63), or a
+    # whole-tile caller whose device layout is not exactly (2n,32), takes the
+    # host-map fallback. (numel > 64 tail tiles are decided above.)
     if numel % _RNG_MAX_UNIFORM_ELEMS == 0:
         _n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
         if 1 <= _n_tiles <= _RNG_UNIFORM_TILES_CAP and device_size == (
@@ -2206,12 +2245,29 @@ def launch_uniform_draw(
         xlat_plan.symbols[0].symbol_id: params,
         xlat_plan.symbols[1].symbol_id: target,
     }
-    # Direct bind is extent-exact (numel a whole multiple of 64 -> ``numel*4``
-    # == the binary's 2n-stick write, stick-aligned), so the logical nbytes IS
-    # the window the ABI gate needs.
+    out_symbol_id = xlat_plan.symbols[1].symbol_id
+    # The output window extent is the tensor's DEVICE ALLOCATION bytes, not its
+    # logical nbytes: a tail-tile direct bind (A6 slice-2) writes
+    # 2*ceil(numel/64) whole sticks into a stick-padded allocation whose
+    # device_size is exactly that (the direct decision guaranteed it), so the
+    # device-allocation extent is the honest window gate 8 must compare
+    # (launch_abi.py:1348 accepts >=). For a whole-tile cell the two extents are
+    # EQUAL (numel a whole multiple of 64 is also a multiple of the 32-element
+    # stick -> device allocation == numel*4), so whole-tile launches are
+    # unchanged bit-for-bit. A fresh (out is None) output keeps its logical
+    # nbytes (its shape already IS the full egress region).
+    out_device_size = _device_stick_layout(target) if out is not None else None
+    if out_device_size is not None and len(out_device_size) == 2:
+        out_extent = int(
+            out_device_size[0] * out_device_size[1] * target.element_size()
+        )
+    else:
+        out_extent = int(target.element_size() * target.nelement())
     specs = {
         sym.symbol_id: (
-            int(
+            out_extent
+            if sym.symbol_id == out_symbol_id
+            else int(
                 tensors_by_symbol[sym.symbol_id].element_size()
                 * tensors_by_symbol[sym.symbol_id].nelement()
             ),
@@ -2239,19 +2295,22 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
     """Device route for a switch-ON ``uniform_`` fill (doc 54 §4.1).
 
     Returns ``True`` when the fill was performed ON DEVICE (zero host round
-    trip, direct-bind): the caller tensor is float32, contiguous, a whole
-    number of 64-word tiles (1..``_RNG_UNIFORM_TILES_CAP``), its device layout
-    is exactly ``(2n, 32)``, and the map is the identity ``[0,1)``. Returns
+    trip, direct-bind): the caller tensor is float32, contiguous,
+    ``ceil(numel/64)`` tiles (1..``_RNG_UNIFORM_TILES_CAP``) — a whole number of
+    tiles, OR a TAIL tile whose stick-padded allocation covers the
+    ``2·ceil(numel/64)``-stick write — its device layout is exactly
+    ``(2·ceil(numel/64), 32)``, and the map is the identity ``[0,1)``. Returns
     ``False`` when the caller must take the
     EXISTING host-map path — every other case (non-identity ``(from_, to)``,
-    non-fp32, non-contiguous / non-``(2,32)``, and ``numel <= 32`` whose scratch
+    non-fp32, non-contiguous / non-``(2n,32)``, and ``numel <= 32`` whose scratch
     path is f32-blocked). See :func:`_select_uniform_binding`.
 
-    Raises typed (``SpyreRngError``) for a ``numel > 64`` that is not a whole
-    number of tiles, for a tile count above ``_RNG_UNIFORM_TILES_CAP``, and for
-    a direct call whose device generator is unreachable (registration + state)
-    — exactly as today's ``route_uniform_draw`` requires; a direct call with the
-    generator unreachable raises rather than silently host-drawing.
+    Raises typed (``SpyreRngError``) for a ``numel > 64`` tail whose allocation
+    does not cover the tile write, for a tile count above
+    ``_RNG_UNIFORM_TILES_CAP``, and for a direct call whose device generator is
+    unreachable (registration + state) — exactly as today's
+    ``route_uniform_draw`` requires; a direct call with the generator
+    unreachable raises rather than silently host-drawing.
 
     Reserves ``numel`` block-counters from the device generator (successive
     draws differ, a fixed seed reproduces), draws ``n_tiles`` counter blocks and
@@ -2295,9 +2354,10 @@ def route_uniform_fill(self, from_=0.0, to=1.0) -> bool:
         )
     # Reserve numel block-counters so a second draw advances the offset.
     offset = state.reserve(numel)
-    # A whole, witnessed number of 64-word tiles (the direct decision above
-    # guarantees numel % 64 == 0 and the tile count is witnessed).
-    n_tiles = numel // _RNG_MAX_UNIFORM_ELEMS
+    # ceil (not floor): the direct decision admits a tail tile only when the
+    # allocation covers the whole-tile write, and the kernel writes ceil(numel/64)
+    # tiles (a whole-tile caller's ceil == floor, unchanged).
+    n_tiles = -(-numel // _RNG_MAX_UNIFORM_ELEMS)  # ceil(numel / 64)
     plan = build_rng_launch_plan(
         seed=state.seed,
         offset=offset,
