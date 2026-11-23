@@ -2124,7 +2124,26 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     True,
                 ),
             },
-            "expect_fail": ["mha_decode", "gqa_decode"],
+            # attention-aten-exposure (2026-11-23): F.sdpa on spyre now
+            # routes through the attention program (spyre::attention) and
+            # REFUSES TYPED outside the v1 decode envelope (the predicate's
+            # clause names) instead of CPU-falling-back. Every param set
+            # here is outside that envelope (prefill rows>32 -> [row-budget];
+            # explicit mask -> [mask-mode]; GQA -> [gqa-group]; kv=257
+            # ragged -> [kv-len]) — strict xfail pins the refusal. The
+            # in-envelope contract is pinned off-box in
+            # torch_spyre/tests/test_attention_aten_mapping.py and on
+            # silicon by the exposure KAT; adding an in-envelope cell here
+            # is a follow-up once the KAT lands.
+            "expect_fail": [
+                "mha_prefill",
+                "mha_prefill_causal",
+                "mha_prefill_mask",
+                "gqa_prefill",
+                "gqa_prefill_causal",
+                "mha_decode",
+                "gqa_decode",
+            ],
         },
         ("test_split", "test_split_cpu"): {
             "ops_dict": {
