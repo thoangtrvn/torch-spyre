@@ -105,8 +105,8 @@ compiled_result = compiled_attention(q_dev, k_dev, v_dev).cpu().reshape(ROWS, HE
 print(f"Reference (fp64 flash)\n{reference}")
 print(f"Spyre eager result\n{eager_result}")
 print(f"Spyre compiled result\n{compiled_result}")
-eager_delta = float((eager_result.double().numpy() - reference).abs().max())
-compiled_delta = float((compiled_result.double().numpy() - reference).abs().max())
+eager_delta = float(np.abs(eager_result.double().numpy() - reference).max())
+compiled_delta = float(np.abs(compiled_result.double().numpy() - reference).max())
 eager_vs_compiled = float((eager_result.float() - compiled_result.float()).abs().max())
 print(f"Max delta eager vs. fp64 reference: {eager_delta:.4f}")
 print(f"Max delta compiled vs. fp64 reference: {compiled_delta:.4f}")
@@ -114,11 +114,21 @@ print(f"Max delta compiled vs. eager: {eager_vs_compiled:.4f}")
 
 # The refusal surface: one out-of-envelope call (rows=33 > the v1 row
 # ceiling of 32) refuses typed with the predicate's own clause name —
-# under torch.compile the refusal surfaces at compile time.
+# under torch.compile the refusal surfaces at compile time. At this
+# single-block shape (kv_len == 64) the refusal is the predicate's
+# [row-budget] clause; at multi-block shapes the multiblock owner's
+# [kv-block] no-witnessed-width refusal fires first — both are typed
+# and clause-named.
 torch._dynamo.reset()
 q33 = torch.randint(1, 4, (33, HEAD_DIM), generator=g, dtype=torch.float16)
+k64 = torch.randint(-1, 2, (64, HEAD_DIM), generator=g, dtype=torch.float16)
+v64 = torch.randint(-1, 2, (64, HEAD_DIM), generator=g, dtype=torch.float16)
 try:
-    compiled_attention(q33.reshape(1, 1, 33, HEAD_DIM).to(DEVICE), k_dev, v_dev)
+    compiled_attention(
+        q33.reshape(1, 1, 33, HEAD_DIM).to(DEVICE),
+        k64.reshape(1, 1, 64, HEAD_DIM).to(DEVICE),
+        v64.reshape(1, 1, 64, HEAD_DIM).to(DEVICE),
+    )
     print("rows=33: ADMITTED (unexpected — the v1 row ceiling is 32)")
 except Exception as e:  # the typed refusal carries the clause name
     if "[row-budget]" not in str(e):
