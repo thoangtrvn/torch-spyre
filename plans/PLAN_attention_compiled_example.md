@@ -46,22 +46,33 @@ delegate, the predicate) owns everything downstream. Standard
 `register_spyre_decomposition` (table + PrivateUse1), the same convention as
 every other op in the table.
 
-## The routing mechanism (fix-round R1, executed evidence — receipts/)
+## The routing mechanism (fix-rounds R1+R2, executed evidence — receipts/)
 
 The PrivateUse1 kernel registration is what makes COMPILE work, not the
-table entry: dynamo INLINES the Python dispatch kernel at trace time, so
-the traced graph contains `spyre.attention` directly and the dispatcher
-is never consulted during the compiled run (instrumented at b396ebbb:
-zero OPWrapper dispatch calls, 15 launches, aot forward graph = the
-single `torch.ops.spyre.attention.default` node —
-`receipts/b396_compiled_path_mechanism.log`).
+table entry. The stages, as executed (R2 corrected the R1 wording — the
+dynamo graph does NOT inline the kernel):
+
+- dynamo traces the user function and puts the TOP-LEVEL
+  `aten::scaled_dot_product_attention` in the graph (the captured dynamo
+  graph is exactly that one op);
+- inside compile_fx, aot's FakeTensor tracing dispatches the top-level
+  op THROUGH the PrivateUse1 kernel, expanding it to `spyre.attention` —
+  the aot forward graph is the single `torch.ops.spyre.attention.default`
+  node (raw `__aot_graphs` lines in
+  `receipts/b396_compiled_path_mechanism.log`; NOTE that receipt's own
+  machine summary line "aot forward graph contains spyre.attention:
+  False" is a probe-script bug — its logging handler captured nothing
+  because the artifact records reach stderr from a compile subprocess;
+  the node is visible in the log body);
+- the dispatcher is never consulted at RUNTIME (instrumented at
+  b396ebbb: zero OPWrapper dispatch calls, 15 launches).
 
 A TABLE-ONLY variant (decomposition table entry, no PrivateUse1 kernel —
 the R1 reviewers' preferred branch, preserving eager dispatch) was built
-and REFUTED BY EXECUTION: without the kernel, dynamo executes the C++
-composite under FakeTensor before any aot table applies, the graph
-degrades to the math form, and the Sentient codegen refuses
-`F32PointerElementGrainError` (`receipts/table_only_refutation.log`).
+and REFUTED BY EXECUTION: without the kernel, the C++ composite expands
+to the math form under FakeTensor and the table entry never applies, so
+the Sentient codegen refuses `F32PointerElementGrainError`
+(`receipts/table_only_refutation.log`).
 The eager reroute is therefore ACCEPTED, not chosen: registering the
 kernel reroutes EAGER `F.scaled_dot_product_attention` through the Spyre
 seam (the C++ composite and its fp16→fp32 prelude are bypassed). The
@@ -119,12 +130,17 @@ eager dispatch):
   graph contains the top-level SDPA op, and the EXECUTED launch roles
   are the attention plan's own phase vocabulary with the launch count
   derived from the plan's step count (not a hand-counted constant).
-- mutation-proven teeth: with the user compile removed the two compile
-  tests FAIL (`receipts/mutationA_user_compile_removed.log`); with the
-  OPWrapper inner compile neutralized they still pass — expected, the
-  inner compile is off the compiled path (dynamo inlines the kernel at
-  trace time) and off the is_compiling pin (recorded at user-fn entry
-  before any dispatch) — `receipts/mutationB_inner_compile_neutralized.log`.
+- mutation-proven teeth (R2 set, on the final code — the *_v2 logs;
+  the R1-era logs are superseded): user compile removed -> the two
+  compile tests FAIL on the is_compiling pin
+  (`receipts/mutationA_v2.log`); BACKEND NO-OP (the recording backend
+  returns gm.forward, traced-then-eager through the seam's own inner
+  compile) -> they FAIL on the user-graph-compiled pin
+  (`receipts/mutationC_v2.log` — only the USER-level compile hands
+  compile_fx a graph containing the top-level SDPA op; the OPWrapper
+  inner compile's graph contains spyre.attention only); OPWrapper inner
+  compile neutralized -> they still pass, expected and disclosed — the
+  inner compile is off the user-level pins (`receipts/mutationB_v2.log`).
 - eager F.sdpa reroutes through the seam (the R1-required committed
   eager test: the top-level PrivateUse1 wrapper records an EAGER
   dispatch, values correct).

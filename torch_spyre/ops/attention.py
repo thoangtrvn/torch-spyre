@@ -145,11 +145,15 @@ def sdpa_attention_mapping(
             "route returns no debug artifacts"
         )
     if not (0.0 <= dropout_p < 1.0):
-        # ATen's own contract (the C++ composite validates the same range
-        # before dispatch): dropout_p outside [0, 1) is an error, never a
-        # silently-ignored value. Negative p reached this mapping
-        # unrefused before — the composite's check is bypassed on the
-        # compiled path, so the range lives here too.
+        # A DELIBERATE TIGHTENING owned here, not ATen parity: probed on
+        # torch 2.13.0, the ATen composite has NO composite-level range
+        # gate — with the math backend forced, dropout_p=-0.5 and 1.0
+        # are accepted (only p>1 errors, via the inner dropout op's own
+        # check, with a backend-specific message). Those backend-specific
+        # checks are bypassed on this route (the compiled path never runs
+        # the composite; the Spyre seam has no dropout op to catch it),
+        # so the range is enforced at the mapping: outside [0, 1) is a
+        # typed error, never a silently-ignored value.
         raise NotImplementedError(
             f"spyre attention: dropout_p must be in [0, 1), got {dropout_p} "
             f"(dropout itself is unsupported on the v1 route)"

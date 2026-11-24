@@ -74,7 +74,10 @@ import torch_spyre  # noqa: E402
 # Post-condition on the meta_path cleanup above: the torch_spyre this
 # test executes must be THIS tree's (an editable install of another
 # checkout would otherwise silently run a different decomposition table).
-assert torch_spyre.__file__.startswith(_THIS_REPO), (
+assert (
+    os.path.commonpath([os.path.abspath(torch_spyre.__file__), _THIS_REPO])
+    == _THIS_REPO
+), (
     f"torch_spyre resolves outside this tree: {torch_spyre.__file__} "
     f"(repo root {_THIS_REPO}) — the meta_path cleanup above failed"
 )
@@ -249,16 +252,35 @@ class _CompiledHarness:
         return False
 
 
+class _CompiledRun:
+    """What one compiled execution proved (a named structure, not a
+    7-tuple)."""
+
+    out: object
+    user_is_compiling: list
+    dynamo_graph_text: str
+    compile_fx_entries: int
+    breaks: dict
+    launches: int
+    expected_launches: int
+    executed_roles: list
+    compile_fx_graphs: list
+
+
 def _recording_backend(graphs):
-    """A torch.compile backend that records the post-decomposition (aot
-    output) graph, then delegates to the PRODUCTION compile path —
-    torch_spyre wraps ``torch._inductor.compile_fx.compile_fx`` (see
+    """A torch.compile backend that records the DYNAMO (pre-decomposition)
+    graph, then delegates to the production compile path — torch_spyre
+    wraps ``torch._inductor.compile_fx.compile_fx`` (see
     ``torch_spyre/_inductor/__init__.py::enable_spyre_compile_fx_wrapper``),
-    so this backend runs the exact same lowering the default
-    ``backend='inductor'`` call would. In-process and deterministic (the
-    TORCH_LOGS=aot_graphs route was probed and REJECTED: the artifact
-    records reach stderr from a compile subprocess and a logging handler
-    on the artifact logger captures nothing — see the receipts)."""
+    so this backend drives the same lowering core the default
+    ``backend='inductor'`` call would. (The compile_fx ENTRY COUNTER —
+    the backend-no-op pin — is installed by ``_run_compiled`` around the
+    module attribute itself, so it counts real entries into the
+    production compiler regardless of what any backend does.)
+    In-process and deterministic (the TORCH_LOGS=aot_graphs route was
+    probed and REJECTED: the artifact records reach stderr from a
+    compile subprocess and a logging handler on the artifact logger
+    captures nothing — see the receipts)."""
 
     def backend(gm, example_inputs):
         graphs.append(gm)
@@ -272,12 +294,22 @@ def _recording_backend(graphs):
 def _run_compiled(q, k, v):
     """torch.compile the user-level F.sdpa function and EXECUTE it.
 
-    Returns (out, user_is_compiling, graph_text, breaks, launches,
-    expected_launches, executed_roles). ``user_is_compiling`` is the
-    record of ``torch.compiler.is_compiling()`` at the USER function's
-    entry — the anti-fallback pin (False on a silent eager fallback,
-    including one that routes through the seam's own OPWrapper inner
-    compile, which compiles the decomposition, never this function)."""
+    Returns a _CompiledRun. ``user_is_compiling`` is the record of
+    ``torch.compiler.is_compiling()`` at the USER function's entry — the
+    anti-fallback pin against a dynamo skip (False on a silent eager
+    fallback, including one that routes through the seam's own OPWrapper
+    inner compile, which compiles the decomposition, never this
+    function). ``compile_fx_graphs`` records the graph handed to each
+    entry into the PRODUCTION compiler (``torch._inductor.compile_fx.
+    compile_fx``, the spyre-wrapped module attribute) during the
+    compiled call — the anti-fallback pin against a BACKEND no-op: a
+    backend that traces and then returns ``gm.forward`` executes the
+    dynamo graph eagerly, whose SDPA call dispatches through the seam's
+    OPWrapper INNER torch.compile (which also enters compile_fx — with
+    the DECOMPOSITION's graph, containing spyre.attention, not the
+    top-level SDPA op). The pin therefore requires a compile_fx entry
+    whose graph contains the top-level ``scaled_dot_product_attention``
+    op: only the USER-level compile produces that graph."""
     _plan_fn()  # skip if codegen is unreachable
     torch._dynamo.reset()
     from torch._dynamo.utils import counters
@@ -285,65 +317,97 @@ def _run_compiled(q, k, v):
     counters.clear()
     user_is_compiling = []
     graphs = []
+    # the graph handed to each compile_fx entry during the compiled call
+    compile_fx_graphs = []
 
     def user_fn(q_, k_, v_):
         user_is_compiling.append(torch.compiler.is_compiling())
         return F.scaled_dot_product_attention(q_, k_, v_)
 
+    import torch._inductor.compile_fx as cfx
+
+    _real_compile_fx = cfx.compile_fx
+
+    def _counting_compile_fx(gm, *args, **kwargs):
+        compile_fx_graphs.append(str(gm.graph))
+        return _real_compile_fx(gm, *args, **kwargs)
+
     with _CompiledHarness() as h:
         q4 = q.reshape(1, 1, ROWS, HEAD_DIM).to(DEVICE)
         k4 = k.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
         v4 = v.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
-        compiled = torch.compile(
-            user_fn, backend=_recording_backend(graphs), dynamic=False
-        )
-        out = compiled(q4, k4, v4).cpu().reshape(ROWS, HEAD_DIM)
+        cfx.compile_fx = _counting_compile_fx
+        try:
+            compiled = torch.compile(
+                user_fn, backend=_recording_backend(graphs), dynamic=False
+            )
+            out = compiled(q4, k4, v4).cpu().reshape(ROWS, HEAD_DIM)
+        finally:
+            cfx.compile_fx = _real_compile_fx
         breaks = dict(counters["graph_breaks"])
         launches = h.simulator.launches
         # derived from the plan itself, not a hand-counted constant
         expected_launches = sum(len(getattr(p, "steps", [])) for p in h.plans)
-    graph_text = "\n".join(str(gm.graph) for gm in graphs)
-    executed_roles = [tuple(r) for r in h.simulator.executed_roles]
-    return (
-        out,
-        user_is_compiling,
-        graph_text,
-        breaks,
-        launches,
-        expected_launches,
-        executed_roles,
-    )
+    run = _CompiledRun()
+    run.out = out
+    run.user_is_compiling = user_is_compiling
+    run.dynamo_graph_text = "\n".join(str(gm.graph) for gm in graphs)
+    run.compile_fx_graphs = compile_fx_graphs
+    run.breaks = breaks
+    run.launches = launches
+    run.expected_launches = expected_launches
+    run.executed_roles = [tuple(r) for r in h.simulator.executed_roles]
+    return run
+
+
+def _user_graph_compiled(run):
+    """True iff some compile_fx entry during the compiled call received a
+    graph containing the top-level SDPA op — the USER-level dynamo graph.
+    The seam OPWrapper's inner torch.compile also enters compile_fx, but
+    with the DECOMPOSITION's graph (spyre.attention only), so it cannot
+    satisfy this pin."""
+    return any("scaled_dot_product_attention" in g for g in run.compile_fx_graphs)
 
 
 def test_compiled_sdpa_executes_through_dynamo():
     """The M6 cell: values correct AND the dynamo path actually taken.
 
-    The is_compiling record is the anti-fallback pin: a silent eager
-    fallback produces correct values with is_compiling False at the user
-    entry and must FAIL (mutation-proven — see the receipts)."""
+    Two anti-fallback pins: the is_compiling record at the user entry
+    (False on a dynamo skip) and the compile_fx entry count (zero on a
+    backend no-op that traces and then executes the graph eagerly).
+    Both are mutation-proven — see the receipts."""
     q, k, v = _data()
     ref = _flash(q, k, v)
-    out, user_is_compiling, _g, _b, launches, _e, _r = _run_compiled(q, k, v)
+    run = _run_compiled(q, k, v)
     import numpy as np
 
-    md = float(np.abs(out.float().numpy().astype("float64") - ref).max())
+    md = float(np.abs(run.out.float().numpy().astype("float64") - ref).max())
     assert md <= OUT_MAX_ABS, f"max_abs={md} > {OUT_MAX_ABS}"
-    assert user_is_compiling and all(user_is_compiling), (
+    assert run.user_is_compiling and all(run.user_is_compiling), (
         f"the user function never ran inside torch.compile "
-        f"(is_compiling record: {user_is_compiling}) — correct values alone "
+        f"(is_compiling record: {run.user_is_compiling}) — correct values alone "
         f"do not distinguish a compiled run from a silent eager fallback"
     )
-    assert launches > 0, "no device launch executed"
+    assert _user_graph_compiled(run), (
+        "the USER-level graph was never compiled — the backend no-op'd "
+        "(traced the graph then executed it eagerly through the seam's own "
+        "inner compile); correct values and a traced graph do not prove a "
+        "user-level compiled artifact exists"
+    )
+    assert run.launches > 0, "no device launch executed"
 
 
 def test_compiled_graph_routes_through_the_attention_program():
     """The top-level SDPA op must reach spyre.attention, not the math
-    form. Two independent facts, both in-process:
+    form. What is pinned, honestly labeled:
 
-    - the DYNAMO graph (captured by a recording backend that delegates
-      to the production compile_fx) contains the top-level
+    - the DYNAMO graph (pre-decomposition; captured by the recording
+      backend before it delegates) contains the top-level
       ``scaled_dot_product_attention`` call — the user function was
-      traced, not skipped;
+      traced, not skipped. (The POST-decomposition aot forward graph —
+      the single ``torch.ops.spyre.attention.default`` node — is an
+      artifact INSIDE compile_fx; it is evidenced in the receipts, not
+      captured here.)
     - the EXECUTED launch roles are the attention program's own phase
       vocabulary (q_scale / gather / scores / softmax / pv, from the
       codegen plan the attention route builds) and the launch count
@@ -351,14 +415,21 @@ def test_compiled_graph_routes_through_the_attention_program():
       The math form cannot produce these — it never builds an attention
       plan and is refused typed (F32PointerElementGrainError) before any
       launch.
+    - the USER-level graph went through the production compiler (the
+      backend no-op pin: only the user-level compile hands compile_fx a
+      graph containing the top-level SDPA op).
 
     Plus zero graph breaks."""
     q, k, v = _data()
-    _out, _u, graph_text, breaks, launches, expected, roles = _run_compiled(q, k, v)
-    assert "scaled_dot_product_attention" in graph_text, (
-        "the traced graph does not contain the top-level SDPA op — the "
-        "user function was not traced"
+    run = _run_compiled(q, k, v)
+    assert "scaled_dot_product_attention" in run.dynamo_graph_text, (
+        "the traced dynamo graph does not contain the top-level SDPA op — "
+        "the user function was not traced"
     )
+    assert _user_graph_compiled(run), (
+        "the USER-level graph was never compiled — the backend no-op'd"
+    )
+    roles = run.executed_roles
     assert ("q", "q_scaled") in roles, (
         f"the attention plan's own role vocabulary never executed (roles: "
         f"{sorted(set(roles))})"
@@ -366,22 +437,24 @@ def test_compiled_graph_routes_through_the_attention_program():
     assert ("softmax_scratch", "scores", "probs") in roles, (
         f"the softmax phase never executed (roles: {sorted(set(roles))})"
     )
-    assert launches == expected, (
-        f"launches {launches} != the plan's own step count {expected}"
+    assert run.launches == run.expected_launches, (
+        f"launches {run.launches} != the plan's own step count {run.expected_launches}"
     )
-    assert launches > 1, (
-        f"expected the kv=128 HOST_SERIAL multi-launch sequence, got {launches}"
+    assert run.launches > 1, (
+        f"expected the kv=128 HOST_SERIAL multi-launch sequence, got {run.launches}"
     )
-    assert not breaks, f"unexpected graph breaks: {breaks}"
+    assert not run.breaks, f"unexpected graph breaks: {run.breaks}"
 
 
 def test_compiled_matches_the_eager_seam():
-    """Compiled output matches the eager overrideable-seam output (the
-    form the eager silicon e-cell reaches through C++ backend selection)
-    within the DL16 store band — the same computation executed through
-    two dispatch paths, not a bit-identity claim."""
+    """Compiled output is BIT-IDENTICAL to the eager overrideable-seam
+    output (the form the eager silicon e-cell reaches through C++
+    backend selection): both paths execute the SAME codegen plan and
+    binaries through the same simulator, so any nonzero delta is a
+    routing divergence, not numeric noise — exact equality is the
+    pin."""
     q, k, v = _data()
-    out_c, *_ = _run_compiled(q, k, v)
+    out_c = _run_compiled(q, k, v).out
     with _CompiledHarness():
         q4 = q.reshape(1, 1, ROWS, HEAD_DIM).to(DEVICE)
         k4 = k.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
@@ -393,7 +466,7 @@ def test_compiled_matches_the_eager_seam():
         )
         out_e = out_e.cpu().reshape(ROWS, HEAD_DIM)
     delta = float((out_c.float() - out_e.float()).abs().max())
-    assert delta <= 1e-3, f"compiled != eager seam (max delta {delta})"
+    assert delta == 0.0, f"compiled != eager seam (max delta {delta})"
 
 
 def test_out_of_envelope_refuses_typed_under_compile():
@@ -417,17 +490,15 @@ def test_out_of_envelope_refuses_typed_under_compile():
         )
         with pytest.raises(Exception) as ei:
             compiled(q4, k4, v4)
-    typed = [
-        e for e in _exc_chain(ei.value) if isinstance(e, UnsupportedAttentionError)
-    ]
-    assert typed, (
+    terminal = _terminal_exc(ei.value)
+    assert isinstance(terminal, UnsupportedAttentionError), (
         f"the refusal must be the predicate's own typed "
-        f"UnsupportedAttentionError (chain: "
-        f"{[type(e).__name__ for e in _exc_chain(ei.value)]})"
+        f"UnsupportedAttentionError as the terminal exception, got "
+        f"{type(terminal).__name__}: {str(terminal)[:120]}"
     )
-    assert "[row-budget]" in str(typed[0]), (
+    assert "[row-budget]" in str(terminal), (
         f"the refusal must carry the predicate's own clause name, got: "
-        f"{str(typed[0])[:200]}"
+        f"{str(terminal)[:200]}"
     )
 
 
@@ -491,17 +562,36 @@ def test_eager_sdpa_reroutes_through_the_seam():
     assert launches > 0, "no device launch executed in the eager reroute"
 
 
-def _exc_chain(exc):
+def _terminal_exc(exc):
+    """The TERMINAL exception of the cause/context chain. Walking the
+    full chain and matching ANY node would let an unrelated exception
+    dragged in by __context__ (enclosing except/cleanup blocks) satisfy
+    a typed-error match; requiring the match on the terminal node keeps
+    the pin honest."""
     while exc is not None:
-        yield exc
-        exc = exc.__cause__ or exc.__context__
+        nxt = exc.__cause__ or exc.__context__
+        if nxt is None:
+            return exc
+        exc = nxt
+    return exc
 
 
-def test_negative_dropout_p_refuses_typed():
-    """ATen's own contract: dropout_p outside [0, 1) is an error. The C++
-    composite validated it before dispatch; the compiled path bypasses
-    the composite, so the mapping owns the range now (typed
-    NotImplementedError, not an untyped crash)."""
+def _assert_typed_dropout_refusal(exc):
+    terminal = _terminal_exc(exc)
+    assert isinstance(terminal, NotImplementedError) and "dropout_p" in str(terminal), (
+        f"expected the typed dropout-range NotImplementedError as the "
+        f"terminal exception, got {type(terminal).__name__}: "
+        f"{str(terminal)[:120]}"
+    )
+
+
+@pytest.mark.parametrize("dropout_p", [-0.5, 1.0])
+def test_out_of_range_dropout_p_refuses_typed_under_compile(dropout_p):
+    """The mapping's dropout range ([0, 1), a DELIBERATE tightening —
+    ATen's composite has no composite-level gate on torch 2.13.0; the
+    math backend accepts -0.5 and 1.0, and those backend-specific checks
+    are bypassed on this route) refuses typed at BOTH boundaries on the
+    compiled path (typed NotImplementedError, not an untyped crash)."""
     q, k, v = _data()
     torch._dynamo.reset()
     with _CompiledHarness():
@@ -510,14 +600,29 @@ def test_negative_dropout_p_refuses_typed():
         v4 = v.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
         compiled = torch.compile(
             lambda q_, k_, v_: F.scaled_dot_product_attention(
-                q_, k_, v_, dropout_p=-0.5
+                q_, k_, v_, dropout_p=dropout_p
             ),
             dynamic=False,
         )
         with pytest.raises(Exception) as ei:
             compiled(q4, k4, v4)
-    typed = [e for e in _exc_chain(ei.value) if isinstance(e, NotImplementedError)]
-    assert typed and "dropout_p" in str(typed[0]), (
-        f"expected the typed dropout-range NotImplementedError in the chain, "
-        f"got {[type(e).__name__ for e in _exc_chain(ei.value)]}"
-    )
+    _assert_typed_dropout_refusal(ei.value)
+
+
+@pytest.mark.parametrize("dropout_p", [-0.5, 1.0])
+def test_out_of_range_dropout_p_refuses_typed_eager(dropout_p):
+    """The same range refuses on the EAGER path (the reroute dispatches
+    through the seam, whose mapping owns the check — the C++ composite's
+    backend-specific validation is bypassed there too)."""
+    q, k, v = _data()
+    with _CompiledHarness():
+        q4 = q.reshape(1, 1, ROWS, HEAD_DIM).to(DEVICE)
+        k4 = k.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
+        v4 = v.reshape(1, 1, KV_LEN, HEAD_DIM).to(DEVICE)
+        # the reroute dispatches through the seam's OPWrapper, whose
+        # eager branch runs the decomposition inside its OWN inner
+        # torch.compile — the refusal surfaces wrapped
+        # (BackendCompilerFailed), with the typed error terminal.
+        with pytest.raises(Exception) as ei:
+            F.scaled_dot_product_attention(q4, k4, v4, dropout_p=dropout_p)
+    _assert_typed_dropout_refusal(ei.value)

@@ -775,18 +775,21 @@ def spyre_scaled_dot_product_attention(
     """The TOP-LEVEL SDPA entry: route to the overrideable seam.
 
     Why this exists: under ``torch.compile``, dynamo traces the TOP-LEVEL
-    ``aten::scaled_dot_product_attention`` and executes its C++ composite
-    under FakeTensor, emitting the MATH form (fp32 upcast, bmm, softmax,
-    where) — which never reaches the attention program and is refused
-    typed by the Sentient codegen (f32 pointee, no 32-bit-grain route).
-    The PrivateUse1 kernel registered here is what makes compile work:
-    dynamo INLINES the Python dispatch kernel at trace time, so the
-    traced graph contains ``spyre.attention`` directly. A table-only
-    registration (decomposition table, no PrivateUse1 kernel) was probed
-    and REFUTED by execution: without the kernel, dynamo executes the
-    C++ composite under FakeTensor before any aot table applies, and the
-    graph degrades to the math form (F32PointerElementGrainError) — see
-    the lane receipts.
+    ``aten::scaled_dot_product_attention`` and, without this
+    registration, its C++ composite executes under FakeTensor emitting
+    the MATH form (fp32 upcast, bmm, softmax, where) — which never
+    reaches the attention program and is refused typed by the Sentient
+    codegen (f32 pointee, no 32-bit-grain route). The PrivateUse1 kernel
+    registered here is what makes compile work: during aot's FakeTensor
+    tracing (inside compile_fx), the top-level op dispatches through the
+    kernel and expands to ``spyre.attention`` — the aot forward graph is
+    that single node. A table-only registration (decomposition table, no
+    PrivateUse1 kernel) was probed and REFUTED by execution: without the
+    kernel, the C++ composite expands to the math form under FakeTensor
+    and the decomposition-table entry never applies
+    (F32PointerElementGrainError) — see the lane receipts. (The dynamo
+    graph itself RETAINS the top-level op; the expansion happens one
+    stage later, inside compile_fx.)
 
     EAGER REROUTE (disclosed, intentional): registering the kernel also
     intercepts EAGER dispatch — ``F.scaled_dot_product_attention`` on a
