@@ -163,6 +163,24 @@ example AND an eager F.sdpa re-witness (the eager route changed with the
 kernel registration — see The routing mechanism), L-190 LAUNCH-STATE pin
 with launched binary hashes.
 
+## Box cell RESULT (executed 2026-11-24, claim attention-ace-box-20261124-001)
+
+RUN and PASS (receipt:
+`spyre-workspaces/receipts/attention-compiled-example/hw-box-cell-results-20261124.md`):
+a1p3 control PASS (bdcde582); EAGER re-witness through the kernel-reroute
+0.0275 vs fp64 flash (in band); **COMPILED torch.compile through F.sdpa
+0.0275 — the owed M6 item CLOSED, the compiled entry point
+silicon-witnessed**; compiled-vs-eager 0.0000 bit-identical (the
+exact-equality expectation confirmed on hardware); rows=33 refusal demo
+typed [row-budget], full example exit 0 at the final tip 38dfb51a. The
+run also forced two example fixes (commit 38dfb51a): the grading lines'
+torch/numpy .abs() mix-up, and the refusal demo's shape (single-block
+kv_len=64, where [row-budget] fires first — at multi-block shapes the
+multiblock owner's [kv-block] no-witnessed-width refusal fires before
+[row-budget]; both typed and clause-named). Not run (named): the KAT
+re-run at final flags with launched-binary hashes — the ATen lane's owed
+item, it did not ride this claim.
+
 ## Not in scope
 
 Device-resident staging (the D2H/H2D per-call cost is the DECLARED v1
